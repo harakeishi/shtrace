@@ -86,8 +86,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// InsertSession upserts a session row. Tags are stored as JSON; the empty map
-// is acceptable.
+// InsertSession upserts a session row. Tags are stored as JSON. The upsert
+// uses COALESCE on ended_at so that a re-insert with nil ended_at (e.g., a
+// nested child invocation re-entering the same row) does not clobber an
+// already-set end time.
 func (s *Store) InsertSession(ctx context.Context, sess Session) error {
 	tagsJSON, err := json.Marshal(sess.Tags)
 	if err != nil {
@@ -100,8 +102,28 @@ func (s *Store) InsertSession(ctx context.Context, sess Session) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO sessions(id, started_at, ended_at, tags_json)
 		VALUES(?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET ended_at=excluded.ended_at, tags_json=excluded.tags_json`,
+		ON CONFLICT(id) DO UPDATE SET
+			ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
+			tags_json = excluded.tags_json`,
 		sess.ID, sess.StartedAt.UTC().Format(time.RFC3339Nano), endedAt, string(tagsJSON),
+	)
+	return err
+}
+
+// EnsureSession inserts the session row if it doesn't exist; if it does, this
+// is a complete no-op. Child shtrace invocations call this to satisfy the
+// spans.session_id foreign key when the parent wrote to a different on-disk
+// DB (different SHTRACE_DATA_DIR resolution).
+func (s *Store) EnsureSession(ctx context.Context, sess Session) error {
+	tagsJSON, err := json.Marshal(sess.Tags)
+	if err != nil {
+		return fmt.Errorf("marshal tags: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sessions(id, started_at, tags_json)
+		VALUES(?, ?, ?)
+		ON CONFLICT(id) DO NOTHING`,
+		sess.ID, sess.StartedAt.UTC().Format(time.RFC3339Nano), string(tagsJSON),
 	)
 	return err
 }
@@ -157,16 +179,22 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]Session, error) 
 		if err := rows.Scan(&sess.ID, &startedAt, &endedAt, &tagsJSON); err != nil {
 			return nil, err
 		}
-		if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
-			sess.StartedAt = t
+		t, err := time.Parse(time.RFC3339Nano, startedAt)
+		if err != nil {
+			return nil, fmt.Errorf("session %s: parse started_at %q: %w", sess.ID, startedAt, err)
 		}
+		sess.StartedAt = t
 		if endedAt.Valid {
-			if t, err := time.Parse(time.RFC3339Nano, endedAt.String); err == nil {
-				sess.EndedAt = &t
+			t, err := time.Parse(time.RFC3339Nano, endedAt.String)
+			if err != nil {
+				return nil, fmt.Errorf("session %s: parse ended_at %q: %w", sess.ID, endedAt.String, err)
 			}
+			sess.EndedAt = &t
 		}
 		sess.Tags = map[string]string{}
-		_ = json.Unmarshal([]byte(tagsJSON), &sess.Tags)
+		if err := json.Unmarshal([]byte(tagsJSON), &sess.Tags); err != nil {
+			return nil, fmt.Errorf("session %s: parse tags_json: %w", sess.ID, err)
+		}
 		out = append(out, sess)
 	}
 	return out, rows.Err()
@@ -197,13 +225,19 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string) ([]Span, 
 		if err := rows.Scan(&sp.ID, &sp.SessionID, &sp.ParentSpanID, &sp.Command, &argvJSON, &sp.Cwd, &sp.Mode, &started, &ended, &exitCode); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(argvJSON), &sp.Argv)
-		if t, err := time.Parse(time.RFC3339Nano, started); err == nil {
-			sp.StartedAt = t
+		if err := json.Unmarshal([]byte(argvJSON), &sp.Argv); err != nil {
+			return nil, fmt.Errorf("span %s: parse argv_json: %w", sp.ID, err)
 		}
-		if t, err := time.Parse(time.RFC3339Nano, ended); err == nil {
-			sp.EndedAt = t
+		t, err := time.Parse(time.RFC3339Nano, started)
+		if err != nil {
+			return nil, fmt.Errorf("span %s: parse started_at %q: %w", sp.ID, started, err)
 		}
+		sp.StartedAt = t
+		t, err = time.Parse(time.RFC3339Nano, ended)
+		if err != nil {
+			return nil, fmt.Errorf("span %s: parse ended_at %q: %w", sp.ID, ended, err)
+		}
+		sp.EndedAt = t
 		if exitCode.Valid {
 			v := int(exitCode.Int64)
 			sp.ExitCode = &v

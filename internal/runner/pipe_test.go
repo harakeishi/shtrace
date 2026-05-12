@@ -131,6 +131,89 @@ type jsonChunk struct {
 	Data   string `json:"data"`
 }
 
+// TestForwardStream_MasksSecretSplitAcrossReads is the regression test for
+// the pipe-boundary leak: the previous implementation masked each Read in
+// isolation, so a Bearer token straddling two reads slipped through.
+func TestForwardStream_MasksSecretSplitAcrossReads(t *testing.T) {
+	r, w := io.Pipe()
+	rec := &recordingWriter{}
+	var tee bytes.Buffer
+	m := secret.DefaultMasker()
+
+	done := make(chan struct{})
+	go func() {
+		forwardStream(r, storage.StreamStdout, &tee, rec, m)
+		close(done)
+	}()
+
+	full := "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890ABCDEF\n"
+	// Split inside the bearer token so neither half matches the regex on
+	// its own. io.Pipe is synchronous, so the first Write completes only
+	// after the goroutine has Read it.
+	splitAt := len("Authorization: Bearer abcd")
+	if _, err := w.Write([]byte(full[:splitAt])); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	if _, err := w.Write([]byte(full[splitAt:])); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	<-done
+
+	recorded := ""
+	for _, c := range rec.snapshot() {
+		recorded += c.Data
+	}
+	if strings.Contains(recorded, "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
+		t.Fatalf("secret leaked across read boundary; recorded=%q", recorded)
+	}
+	// Tee should still see the raw bytes (user's own terminal output).
+	if !strings.Contains(tee.String(), "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
+		t.Fatalf("tee should pass raw bytes through, got %q", tee.String())
+	}
+}
+
+// TestForwardStream_FlushesAfterLargeOutput verifies the tail-buffer scheme
+// still catches a secret that lands at the very end of the stream, even
+// after many bytes of harmless content have flushed past.
+func TestForwardStream_FlushesAfterLargeOutput(t *testing.T) {
+	r, w := io.Pipe()
+	rec := &recordingWriter{}
+	m := secret.DefaultMasker()
+
+	done := make(chan struct{})
+	go func() {
+		forwardStream(r, storage.StreamStdout, io.Discard, rec, m)
+		close(done)
+	}()
+
+	padding := strings.Repeat("x", 4096)
+	secretStr := "ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"
+	go func() {
+		_, _ = w.Write([]byte(padding))
+		_, _ = w.Write([]byte(secretStr))
+		_ = w.Close()
+	}()
+	<-done
+
+	recorded := ""
+	for _, c := range rec.snapshot() {
+		recorded += c.Data
+	}
+	if strings.Contains(recorded, "ghp_abcdefghijklmnopqrstuvwxyz0123456789") {
+		t.Fatalf("PAT leaked after padding; recorded tail=%q", recorded[max(0, len(recorded)-200):])
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func TestPipeRunner_WritesJSONLToBackingWriter(t *testing.T) {
 	var buf bytes.Buffer
 	w := storage.NewJSONLWriter(&buf, nil)

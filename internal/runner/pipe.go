@@ -89,12 +89,25 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 	return res, err
 }
 
-// forward reads from src and (a) passes raw bytes through to the user-visible
-// tee, (b) sends masked bytes to the recorder. Tee output is intentionally
-// unmasked — the user already sees the original on their terminal, and masking
-// here would only confuse them.
+// forward is the goroutine wrapper around forwardStream.
 func forward(wg *sync.WaitGroup, src io.Reader, stream storage.Stream, tee io.Writer, rec ChunkWriter, m *secret.Masker) {
 	defer wg.Done()
+	forwardStream(src, stream, tee, rec, m)
+}
+
+// safetyTail is the number of trailing bytes we hold back per stream before
+// masking, so a secret straddling two Reads still matches its regex. It must
+// exceed the longest expected secret literal we want to catch.
+const safetyTail = 256
+
+// forwardStream reads from src and routes each chunk to (a) the user tee
+// (raw bytes — the user already sees them on their terminal) and (b) the
+// recorder, after secret masking. Crucially, it buffers a small trailing
+// window between Reads so a secret that straddles a pipe-buffer boundary
+// still gets caught by a regex match. The previous implementation called
+// MaskString on each Read in isolation, which leaked split secrets.
+func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec ChunkWriter, m *secret.Masker) {
+	var pending []byte
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
@@ -102,10 +115,22 @@ func forward(wg *sync.WaitGroup, src io.Reader, stream storage.Stream, tee io.Wr
 			if tee != nil {
 				_, _ = tee.Write(buf[:n])
 			}
-			masked, _ := m.MaskString(string(buf[:n]))
-			_ = rec.WriteChunk(stream, []byte(masked))
+			pending = append(pending, buf[:n]...)
+			if len(pending) > safetyTail {
+				flushable := pending[:len(pending)-safetyTail]
+				masked, _ := m.MaskString(string(flushable))
+				_ = rec.WriteChunk(stream, []byte(masked))
+				// Keep the tail; reuse the underlying array to avoid churn.
+				tailLen := safetyTail
+				copy(pending, pending[len(pending)-tailLen:])
+				pending = pending[:tailLen]
+			}
 		}
 		if err != nil {
+			if len(pending) > 0 {
+				masked, _ := m.MaskString(string(pending))
+				_ = rec.WriteChunk(stream, []byte(masked))
+			}
 			return
 		}
 	}

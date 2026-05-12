@@ -86,6 +86,18 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 			fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
 			return 1
 		}
+	} else {
+		// Child invocation: parent may have written to a different on-disk
+		// DB (e.g., different SHTRACE_DATA_DIR), so guarantee the session
+		// row exists locally before any FK-constrained span insert.
+		if err := store.EnsureSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: startedAt,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			fmt.Fprintf(stderr, "shtrace: ensure session: %v\n", err)
+			return 1
+		}
 	}
 
 	logPath := storage.OutputPath(dataDir, sessCtx.SessionID, sessCtx.SpanID)
@@ -105,6 +117,11 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 
 	jsonl := storage.NewJSONLWriter(logFile, nil)
 
+	// Construct the masker once and share between the runner and the
+	// argv-persisting code so that any future user-supplied patterns apply
+	// uniformly.
+	masker := secret.DefaultMasker()
+
 	res, runErr := runner.RunPipe(ctx, runner.PipeOptions{
 		Argv:   cmdArgs,
 		Env:    childEnv,
@@ -112,7 +129,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		Writer: jsonl,
 		Stdout: stdout,
 		Stderr: stderr,
-		Masker: secret.DefaultMasker(),
+		Masker: masker,
 	})
 	if runErr != nil {
 		fmt.Fprintf(stderr, "shtrace: run: %v\n", runErr)
@@ -126,7 +143,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		SessionID:    sessCtx.SessionID,
 		ParentSpanID: sessCtx.ParentSpanID,
 		Command:      cmdArgs[0],
-		Argv:         secret.DefaultMasker().MaskArgv(cmdArgs),
+		Argv:         masker.MaskArgv(cmdArgs),
 		Cwd:          cwd,
 		Mode:         "pipe",
 		StartedAt:    startedAt,
@@ -138,12 +155,17 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 	}
 	if sessCtx.IsRoot {
 		ended := endedAt
-		_ = store.InsertSession(ctx, storage.Session{
+		if err := store.InsertSession(ctx, storage.Session{
 			ID:        sessCtx.SessionID,
 			StartedAt: startedAt,
 			EndedAt:   &ended,
 			Tags:      sessCtx.Tags,
-		})
+		}); err != nil {
+			// The wrapped command's exit code still propagates — failing
+			// the whole invocation just because we couldn't stamp ended_at
+			// would be worse than reporting the issue on stderr.
+			fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
+		}
 	}
 
 	return exitCode
@@ -248,19 +270,32 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "shtrace: read log %s: %v\n", logPath, err)
 			continue
 		}
-		// Render JSON Lines as a flat stream of `data` fields so the user
-		// just sees what the command printed.
-		for _, line := range splitLines(b) {
+		// Render JSON Lines, routing each chunk to stdout or stderr based on
+		// its recorded stream label so callers can pipe show's output the
+		// same way they would the original command's.
+		corrupt := 0
+		for i, line := range splitLines(b) {
 			if len(line) == 0 {
 				continue
 			}
 			var c storage.Chunk
 			if err := json.Unmarshal(line, &c); err != nil {
+				corrupt++
+				fmt.Fprintf(stderr, "shtrace: skipped corrupt line %d in %s: %v\n", i+1, logPath, err)
 				continue
 			}
-			fmt.Fprint(stdout, c.Data)
+			switch storage.Stream(c.Stream) {
+			case storage.StreamStderr:
+				fmt.Fprint(stderr, c.Data)
+			default:
+				// stdout, pty (mode A merged), or any future label
+				fmt.Fprint(stdout, c.Data)
+			}
 		}
 		fmt.Fprintln(stdout)
+		if corrupt > 0 {
+			fmt.Fprintf(stderr, "shtrace: %d corrupt line(s) skipped in %s\n", corrupt, logPath)
+		}
 	}
 	return 0
 }
