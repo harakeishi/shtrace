@@ -3,12 +3,19 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
+
+func openSQLiteForTest(path string) (*sql.DB, error) {
+	return sql.Open("sqlite", "file:"+path)
+}
 
 // runHarness wires a CLI run against a temp data dir so tests can assert on
 // the on-disk state without polluting the user's $HOME. It also zeroes out
@@ -169,6 +176,41 @@ func TestCLI_ShowReportsCorruptLogToStderr(t *testing.T) {
 	}
 	if !strings.Contains(sse.String(), "corrupt") && !strings.Contains(sse.String(), "skipped") {
 		t.Fatalf("expected show to report the corrupt line on stderr, got %q", sse.String())
+	}
+}
+
+// TestCLI_LsSurvivesCorruptSessionRow: a single corrupt session row must
+// not take the whole `shtrace ls` offline (Round-2 finding). The corrupt
+// row should surface as a warning on stderr; healthy rows still listed.
+func TestCLI_LsSurvivesCorruptSessionRow(t *testing.T) {
+	// First, record a healthy session via the normal CLI path.
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf healthy")
+	if exit != 0 {
+		t.Fatalf("setup run exit = %d", exit)
+	}
+
+	// Inject a corrupt row directly into sessions.db.
+	db, err := openSQLiteForTest(filepath.Join(dataDir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions(id, started_at, tags_json) VALUES('corrupt', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject corrupt row: %v", err)
+	}
+	db.Close()
+
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "ls"}, &so, &se)
+	if code != 0 {
+		t.Fatalf("ls exit = %d (should still succeed): stderr=%q", code, se.String())
+	}
+	// Healthy session line should still be there.
+	if !strings.Contains(so.String(), "sh") {
+		t.Fatalf("healthy session not listed: stdout=%q", so.String())
+	}
+	// The corrupt row should be surfaced as a warning.
+	if !strings.Contains(se.String(), "warning") || !strings.Contains(se.String(), "corrupt") {
+		t.Fatalf("expected stderr warning for corrupt row, got %q", se.String())
 	}
 }
 

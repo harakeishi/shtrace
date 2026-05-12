@@ -154,7 +154,13 @@ func (s *Store) InsertSpan(ctx context.Context, sp Span) error {
 }
 
 // ListSessions returns sessions newest-first, up to limit.
-func (s *Store) ListSessions(ctx context.Context, limit int) ([]Session, error) {
+//
+// Per-row parse failures (malformed timestamp, malformed tags_json) are
+// reported via warn and the offending row is skipped, so a single corrupt row
+// does not take the whole listing offline. The function still returns an
+// error for unrecoverable conditions (the underlying query failed, a column
+// scan failed). Pass nil for warn to ignore per-row warnings.
+func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) ([]Session, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -181,19 +187,22 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]Session, error) 
 		}
 		t, err := time.Parse(time.RFC3339Nano, startedAt)
 		if err != nil {
-			return nil, fmt.Errorf("session %s: parse started_at %q: %w", sess.ID, startedAt, err)
+			reportWarn(warn, fmt.Errorf("session %s: parse started_at %q: %w", sess.ID, startedAt, err))
+			continue
 		}
 		sess.StartedAt = t
 		if endedAt.Valid {
 			t, err := time.Parse(time.RFC3339Nano, endedAt.String)
 			if err != nil {
-				return nil, fmt.Errorf("session %s: parse ended_at %q: %w", sess.ID, endedAt.String, err)
+				reportWarn(warn, fmt.Errorf("session %s: parse ended_at %q: %w", sess.ID, endedAt.String, err))
+				continue
 			}
 			sess.EndedAt = &t
 		}
 		sess.Tags = map[string]string{}
 		if err := json.Unmarshal([]byte(tagsJSON), &sess.Tags); err != nil {
-			return nil, fmt.Errorf("session %s: parse tags_json: %w", sess.ID, err)
+			reportWarn(warn, fmt.Errorf("session %s: parse tags_json: %w", sess.ID, err))
+			continue
 		}
 		out = append(out, sess)
 	}
@@ -202,7 +211,11 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]Session, error) 
 
 // SpansForSession returns spans for sessionID, ordered by start time ascending
 // so callers can render a chronological timeline.
-func (s *Store) SpansForSession(ctx context.Context, sessionID string) ([]Span, error) {
+//
+// Per-row parse failures are reported via warn and the row is skipped; the
+// function still returns an error for unrecoverable query/scan failures.
+// Pass nil for warn to ignore per-row warnings.
+func (s *Store) SpansForSession(ctx context.Context, sessionID string, warn func(error)) ([]Span, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, session_id, parent_span_id, command, argv_json, cwd, mode, started_at, ended_at, exit_code
 		FROM spans
@@ -226,16 +239,19 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string) ([]Span, 
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(argvJSON), &sp.Argv); err != nil {
-			return nil, fmt.Errorf("span %s: parse argv_json: %w", sp.ID, err)
+			reportWarn(warn, fmt.Errorf("span %s: parse argv_json: %w", sp.ID, err))
+			continue
 		}
 		t, err := time.Parse(time.RFC3339Nano, started)
 		if err != nil {
-			return nil, fmt.Errorf("span %s: parse started_at %q: %w", sp.ID, started, err)
+			reportWarn(warn, fmt.Errorf("span %s: parse started_at %q: %w", sp.ID, started, err))
+			continue
 		}
 		sp.StartedAt = t
 		t, err = time.Parse(time.RFC3339Nano, ended)
 		if err != nil {
-			return nil, fmt.Errorf("span %s: parse ended_at %q: %w", sp.ID, ended, err)
+			reportWarn(warn, fmt.Errorf("span %s: parse ended_at %q: %w", sp.ID, ended, err))
+			continue
 		}
 		sp.EndedAt = t
 		if exitCode.Valid {
@@ -245,4 +261,10 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string) ([]Span, 
 		out = append(out, sp)
 	}
 	return out, rows.Err()
+}
+
+func reportWarn(warn func(error), err error) {
+	if warn != nil {
+		warn(err)
+	}
 }

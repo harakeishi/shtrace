@@ -196,7 +196,8 @@ func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	sessions, err := store.ListSessions(ctx, 50)
+	warn := func(e error) { fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
+	sessions, err := store.ListSessions(ctx, 50, warn)
 	if err != nil {
 		fmt.Fprintf(stderr, "shtrace: list: %v\n", err)
 		return 1
@@ -218,7 +219,10 @@ func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	for _, s := range sessions {
-		spans, _ := store.SpansForSession(ctx, s.ID)
+		spans, err := store.SpansForSession(ctx, s.ID, warn)
+		if err != nil {
+			fmt.Fprintf(stderr, "shtrace: spans for %s: %v\n", s.ID, err)
+		}
 		cmdSummary := ""
 		if len(spans) > 0 {
 			cmdSummary = spans[0].Command
@@ -252,7 +256,8 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	spans, err := store.SpansForSession(ctx, sessionID)
+	warn := func(e error) { fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
+	spans, err := store.SpansForSession(ctx, sessionID, warn)
 	if err != nil {
 		fmt.Fprintf(stderr, "shtrace: spans: %v\n", err)
 		return 1

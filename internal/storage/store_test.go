@@ -43,7 +43,7 @@ func TestStore_RecordsSessionAndSpan(t *testing.T) {
 		t.Fatalf("InsertSpan: %v", err)
 	}
 
-	sessions, err := s.ListSessions(context.Background(), 10)
+	sessions, err := s.ListSessions(context.Background(), 10, nil)
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestStore_RecordsSessionAndSpan(t *testing.T) {
 		t.Fatalf("session tags = %v, want pr_number=42", sessions[0].Tags)
 	}
 
-	spans, err := s.SpansForSession(context.Background(), "sess-1")
+	spans, err := s.SpansForSession(context.Background(), "sess-1", nil)
 	if err != nil {
 		t.Fatalf("SpansForSession: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestStore_EnsureSession_NoopWhenExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.ListSessions(context.Background(), 10)
+	got, err := s.ListSessions(context.Background(), 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestStore_InsertSession_PreservesEndedAtOnReinsert(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.ListSessions(context.Background(), 10)
+	got, err := s.ListSessions(context.Background(), 10, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestStore_ListSessions_OrderedByStartedDesc(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.ListSessions(context.Background(), 10)
+	got, err := s.ListSessions(context.Background(), 10, nil)
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
@@ -237,9 +237,10 @@ func TestStore_ListSessions_OrderedByStartedDesc(t *testing.T) {
 	}
 }
 
-// TestStore_ListSessions_SurfacesParseErrors: silent drop hides regressions
-// in the writer or DB corruption. The reader must fail loudly.
-func TestStore_ListSessions_SurfacesParseErrors(t *testing.T) {
+// TestStore_ListSessions_SkipsCorruptRowAndReportsViaWarn: one bad row must
+// not take the whole listing offline (Round-2 finding), but the failure must
+// still be observable via the warn callback so it isn't silently dropped.
+func TestStore_ListSessions_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "sessions.db"))
 	if err != nil {
@@ -250,15 +251,72 @@ func TestStore_ListSessions_SurfacesParseErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Inject a row directly with a bogus started_at.
+	good := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	if err := s.InsertSession(context.Background(), Session{ID: "good", StartedAt: good}); err != nil {
+		t.Fatal(err)
+	}
+	// Inject a corrupt row directly.
 	if _, err := s.db.ExecContext(context.Background(),
 		`INSERT INTO sessions(id, started_at, tags_json) VALUES(?, ?, ?)`,
 		"bad", "not-a-timestamp", "{}"); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := s.ListSessions(context.Background(), 10); err == nil {
-		t.Fatalf("ListSessions should return an error on malformed started_at, got nil")
+	var warned []error
+	got, err := s.ListSessions(context.Background(), 10, func(e error) { warned = append(warned, e) })
+	if err != nil {
+		t.Fatalf("ListSessions: %v (should be lenient on per-row errors)", err)
+	}
+	if len(got) != 1 || got[0].ID != "good" {
+		t.Fatalf("ListSessions = %+v, want only the good row", got)
+	}
+	if len(warned) == 0 {
+		t.Fatalf("warn callback was never invoked for corrupt row")
+	}
+}
+
+// TestStore_SpansForSession_SkipsCorruptRowAndReportsViaWarn: same lenient
+// behaviour for spans so `shtrace show` can still render the healthy spans
+// even when one is corrupt.
+func TestStore_SpansForSession_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	if err := s.InsertSession(context.Background(), Session{ID: "s", StartedAt: started}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertSpan(context.Background(), Span{
+		ID: "good", SessionID: "s", Command: "go", Argv: []string{"go"}, Mode: "pipe",
+		StartedAt: started, EndedAt: started.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt span row.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO spans(id, session_id, parent_span_id, command, argv_json, cwd, mode, started_at, ended_at)
+		 VALUES(?, ?, '', ?, ?, '', 'pipe', ?, ?)`,
+		"bad", "s", "go", "[bad json", "not-a-ts", "also-bad"); err != nil {
+		t.Fatal(err)
+	}
+
+	var warned []error
+	got, err := s.SpansForSession(context.Background(), "s", func(e error) { warned = append(warned, e) })
+	if err != nil {
+		t.Fatalf("SpansForSession: %v (should be lenient)", err)
+	}
+	if len(got) != 1 || got[0].ID != "good" {
+		t.Fatalf("SpansForSession = %+v, want only the good span", got)
+	}
+	if len(warned) == 0 {
+		t.Fatalf("warn callback not invoked")
 	}
 }
 
