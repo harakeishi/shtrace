@@ -133,12 +133,12 @@ func TestRunGC_SizeCap(t *testing.T) {
 	insertTestSession(t, store, "sess-a", now.Add(-2*time.Hour))
 	insertTestSession(t, store, "sess-b", now.Add(-1*time.Hour))
 
-	nA := writeOutputFile(t, dataDir, "sess-a", "spanA", string(make([]byte, 600)))
+	_ = writeOutputFile(t, dataDir, "sess-a", "spanA", string(make([]byte, 600)))
 	nB := writeOutputFile(t, dataDir, "sess-b", "spanB", string(make([]byte, 600)))
-	total := int64(nA + nB) // 1200 bytes
 
-	// Cap at 700 bytes: sess-a (oldest, 600 B) must be removed to bring total ≤ 700.
-	cfg := storage.GCConfig{TTLDays: 365, MaxSizeBytes: total - int64(nA)}
+	// Cap at nB+1 bytes so sess-a (oldest) must be removed to fit, with a
+	// non-zero margin that avoids relying on exact boundary equality.
+	cfg := storage.GCConfig{TTLDays: 365, MaxSizeBytes: int64(nB) + 1}
 	result, err := storage.RunGC(ctx, store, nil, dataDir, cfg, false)
 	if err != nil {
 		t.Fatalf("RunGC size-cap: %v", err)

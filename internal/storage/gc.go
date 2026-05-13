@@ -89,6 +89,18 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
 	})
 
+	// Pre-compute per-session output sizes once. Measuring upfront keeps the
+	// TTL-subtraction, size-cap eviction, and BytesReclaimed accounting
+	// consistent, and avoids repeated filesystem walks per session.
+	sessionSizes := make(map[string]int64, len(sessions))
+	for _, s := range sessions {
+		sz, err := gcSessionSize(baseDir, s.ID)
+		if err != nil {
+			return GCResult{}, fmt.Errorf("gc: measure session %s: %w", s.ID, err)
+		}
+		sessionSizes[s.ID] = sz
+	}
+
 	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.EffectiveTTLDays())
 	toDelete := make(map[string]struct{})
 
@@ -108,8 +120,7 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 		return GCResult{}, fmt.Errorf("gc: measure output size: %w", err)
 	}
 	for id := range toDelete {
-		sz, _ := gcSessionSize(baseDir, id)
-		total -= sz
+		total -= sessionSizes[id]
 	}
 	maxBytes := cfg.EffectiveMaxBytes()
 	if total > maxBytes {
@@ -117,9 +128,8 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 			if _, already := toDelete[s.ID]; already {
 				continue
 			}
-			sz, _ := gcSessionSize(baseDir, s.ID)
 			toDelete[s.ID] = struct{}{}
-			total -= sz
+			total -= sessionSizes[s.ID]
 			if total <= maxBytes {
 				break
 			}
@@ -133,7 +143,7 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 		if _, ok := toDelete[s.ID]; !ok {
 			continue
 		}
-		sz, _ := gcSessionSize(baseDir, s.ID)
+		sz := sessionSizes[s.ID]
 
 		if dryRun {
 			result.Sessions = append(result.Sessions, s.ID)
@@ -153,14 +163,16 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 			// authoritative DB so stale index rows are harmless.
 			_ = fts.DeleteSessionIndex(ctx, s.ID)
 		}
-		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
-			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
-		}
-
-		// Only count after every deletion step succeeds.
+		// Count the session as removed before attempting disk cleanup: the DB
+		// record is already gone so this session will not appear in future GC
+		// runs regardless of whether RemoveAll succeeds. Recording it here
+		// ensures callers can identify partially-cleaned sessions on error.
 		result.Sessions = append(result.Sessions, s.ID)
 		result.BytesReclaimed += sz
 		result.SessionsRemoved++
+		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
+			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
+		}
 	}
 	return result, nil
 }
@@ -169,12 +181,14 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 // baseDir/outputs/. Returns 0 without error when the directory does not exist.
 func gcTotalOutputSize(baseDir string) (int64, error) {
 	dir := filepath.Join(baseDir, "outputs")
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return 0, nil
-	}
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				// Handles both a missing root directory and benign TOCTOU
+				// races where an entry is removed during the walk.
+				return nil
+			}
 			return err
 		}
 		if !d.IsDir() {
@@ -196,12 +210,12 @@ func gcTotalOutputSize(baseDir string) (int64, error) {
 // Returns 0 without error when the session directory does not exist.
 func gcSessionSize(baseDir, sessionID string) (int64, error) {
 	dir := filepath.Join(baseDir, "outputs", sessionID)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return 0, nil
-	}
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 		if !d.IsDir() {
