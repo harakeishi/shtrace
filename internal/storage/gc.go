@@ -144,7 +144,21 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 
 	// Execute deletions (oldest first). In dry-run mode only report; do not
 	// touch disk or DB.
+	// Deletion order: disk first, then DB, then FTS (best-effort).
+	//
+	// Removing disk files before the DB row ensures there are no permanent
+	// orphans: if RemoveAll fails the DB row is untouched and the session is
+	// retried on the next GC run. If RemoveAll succeeds but DeleteSession
+	// fails, the disk is already clean; on the next run gcSessionSize returns
+	// 0 for the missing directory, RemoveAll is a no-op, and DeleteSession is
+	// retried successfully.
+	//
+	// DeleteSession failures are non-fatal: we continue the loop so that all
+	// remaining sessions are processed. The first DB error is collected and
+	// returned after the loop so callers know a retry is needed, but a single
+	// transient DB failure does not strand all subsequent sessions.
 	var result GCResult
+	var firstDBErr error
 	for _, s := range sessions {
 		if _, ok := toDelete[s.ID]; !ok {
 			continue
@@ -158,33 +172,27 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 			continue
 		}
 
-		// Deletion order: disk first, then DB, then FTS (best-effort).
-		//
-		// Removing disk files before the DB row ensures that a mid-sequence
-		// failure leaves the system in a retry-safe state:
-		//   - RemoveAll fails  → DB+FTS untouched; session retried on next run ✓
-		//   - RemoveAll ok, DeleteSession fails → disk already clean; next run
-		//     finds the session, calls RemoveAll on missing dir (no-op), then
-		//     retries DeleteSession ✓
-		//   - Both succeed → fully clean ✓
-		// This avoids the permanent orphan scenario where a DB row is deleted
-		// but disk files remain inaccessible to future GC runs.
 		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
 			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
 		}
 		if err := store.DeleteSession(ctx, s.ID); err != nil {
-			return result, fmt.Errorf("gc: delete session %s: %w", s.ID, err)
+			// Disk is already clean. Record the first error and continue so
+			// the remaining sessions are still processed. The DB row persists
+			// and will be retried on the next GC run.
+			if firstDBErr == nil {
+				firstDBErr = fmt.Errorf("gc: delete session %s: %w", s.ID, err)
+			}
+			continue
 		}
 		if fts != nil {
-			// FTS errors are non-fatal: the session is already removed from
-			// disk and DB so stale FTS rows are harmless.
+			// FTS errors are non-fatal: disk and DB are already clean.
 			_ = fts.DeleteSessionIndex(ctx, s.ID)
 		}
 		result.Sessions = append(result.Sessions, s.ID)
 		result.SessionsRemoved++
 		result.BytesReclaimed += sz
 	}
-	return result, nil
+	return result, firstDBErr
 }
 
 // gcSessionSize returns the total byte size of output files for one session.
