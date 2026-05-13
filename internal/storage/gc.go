@@ -66,9 +66,13 @@ func GCConfigFromEnv(env map[string]string) GCConfig {
 type GCResult struct {
 	// SessionsRemoved is the number of sessions removed (or that would be).
 	SessionsRemoved int
-	// BytesReclaimed is the total output-file bytes removed (or that would be).
+	// BytesReclaimed is the total output-file bytes actually removed from disk
+	// (or that would be in dry-run). This count excludes bytes from sessions
+	// whose DB row was deleted but whose disk cleanup subsequently failed.
 	BytesReclaimed int64
-	// Sessions lists the IDs of removed sessions, oldest first.
+	// Sessions lists the IDs of removed sessions, oldest first. A session
+	// whose DB row was deleted but whose disk cleanup failed is still included
+	// so callers can identify partial failures.
 	Sessions []string
 }
 
@@ -112,25 +116,26 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 	}
 
 	// Size-cap pass.
-	// Start from the current total, subtract the sizes that the TTL pass will
-	// already reclaim, then keep removing oldest remaining sessions until the
-	// projected total fits within the cap.
-	total, err := gcTotalOutputSize(baseDir)
-	if err != nil {
-		return GCResult{}, fmt.Errorf("gc: measure output size: %w", err)
-	}
-	for id := range toDelete {
-		total -= sessionSizes[id]
+	// Project the total size that would remain after TTL deletions using
+	// per-session cached sizes. Summing only DB-backed sessions ensures that
+	// orphaned output directories (output files with no DB entry, which GC
+	// cannot remove) do not inflate the projection and cause unnecessary
+	// evictions.
+	var projectedTotal int64
+	for _, s := range sessions {
+		if _, condemned := toDelete[s.ID]; !condemned {
+			projectedTotal += sessionSizes[s.ID]
+		}
 	}
 	maxBytes := cfg.EffectiveMaxBytes()
-	if total > maxBytes {
+	if projectedTotal > maxBytes {
 		for _, s := range sessions {
 			if _, already := toDelete[s.ID]; already {
 				continue
 			}
 			toDelete[s.ID] = struct{}{}
-			total -= sessionSizes[s.ID]
-			if total <= maxBytes {
+			projectedTotal -= sessionSizes[s.ID]
+			if projectedTotal <= maxBytes {
 				break
 			}
 		}
@@ -163,47 +168,20 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 			// authoritative DB so stale index rows are harmless.
 			_ = fts.DeleteSessionIndex(ctx, s.ID)
 		}
-		// Count the session as removed before attempting disk cleanup: the DB
-		// record is already gone so this session will not appear in future GC
-		// runs regardless of whether RemoveAll succeeds. Recording it here
-		// ensures callers can identify partially-cleaned sessions on error.
+		// Record the session and increment the counter before disk cleanup:
+		// the DB row is already gone so this session will not appear in future
+		// GC runs regardless of whether RemoveAll succeeds. Callers can use
+		// result.Sessions to identify any partially-cleaned sessions.
+		// BytesReclaimed is updated only after successful disk removal so it
+		// accurately reflects bytes actually freed from disk.
 		result.Sessions = append(result.Sessions, s.ID)
-		result.BytesReclaimed += sz
 		result.SessionsRemoved++
 		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
 			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
 		}
+		result.BytesReclaimed += sz
 	}
 	return result, nil
-}
-
-// gcTotalOutputSize returns the total byte size of all files under
-// baseDir/outputs/. Returns 0 without error when the directory does not exist.
-func gcTotalOutputSize(baseDir string) (int64, error) {
-	dir := filepath.Join(baseDir, "outputs")
-	var total int64
-	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Handles both a missing root directory and benign TOCTOU
-				// races where an entry is removed during the walk.
-				return nil
-			}
-			return err
-		}
-		if !d.IsDir() {
-			info, infoErr := d.Info()
-			if infoErr != nil {
-				if os.IsNotExist(infoErr) {
-					return nil // benign TOCTOU race: file removed between enumeration and stat
-				}
-				return infoErr
-			}
-			total += info.Size()
-		}
-		return nil
-	})
-	return total, err
 }
 
 // gcSessionSize returns the total byte size of output files for one session.
