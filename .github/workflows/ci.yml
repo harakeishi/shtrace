@@ -69,6 +69,10 @@ jobs:
   integration:
     name: Integration test (dogfooding)
     runs-on: ubuntu-latest
+    # Gate on test + build so a broken unit test or compile error short-circuits
+    # this job — the dogfooding run would otherwise duplicate the same failure
+    # signal and waste a runner slot.
+    needs: [test, build]
     steps:
       - uses: actions/checkout@v4
 

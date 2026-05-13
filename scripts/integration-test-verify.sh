@@ -44,16 +44,19 @@ fi
 session_id=$(printf '%s' "$sessions_json" | jq -r '.[0].id')
 note "session=$session_id"
 
-# --- assertion 2: at least 5 span log files (1 outer + 4 nested) ---
+# --- assertion 2: exactly 5 span log files (1 outer bash + 4 nested) ---
+# The workload is fully deterministic, so an exact-equals check catches both
+# under-counting (missed nested span) and over-counting (a stray child process
+# or accidental duplicate insert) regressions.
 log_dir="$SHTRACE_DATA_DIR/outputs/$session_id"
 if [ ! -d "$log_dir" ]; then
     err "log dir $log_dir missing"
     exit 1
 fi
-expected_min_spans=5
+expected_spans=5
 span_count=$(find "$log_dir" -maxdepth 1 -name '*.log' | wc -l | tr -d ' ')
-if [ "$span_count" -lt "$expected_min_spans" ]; then
-    err "expected >= $expected_min_spans spans, got $span_count under $log_dir"
+if [ "$span_count" -ne "$expected_spans" ]; then
+    err "expected exactly $expected_spans spans, got $span_count under $log_dir"
 else
     note "$span_count span log files"
 fi
@@ -85,19 +88,32 @@ fi
 # and must never appear under stream=stdout. Using jq instead of grep avoids
 # brittle regex-inside-JSON escaping concerns and correctly handles a chunk
 # that bundles the line with surrounding stdout text.
+#
+# jq's exit status is checked explicitly because `set -e` does NOT propagate
+# from a failing command substitution inside an assignment (`x=$(cmd)`) in
+# bash unless `inherit_errexit` is set. Without an explicit check, a future
+# regression that emits a malformed JSON line would let jq print "parse
+# error" to stderr and exit non-zero, yet $entries would still receive any
+# pre-error output and the loop would silently process an incomplete record
+# set — surfacing as a fake masking/streaming regression.
 found_stderr_marker=0
 found_stdout_misroute=0
-while IFS= read -r logfile; do
+for logfile in "$log_dir"/*.log; do
+    [ -e "$logfile" ] || continue
+    if ! entries=$(jq -r '
+        select(.data | test("on-stderr"))
+        | if .stream == "stderr" then "stderr" else "stdout-misroute" end
+    ' "$logfile"); then
+        err "jq failed parsing $logfile (malformed JSONL?)"
+        continue
+    fi
     while IFS= read -r entry; do
         case "$entry" in
             stderr)          found_stderr_marker=1 ;;
             stdout-misroute) found_stdout_misroute=1 ;;
         esac
-    done < <(jq -r '
-        select(.data | test("on-stderr"))
-        | if .stream == "stderr" then "stderr" else "stdout-misroute" end
-    ' "$logfile")
-done < <(find "$log_dir" -maxdepth 1 -name '*.log')
+    done <<< "$entries"
+done
 
 if [ "$found_stderr_marker" -eq 0 ]; then
     err "'on-stderr' not recorded under stream=stderr in any log"
