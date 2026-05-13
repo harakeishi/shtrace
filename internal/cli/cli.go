@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/harakeishi/shtrace/internal/runner"
@@ -348,6 +349,8 @@ func derefInt(p *int) any {
 }
 
 // runSession handles the `shtrace session <verb>` subtree.
+// context.Context is accepted for API consistency with other handlers; it is
+// currently unused because IDGenerator.NewSessionID has no cancellation point.
 func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "usage: shtrace session <verb>")
@@ -384,17 +387,40 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 	shell := args[0]
 	switch shell {
 	case "bash", "zsh":
-		// The snippet is intentionally POSIX-compatible so the same code
-		// works for both shells without separate branches.
-		fmt.Fprint(stdout, `if [ -z "${SHTRACE_SESSION_ID:-}" ]; then
-  export SHTRACE_SESSION_ID="$(shtrace session new)"
-fi
-`)
+		// Use the absolute path of the running binary so the snippet works
+		// correctly even when PATH is not yet fully configured (e.g. early in
+		// .bashrc) or when multiple shtrace versions coexist.
+		self, err := os.Executable()
+		if err != nil {
+			// Rare (e.g. procfs unavailable, AppArmor restriction), but fall
+			// back to the bare name so the snippet is still usable. Warn so
+			// the user can diagnose if the generated snippet does not work.
+			fmt.Fprintf(stderr, "shtrace: warning: could not resolve binary path (%v); falling back to 'shtrace'\n", err)
+			self = "shtrace"
+		} else if strings.ContainsRune(self, '\x00') {
+			// A NUL byte in a shell snippet would terminate the string early
+			// in most shells. Guard defensively even though os.Executable()
+			// should never return a NUL-containing path.
+			fmt.Fprintf(stderr, "shtrace: warning: binary path contains NUL byte; falling back to 'shtrace'\n")
+			self = "shtrace"
+		}
+		// The snippet is intentionally POSIX-compatible so the same text
+		// works for both bash and zsh without separate branches.
+		// shellQuote wraps the path in single-quotes so that spaces and
+		// special characters in the binary path do not break the snippet.
+		fmt.Fprintf(stdout, "if [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
 		return 0
 	default:
 		fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
 		return 2
 	}
+}
+
+// shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
+// shell snippet even when s contains spaces or other special characters.
+// Single-quote characters within s are handled via the '\''-idiom.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func splitLines(b []byte) [][]byte {

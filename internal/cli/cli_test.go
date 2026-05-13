@@ -247,13 +247,24 @@ func TestCLI_ShowOutputsTheRecordedJSONL(t *testing.T) {
 }
 
 // TestCLI_SessionNew_OutputsUUIDv7 verifies that `shtrace session new`
-// prints a single UUIDv7 string with the correct format.
+// prints a single UUIDv7 string with the correct format per RFC 9562.
 func TestCLI_SessionNew_OutputsUUIDv7(t *testing.T) {
 	stdout, stderr, exit, _ := runHarness(t, "shtrace", "session", "new")
 	if exit != 0 {
 		t.Fatalf("exit = %d, stderr=%q", exit, stderr)
 	}
-	id := strings.TrimSpace(stdout)
+	// session new must print exactly one line so that shell command substitution
+	// $(shtrace session new) does not embed a newline in the session ID.
+	// TrimRight strips the trailing \n that fmt.Fprintln adds; then Split
+	// on \n lets us count actual content lines before any trimming.
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("session new must print exactly one line, got %d lines: %q", len(lines), stdout)
+	}
+	// Normalize to lowercase so the checks below work regardless of whether
+	// the ID generator uses upper- or lower-case hex (Go's hex.EncodeToString
+	// always emits lower-case, but this makes the test implementation-agnostic).
+	id := strings.ToLower(lines[0])
 	// UUIDv7: 8-4-4-4-12 hex chars
 	if len(id) != 36 {
 		t.Fatalf("id length = %d, want 36: %q", len(id), id)
@@ -262,14 +273,24 @@ func TestCLI_SessionNew_OutputsUUIDv7(t *testing.T) {
 	if len(parts) != 5 {
 		t.Fatalf("expected 5 dash-separated parts, got %d: %q", len(parts), id)
 	}
-	// version nibble must be 7
+	// version nibble (parts[2][0]) must be '7' (RFC 9562 §5.7)
 	if len(parts[2]) != 4 || parts[2][0] != '7' {
-		t.Fatalf("expected version nibble '7', got %q", parts[2])
+		t.Fatalf("expected version nibble '7', got %q in %q", string(parts[2][0]), id)
+	}
+	// variant bits (parts[3][0]) must be 8, 9, a, or b (RFC 9562 §4.1)
+	if len(parts[3]) != 4 {
+		t.Fatalf("expected 4-char group at parts[3], got %q", parts[3])
+	}
+	v := parts[3][0]
+	if v != '8' && v != '9' && v != 'a' && v != 'b' {
+		t.Fatalf("expected variant nibble 8/9/a/b, got %q in %q", string(v), id)
 	}
 }
 
 // TestCLI_SessionNew_DifferentEachCall ensures two consecutive calls produce
-// distinct IDs (collision probability with UUIDv7 is astronomically low).
+// distinct IDs. Even when both calls fall within the same millisecond (same
+// UUIDv7 timestamp), the 74 independent random bits make a collision
+// astronomically unlikely (p ≈ 2⁻⁷⁴ per pair).
 func TestCLI_SessionNew_DifferentEachCall(t *testing.T) {
 	s1, _, _, _ := runHarness(t, "shtrace", "session", "new")
 	s2, _, _, _ := runHarness(t, "shtrace", "session", "new")
@@ -299,8 +320,11 @@ func TestCLI_ShellInit_Bash(t *testing.T) {
 	if !strings.Contains(stdout, "SHTRACE_SESSION_ID") {
 		t.Fatalf("snippet missing SHTRACE_SESSION_ID: %q", stdout)
 	}
-	if !strings.Contains(stdout, "shtrace session new") {
-		t.Fatalf("snippet should call 'shtrace session new': %q", stdout)
+	// The snippet embeds the full path of the running binary followed by
+	// "session new", so we check for the subcommand rather than the literal
+	// binary name (which is the test binary path during go test).
+	if !strings.Contains(stdout, "session new") {
+		t.Fatalf("snippet should call '<shtrace> session new': %q", stdout)
 	}
 	if !strings.Contains(stdout, "export") {
 		t.Fatalf("snippet must export the variable: %q", stdout)
@@ -337,6 +361,25 @@ func TestCLI_ShellInit_MissingArg(t *testing.T) {
 	_, _, exit, _ := runHarness(t, "shtrace", "shell-init")
 	if exit != 2 {
 		t.Fatalf("exit = %d, want 2", exit)
+	}
+}
+
+// TestShellQuote verifies that shellQuote produces safe POSIX single-quoted
+// strings for paths that contain spaces or embedded single-quote characters.
+func TestShellQuote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/usr/local/bin/shtrace", "'/usr/local/bin/shtrace'"},
+		{"/path with spaces/shtrace", "'/path with spaces/shtrace'"},
+		{"/path/with'quote/shtrace", `'/path/with'\''quote/shtrace'`},
+		{"", "''"},
+	}
+	for _, tc := range cases {
+		if got := shellQuote(tc.in); got != tc.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
