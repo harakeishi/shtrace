@@ -175,9 +175,8 @@ func (f *FTSStore) Search(ctx context.Context, query string, limit int) ([]Searc
 //
 // The entire operation runs inside a single transaction so callers always see
 // either the old index or the fully rebuilt one — never a partial state.
-// A final FTS5 'rebuild' command synchronises the virtual table from
-// span_contents, correcting any internal inconsistency that accumulated
-// during the delete+re-insert phase.
+// The span_contents_ai trigger propagates each INSERT to outputs_fts, so no
+// manual 'rebuild' command is needed after the re-insert phase.
 func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string) error {
 	// math.MaxInt32 fetches all sessions; passing 0 would silently cap at 50.
 	sessions, err := store.ListSessions(ctx, math.MaxInt32, nil)
