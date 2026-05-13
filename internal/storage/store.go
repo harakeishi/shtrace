@@ -216,10 +216,18 @@ func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) (
 // two cases need different user-facing messages.
 var ErrSessionNotFound = errors.New("session not found")
 
-// ErrSessionCorrupt is returned by GetSession when the row exists but one of
-// its columns fails to parse. GetSession joins ErrSessionCorrupt with the
-// underlying parse error via errors.Join, so callers can errors.Is against
-// either sentinel and unwrap the underlying cause for diagnostics.
+// ErrSessionCorrupt is returned by GetSession when the row exists but one
+// of its columns fails to parse. GetSession joins ErrSessionCorrupt with
+// the underlying parse error via errors.Join, so:
+//
+//   - errors.Is(err, ErrSessionCorrupt) is true.
+//   - errors.As against concrete parse error types (e.g. *time.ParseError,
+//     *json.SyntaxError) works through the join.
+//   - The underlying error's message appears in err.Error() for diagnostics.
+//
+// Note: errors.Unwrap returns nil on a joined error (the join exposes
+// Unwrap() []error, not Unwrap() error). Use errors.Is / errors.As, not
+// errors.Unwrap, to inspect causes.
 var ErrSessionCorrupt = errors.New("session row corrupt")
 
 // GetSession returns the single session row with the given id.

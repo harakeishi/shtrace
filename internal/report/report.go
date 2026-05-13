@@ -48,9 +48,12 @@ type Options struct {
 	Warn func(error)
 }
 
-// Chunk is one rendered line in the timeline view.
+// chunkView is one rendered line in the timeline view. Stream maps to a
+// CSS class via the template's streamClass funcmap; Data is the recorded
+// payload after sanitizeForHTML stripping. The per-chunk timestamp is
+// intentionally omitted because the template does not display it — adding
+// it back is cheap when a future timeline layout wants it.
 type chunkView struct {
-	TS     string
 	Stream string
 	Data   string
 }
@@ -243,7 +246,7 @@ func readChunks(path string) ([]chunkView, int, error) {
 				corrupt++
 				continue
 			}
-			out = append(out, chunkView{TS: c.TS, Stream: c.Stream, Data: sanitizeForHTML(c.Data)})
+			out = append(out, chunkView{Stream: c.Stream, Data: sanitizeForHTML(c.Data)})
 		}
 	}
 	return out, corrupt, nil

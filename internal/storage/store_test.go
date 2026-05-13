@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -406,10 +407,14 @@ func TestStore_GetSession_ReturnsCorruptOnBadTagsJSON(t *testing.T) {
 	}
 }
 
-// TestStore_GetSession_CorruptUnwrapsUnderlyingCause locks in the doc
-// promise that the underlying parse error is reachable via errors.Is /
-// errors.Unwrap (we use errors.Join so both sentinels are reachable).
-func TestStore_GetSession_CorruptUnwrapsUnderlyingCause(t *testing.T) {
+// TestStore_GetSession_CorruptExposesUnderlyingCause locks in the doc
+// contract that the underlying parse error is reachable through the
+// errors.Join wrap: errors.As against the concrete parse error type works,
+// and the offending input appears in err.Error() for human diagnostics.
+//
+// (errors.Unwrap returns nil on a joined error because the join exposes
+// Unwrap() []error, not Unwrap() error — see the doc on ErrSessionCorrupt.)
+func TestStore_GetSession_CorruptExposesUnderlyingCause(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "sessions.db"))
 	if err != nil {
@@ -427,23 +432,17 @@ func TestStore_GetSession_CorruptUnwrapsUnderlyingCause(t *testing.T) {
 	if !errors.Is(err, ErrSessionCorrupt) {
 		t.Fatalf("missing ErrSessionCorrupt sentinel: %v", err)
 	}
-	// The underlying time.Parse error should be surfaced in the message so
-	// the message helps a human diagnose; this also documents that a future
-	// refactor must not swallow the cause.
-	if msg := err.Error(); !contains(msg, "not-a-ts") {
+	// errors.As must traverse the join and find the concrete time.ParseError
+	// that started_at parsing produced — this is the strong "cause reachable"
+	// assertion, distinct from substring-matching the message.
+	var parseErr *time.ParseError
+	if !errors.As(err, &parseErr) {
+		t.Errorf("expected errors.As to expose *time.ParseError through the join, got %T (%v)", err, err)
+	}
+	// And the offending input should surface in err.Error() for humans.
+	if msg := err.Error(); !strings.Contains(msg, "not-a-ts") {
 		t.Errorf("error message should reference the offending value, got %q", msg)
 	}
-}
-
-// contains is a tiny local helper to avoid importing strings just for this
-// test file.
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 func TestStore_GetSession_RoundTripsHealthyRow(t *testing.T) {

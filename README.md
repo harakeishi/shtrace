@@ -12,9 +12,11 @@ a SaaS.
 
 ## Status
 
-**Phase 1 (Collector MVP) — alpha.** Phase 2 (MCP server) and the rest of
-Phase 3 (CI artifact + export/import) are planned but not yet implemented.
-See [Roadmap](#roadmap).
+**Phase 1 (Collector MVP) — alpha.** Mode A (PTY), mode B (pipe), FTS5
+search, storage GC, entropy-based secret masking, and `shtrace report`
+all ship today. Phase 2 (MCP server) and the rest of Phase 3 (export /
+import, GitHub Actions workflow, `pr-comment`) are planned but not yet
+implemented. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -147,10 +149,12 @@ export SHTRACE_SESSION_ID="$(shtrace session new)"
 ### Recording modes
 
 - **mode B (pipe)** — when shtrace's stdout is not a TTY (CI, redirects,
-  pipes). Captures stdout and stderr as separate streams. **This is what is
-  implemented today.**
-- **mode A (PTY)** — when shtrace's stdout is a TTY. Will allocate a PTY to
-  preserve color/progress-bar output. **Not yet implemented.**
+  pipes). Captures stdout and stderr as separate streams.
+- **mode A (PTY)** — when shtrace's stdout is a TTY. Allocates a PTY to
+  preserve color/progress-bar output; the recorded stream is labelled
+  `pty` because the kernel interleaves stdout/stderr onto the same fd.
+  Pass `--mode pipe` to force pipe mode even on a TTY (useful for
+  reproducing CI behaviour locally).
 
 Both modes share a single on-disk JSON Lines schema (`stream` field
 disambiguates `stdout` / `stderr` / `pty`).
@@ -213,7 +217,7 @@ design — CI integration should be a single env var, not a checked-in file).
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1. Collector MVP | `shtrace <cmd>`, `ls`, `show`, mode B, secret masking, session propagation, SQLite + JSON L, `shell-init` | partially done (mode A, FTS5, GC, entropy masking still pending) |
+| 1. Collector MVP | `shtrace <cmd>`, `ls`, `show`, mode A (PTY) + mode B (pipe), `search` (FTS5), `gc`, secret masking (patterns + entropy), session propagation, SQLite + JSON Lines, `shell-init` | done |
 | 2. MCP server | `shtrace mcp` stdio server with `get_session`, `search_commands`, `detect_test_runs`, `compare_runs` | planned |
 | 3. PR verification + HTML report | `shtrace report` (done), `shtrace export/import`, GitHub Actions workflow, `shtrace pr-comment` | in progress |
 | 4. Web UI | `shtrace serve` with dynamic search, asciinema-style replay, diff view | stretch goal |
