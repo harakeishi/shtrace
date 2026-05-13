@@ -87,7 +87,14 @@ func TestPTYRunner_MasksSecretsInRecordedChunks(t *testing.T) {
 
 // TestPTYRunner_ForwardsTTYOutput verifies that PTY output is written to the
 // Tty writer (pass-through to the user's terminal). os.Pipe() provides a real
-// *os.File so the Tty path in RunPTY is exercised.
+// *os.File so the Tty forwarding path in RunPTY is exercised.
+//
+// Note: pw is a pipe, not a real TTY. term.MakeRaw and pty.InheritSize will
+// fail on it (silently, by design) so raw-mode and resize are not tested here
+// — those require a real PTY master which is not available in CI. This test
+// intentionally sets Tty != nil, which also registers a SIGWINCH handler; this
+// is the only test that does so and it does not call t.Parallel() to avoid
+// interference with other tests.
 func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 	rec := &recordingWriter{}
 

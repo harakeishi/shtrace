@@ -158,14 +158,15 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 		}
 	}
 
-	// Resolve the effective mode: if PTY was requested but stdout is not a
-	// *os.File the output would be silently lost, so fall back to pipe.
+	// Resolve the effective mode: PTY requires stdout to be a real terminal.
+	// If it is not (e.g. redirected to a file, non-*os.File writer), fall back
+	// to pipe so output is not silently lost and ioctls don't fail mid-run.
 	var ptyTty *os.File
 	if mode == "pty" {
-		if f, ok := stdout.(*os.File); ok {
+		if f, ok := stdout.(*os.File); ok && isatty.IsTerminal(f.Fd()) {
 			ptyTty = f
 		} else {
-			_, _ = fmt.Fprintf(stderr, "shtrace: warning: --mode pty requested but stdout is not a terminal; falling back to pipe\n")
+			_, _ = fmt.Fprintf(stderr, "shtrace: warning: --mode pty requested but stdout is not a TTY; falling back to pipe\n")
 			mode = "pipe"
 		}
 	}
