@@ -217,8 +217,9 @@ func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) (
 var ErrSessionNotFound = errors.New("session not found")
 
 // ErrSessionCorrupt is returned by GetSession when the row exists but one of
-// its columns fails to parse. The underlying parse error is wrapped so
-// callers can still inspect the cause via errors.Unwrap.
+// its columns fails to parse. GetSession joins ErrSessionCorrupt with the
+// underlying parse error via errors.Join, so callers can errors.Is against
+// either sentinel and unwrap the underlying cause for diagnostics.
 var ErrSessionCorrupt = errors.New("session row corrupt")
 
 // GetSession returns the single session row with the given id.
@@ -248,19 +249,19 @@ func (s *Store) GetSession(ctx context.Context, id string) (Session, error) {
 	}
 	t, err := time.Parse(time.RFC3339Nano, startedAt)
 	if err != nil {
-		return Session{}, fmt.Errorf("%w: parse started_at %q: %v", ErrSessionCorrupt, startedAt, err)
+		return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse started_at %q: %w", startedAt, err))
 	}
 	sess.StartedAt = t
 	if endedAt.Valid {
 		t, err := time.Parse(time.RFC3339Nano, endedAt.String)
 		if err != nil {
-			return Session{}, fmt.Errorf("%w: parse ended_at %q: %v", ErrSessionCorrupt, endedAt.String, err)
+			return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse ended_at %q: %w", endedAt.String, err))
 		}
 		sess.EndedAt = &t
 	}
 	sess.Tags = map[string]string{}
 	if err := json.Unmarshal([]byte(tagsJSON), &sess.Tags); err != nil {
-		return Session{}, fmt.Errorf("%w: parse tags_json: %v", ErrSessionCorrupt, err)
+		return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse tags_json: %w", err))
 	}
 	return sess, nil
 }

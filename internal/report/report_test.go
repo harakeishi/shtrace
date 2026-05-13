@@ -288,6 +288,32 @@ func TestRender_SurfacesCorruptSessionDistinctly(t *testing.T) {
 	}
 }
 
+// TestSortTags exercises the determinism guarantee directly. Within a
+// single Go test binary, map iteration order is randomised once at process
+// start and reused for every subsequent iteration, so a high-level "render
+// twice and compare" test cannot actually detect a missing sort. This test
+// asserts the explicit key order instead.
+func TestSortTags(t *testing.T) {
+	in := map[string]string{"z": "1", "a": "2", "m": "3", "b": "4"}
+	got := sortTags(in)
+	wantKeys := []string{"a", "b", "m", "z"}
+	if len(got) != len(wantKeys) {
+		t.Fatalf("len = %d, want %d", len(got), len(wantKeys))
+	}
+	for i, kv := range got {
+		if kv.K != wantKeys[i] {
+			t.Errorf("got[%d].K = %q, want %q", i, kv.K, wantKeys[i])
+		}
+		if kv.V != in[kv.K] {
+			t.Errorf("got[%d].V = %q, want %q", i, kv.V, in[kv.K])
+		}
+	}
+	// Empty map → empty slice (not nil checks specifically, just length).
+	if got := sortTags(nil); len(got) != 0 {
+		t.Errorf("sortTags(nil) returned %v, want empty", got)
+	}
+}
+
 // TestRender_TagsAreDeterministic verifies that two renders of the same
 // session produce byte-identical tag ordering, so CI artifact diffing
 // stays meaningful. Map iteration order is randomised per process, so this

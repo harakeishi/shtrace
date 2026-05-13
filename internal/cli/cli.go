@@ -571,15 +571,21 @@ const reportUsage = "usage: shtrace report (--session <id> | --latest) [--output
 // parseReportArgs is split out from runReport so the flag-validation rules
 // can be unit-tested without spinning up a Store.
 func parseReportArgs(args []string) (sessionID, output string, latest bool, err error) {
-	// takeValue extracts a flag value, rejecting accidental flag-eats-flag
-	// patterns: `--session --output foo` would otherwise assign sessionID
-	// = "--output", which then trips an unknown-positional error far from
-	// the actual bug site.
+	// reportFlagTokens are the literal flag spellings runReport accepts.
+	// takeValue uses this set to detect "flag-eats-flag" patterns where a
+	// user forgets a value and the parser silently assigns the next flag
+	// token as the value (e.g. `--session --output foo` would otherwise
+	// produce sessionID = "--output" and a confusing positional error).
+	// We check the full set rather than `--` prefix only, so single-dash
+	// flags (`-o`) are also caught.
+	reportFlagTokens := map[string]bool{
+		"--session": true, "--output": true, "--latest": true, "-o": true,
+	}
 	takeValue := func(flag, raw string) (string, error) {
 		if raw == "" {
 			return "", fmt.Errorf("%s requires a non-empty value", flag)
 		}
-		if strings.HasPrefix(raw, "--") {
+		if reportFlagTokens[raw] || strings.HasPrefix(raw, "--") {
 			return "", fmt.Errorf("%s requires a value but got the next flag %q", flag, raw)
 		}
 		return raw, nil

@@ -592,6 +592,8 @@ func TestParseReportArgs(t *testing.T) {
 		{name: "missing selector", args: nil, wantErr: "either --session"},
 		{name: "session and latest", args: []string{"--session", "x", "--latest"}, wantErr: "mutually exclusive"},
 		{name: "session swallows flag", args: []string{"--session", "--output", "r.html"}, wantErr: "--session requires a value but got the next flag"},
+		{name: "session swallows single-dash flag", args: []string{"--session", "-o", "r.html"}, wantErr: "--session requires a value but got the next flag"},
+		{name: "output swallows single-dash flag", args: []string{"--output", "-o"}, wantErr: "requires a value but got the next flag"},
 		{name: "empty session=", args: []string{"--session=", "--latest"}, wantErr: "non-empty"},
 		{name: "session missing trailing value", args: []string{"--session"}, wantErr: "requires a value"},
 		{name: "unknown flag", args: []string{"--bogus"}, wantErr: "unknown report flag"},

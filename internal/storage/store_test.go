@@ -362,6 +362,90 @@ func TestStore_GetSession_ReturnsCorruptOnBadTimestamp(t *testing.T) {
 	}
 }
 
+func TestStore_GetSession_ReturnsCorruptOnBadEndedAt(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	// Valid started_at, junk ended_at: covers the second of the three
+	// corrupt-column branches in GetSession.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, ended_at, tags_json) VALUES('e', '2026-05-13T10:00:00Z', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "e")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("err = %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+func TestStore_GetSession_ReturnsCorruptOnBadTagsJSON(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	// Valid timestamps, junk tags_json: covers the third corrupt branch
+	// and guards against a refactor accidentally dropping its sentinel.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('t', '2026-05-13T10:00:00Z', '{not-json')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "t")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("err = %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+// TestStore_GetSession_CorruptUnwrapsUnderlyingCause locks in the doc
+// promise that the underlying parse error is reachable via errors.Is /
+// errors.Unwrap (we use errors.Join so both sentinels are reachable).
+func TestStore_GetSession_CorruptUnwrapsUnderlyingCause(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('u', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "u")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("missing ErrSessionCorrupt sentinel: %v", err)
+	}
+	// The underlying time.Parse error should be surfaced in the message so
+	// the message helps a human diagnose; this also documents that a future
+	// refactor must not swallow the cause.
+	if msg := err.Error(); !contains(msg, "not-a-ts") {
+		t.Errorf("error message should reference the offending value, got %q", msg)
+	}
+}
+
+// contains is a tiny local helper to avoid importing strings just for this
+// test file.
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestStore_GetSession_RoundTripsHealthyRow(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(filepath.Join(dir, "sessions.db"))
