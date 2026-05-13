@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/harakeishi/shtrace/internal/runner"
@@ -23,7 +24,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
-		fmt.Fprintln(stderr, "subcommands: run (default), ls, show")
+		fmt.Fprintln(stderr, "subcommands: run (default), ls, show, session, shell-init")
 		return 2
 	}
 
@@ -32,6 +33,10 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runLs(ctx, argv[2:], stdout, stderr)
 	case "show":
 		return runShow(ctx, argv[2:], stdout, stderr)
+	case "session":
+		return runSession(ctx, argv[2:], stdout, stderr)
+	case "shell-init":
+		return runShellInit(argv[2:], stdout, stderr)
 	case "--":
 		return runWrapped(ctx, argv[2:], stdout, stderr)
 	default:
@@ -341,6 +346,81 @@ func derefInt(p *int) any {
 		return "?"
 	}
 	return *p
+}
+
+// runSession handles the `shtrace session <verb>` subtree.
+// context.Context is accepted for API consistency with other handlers; it is
+// currently unused because IDGenerator.NewSessionID has no cancellation point.
+func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: shtrace session <verb>")
+		fmt.Fprintln(stderr, "verbs: new")
+		return 2
+	}
+	switch args[0] {
+	case "new":
+		id, err := session.DefaultIDGenerator().NewSessionID()
+		if err != nil {
+			fmt.Fprintf(stderr, "shtrace: generate session id: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, id)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "shtrace: unknown session verb %q\n", args[0])
+		return 2
+	}
+}
+
+// runShellInit outputs a shell snippet that, when eval'd in a user's rc file,
+// automatically exports SHTRACE_SESSION_ID for every new terminal session.
+//
+// Usage:
+//
+//	shtrace shell-init bash
+//	shtrace shell-init zsh
+func runShellInit(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: shtrace shell-init <bash|zsh>")
+		return 2
+	}
+	shell := args[0]
+	switch shell {
+	case "bash", "zsh":
+		// Use the absolute path of the running binary so the snippet works
+		// correctly even when PATH is not yet fully configured (e.g. early in
+		// .bashrc) or when multiple shtrace versions coexist.
+		self, err := os.Executable()
+		if err != nil {
+			// Rare (e.g. procfs unavailable, AppArmor restriction), but fall
+			// back to the bare name so the snippet is still usable. Warn so
+			// the user can diagnose if the generated snippet does not work.
+			fmt.Fprintf(stderr, "shtrace: warning: could not resolve binary path (%v); falling back to 'shtrace'\n", err)
+			self = "shtrace"
+		} else if strings.ContainsRune(self, '\x00') {
+			// A NUL byte in a shell snippet would terminate the string early
+			// in most shells. Guard defensively even though os.Executable()
+			// should never return a NUL-containing path.
+			fmt.Fprintf(stderr, "shtrace: warning: binary path contains NUL byte; falling back to 'shtrace'\n")
+			self = "shtrace"
+		}
+		// The snippet is intentionally POSIX-compatible so the same text
+		// works for both bash and zsh without separate branches.
+		// shellQuote wraps the path in single-quotes so that spaces and
+		// special characters in the binary path do not break the snippet.
+		fmt.Fprintf(stdout, "if [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
+		return 0
+	default:
+		fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
+		return 2
+	}
+}
+
+// shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
+// shell snippet even when s contains spaces or other special characters.
+// Single-quote characters within s are handled via the '\''-idiom.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func splitLines(b []byte) [][]byte {
