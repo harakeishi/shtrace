@@ -116,10 +116,11 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		Tty:    pw,
 		Masker: secret.DefaultMasker(),
 	})
-	// Close pw so the reader goroutine sees EOF.
+	// Close pw so the reader goroutine sees EOF, then wait for it to finish
+	// before closing pr to avoid a read-on-closed-fd race.
 	_ = pw.Close()
-	_ = pr.Close()
 	ttyOutput := <-done
+	_ = pr.Close()
 
 	if runErr != nil {
 		t.Fatalf("RunPTY: %v", runErr)

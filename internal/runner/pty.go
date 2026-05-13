@@ -69,6 +69,13 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 	// Mirror terminal resize events to the PTY.
 	// The goroutine is tracked by a WaitGroup so we can guarantee it has
 	// exited before ptmx is closed (LIFO: this defer runs before ptmx.Close).
+	//
+	// Concurrency note: signal.Notify uses a process-wide signal router. If
+	// multiple RunPTY calls run concurrently (each with a non-nil Tty), each
+	// will receive every SIGWINCH. This is harmless in practice because
+	// concurrent interactive PTY sessions through shtrace are not a supported
+	// use case; the only multi-PTY scenario is test parallelism, which is
+	// avoided by keeping Tty=nil in tests.
 	if opt.Tty != nil {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGWINCH)

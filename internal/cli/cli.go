@@ -130,7 +130,10 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 	}
 	defer func() { _ = logFile.Close() }()
 
-	cwd, _ := os.Getwd()
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+	}
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
 
 	jsonl := storage.NewJSONLWriter(logFile, nil)
@@ -155,31 +158,32 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 		}
 	}
 
-	var res runner.Result
-	var runErr error
+	// Resolve the effective mode: if PTY was requested but stdout is not a
+	// *os.File the output would be silently lost, so fall back to pipe.
+	var ptyTty *os.File
 	if mode == "pty" {
-		var tty *os.File
 		if f, ok := stdout.(*os.File); ok {
-			tty = f
+			ptyTty = f
 		} else {
-			// stdout is not a *os.File (e.g. test buffer, redirected pipe).
-			// PTY output would be silently lost, so fall back to pipe mode.
 			_, _ = fmt.Fprintf(stderr, "shtrace: warning: --mode pty requested but stdout is not a terminal; falling back to pipe\n")
 			mode = "pipe"
 		}
-		if mode == "pty" {
-			res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
-				Argv:   cmdArgs,
-				Env:    childEnv,
-				Cwd:    cwd,
-				Writer: jsonl,
-				Tty:    tty,
-				Stderr: stderr,
-				Masker: masker,
-			})
-		}
 	}
-	if mode == "pipe" {
+
+	var res runner.Result
+	var runErr error
+	switch mode {
+	case "pty":
+		res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
+			Argv:   cmdArgs,
+			Env:    childEnv,
+			Cwd:    cwd,
+			Writer: jsonl,
+			Tty:    ptyTty,
+			Stderr: stderr,
+			Masker: masker,
+		})
+	default: // "pipe"
 		res, runErr = runner.RunPipe(ctx, runner.PipeOptions{
 			Argv:   cmdArgs,
 			Env:    childEnv,
@@ -588,25 +592,32 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// parseMode extracts an optional --mode <value> flag from argv (argv[0] is the
-// program name) and returns the mode string and the remaining argv. argv is
-// returned unmodified if --mode is absent. Returns ("", argv, error) when an
-// invalid mode value is supplied.
+// parseMode extracts an optional --mode <value> (or --mode=<value>) flag from
+// argv (argv[0] is the program name) and returns the mode string and the
+// remaining argv. argv is returned unmodified if --mode is absent.
+// Returns ("", argv, error) when the flag is malformed or an unsupported value.
 func parseMode(argv []string) (mode string, rest []string, err error) {
 	out := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
-		if argv[i] == "--mode" {
+		arg := argv[i]
+		var val string
+		switch {
+		case arg == "--mode":
 			if i+1 >= len(argv) {
 				return "", argv, fmt.Errorf("--mode requires a value (pipe or pty)")
 			}
-			mode = argv[i+1]
-			if mode != "pipe" && mode != "pty" {
-				return "", argv, fmt.Errorf("--mode %q is invalid: must be pipe or pty", mode)
-			}
-			i++ // skip value
+			val = argv[i+1]
+			i++ // skip value token
+		case strings.HasPrefix(arg, "--mode="):
+			val = strings.TrimPrefix(arg, "--mode=")
+		default:
+			out = append(out, arg)
 			continue
 		}
-		out = append(out, argv[i])
+		if val != "pipe" && val != "pty" {
+			return "", argv, fmt.Errorf("--mode %q is invalid: must be pipe or pty", val)
+		}
+		mode = val
 	}
 	return mode, out, nil
 }
