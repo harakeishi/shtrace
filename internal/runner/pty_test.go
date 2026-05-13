@@ -117,6 +117,11 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		done <- sb.String()
 	}()
 
+	// Defer pw.Close() so it is called even if RunPTY panics, preventing the
+	// reader goroutine from blocking on pr.Read indefinitely.
+	defer func() { _ = pw.Close() }()
+	defer func() { _ = pr.Close() }()
+
 	_, runErr := RunPTY(context.Background(), PTYOptions{
 		Argv:   []string{"sh", "-c", "printf world"},
 		Writer: rec,
@@ -124,10 +129,9 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		Masker: secret.DefaultMasker(),
 	})
 	// Close pw so the reader goroutine sees EOF, then wait for it to finish
-	// before closing pr to avoid a read-on-closed-fd race.
+	// before the deferred pr.Close to avoid a read-on-closed-fd race.
 	_ = pw.Close()
 	ttyOutput := <-done
-	_ = pr.Close()
 
 	if runErr != nil {
 		t.Fatalf("RunPTY: %v", runErr)

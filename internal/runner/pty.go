@@ -62,13 +62,16 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	// ptmx is closed last (registered first) so all defers that reference it
-	// run to completion before the fd is invalidated.
+	// ptmx is closed last because it is registered first (Go defers are LIFO).
+	// All defers registered below — including the SIGWINCH goroutine wait —
+	// are registered after this line, so they run before ptmx.Close().
+	// IMPORTANT: do not move this defer after the signal goroutine setup below;
+	// doing so would invert the order and cause a use-after-close race.
 	defer func() { _ = ptmx.Close() }()
 
 	// Mirror terminal resize events to the PTY.
 	// The goroutine is tracked by a WaitGroup so we can guarantee it has
-	// exited before ptmx is closed (LIFO: this defer runs before ptmx.Close).
+	// exited before ptmx is closed (registered after ptmx.Close → runs first).
 	//
 	// Concurrency note: signal.Notify uses a process-wide signal router. If
 	// multiple RunPTY calls run concurrently (each with a non-nil Tty), each
