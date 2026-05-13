@@ -64,15 +64,16 @@ func GCConfigFromEnv(env map[string]string) GCConfig {
 
 // GCResult summarises what the GC run deleted (or would delete in dry-run mode).
 type GCResult struct {
-	// SessionsRemoved is the number of sessions removed (or that would be).
+	// SessionsRemoved is the number of sessions fully removed (or that would be).
 	SessionsRemoved int
-	// BytesReclaimed is the total output-file bytes actually removed from disk
-	// (or that would be in dry-run). This count excludes bytes from sessions
-	// whose DB row was deleted but whose disk cleanup subsequently failed.
+	// BytesReclaimed is the total output-file bytes freed from disk (or that
+	// would be in dry-run). Sessions whose disk files were removed but whose
+	// DB row deletion subsequently failed are not counted here.
 	BytesReclaimed int64
-	// Sessions lists the IDs of removed sessions, oldest first. A session
-	// whose DB row was deleted but whose disk cleanup failed is still included
-	// so callers can identify partial failures.
+	// Sessions lists the IDs of sessions for which both disk cleanup and DB
+	// deletion succeeded (oldest first). A session whose disk files were
+	// removed but whose DB deletion failed is not included; it remains in the
+	// DB and will be retried on the next GC run.
 	Sessions []string
 }
 
