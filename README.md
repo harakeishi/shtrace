@@ -227,18 +227,26 @@ then the minimum implementation that makes it pass.
 ### Performance SLIs
 
 `shtrace` is a wrapper, so its overhead has to be invisible against the
-wrapped command. Concrete SLIs (committed-to ceilings, measured by the
-benchmarks above):
+wrapped command. Concrete SLIs (committed-to ceilings, all measured as
+**mean ns/op** by `go test -bench`; aggregate across `-count=N` runs with
+`benchstat` if you need a distribution):
 
-| SLI | Target | Benchmark |
+| SLI | Target (mean) | Benchmark |
 |---|---|---|
-| Wrapper overhead on a short command | wall-clock `shtrace -- printf hi` adds < 5 ms over a bare `printf hi` on the same host | `BenchmarkRunPipe_SmallOutput` |
-| Streaming overhead on bulk stdout | sustained throughput ≥ 10 MB/s through the masker + recorder pipeline for printable ASCII | `BenchmarkRunPipe_MediumOutput` (reports MB/s) |
-| Span insert | `InsertSpan` < 5 ms p50 on local SSD | `BenchmarkInsertSpan` |
-| Session list (50 rows out of 1 000) | < 10 ms p50 | `BenchmarkListSessions` |
-| Spans-for-session (100 rows) | < 10 ms p50 | `BenchmarkSpansForSession` |
-| FTS index of one span (100 lines) | < 10 ms p50 | `BenchmarkFTSIndexSpan` |
-| FTS search across 100 indexed spans | < 20 ms p50 | `BenchmarkFTSSearch` |
+| Wrapping a near-zero-output command (spawn floor) | wrapped wall-clock of `sh -c 'printf hi'` < 5 ms | `BenchmarkRunPipe_SpawnFloor` |
+| Masker + recorder streaming throughput (in-process, no child) | ≥ 10 MB/s for printable ASCII | `BenchmarkForwardStream_Throughput` (reports MB/s) |
+| Span insert (sqlite WAL, `synchronous=NORMAL`) | `InsertSpan` < 5 ms | `BenchmarkInsertSpan` |
+| Session list (50 rows out of 1 000) | < 10 ms | `BenchmarkListSessions` |
+| Spans-for-session (100 rows) | < 10 ms | `BenchmarkSpansForSession` |
+| FTS first-time index of one span (100 lines, fresh `span_id`) | < 10 ms | `BenchmarkFTSIndexSpan` |
+| FTS search across 100 indexed spans (~20 % selectivity) | < 20 ms | `BenchmarkFTSSearch` |
+
+The spawn-floor SLI measures wrapped wall-clock, not "wrapper overhead
+relative to a bare command" — the latter requires a separate baseline run
+and is currently out of scope. The storage SLIs assume the pragma settings
+applied by `storage.Open` (WAL journal, default `synchronous=NORMAL`); if a
+future change tightens durability to `FULL`, retune the ceilings or document
+the new floor.
 
 These targets are intentionally generous for the v0.x line — the goal is to
 catch regressions, not to chase microseconds. Once shtrace is integrated into

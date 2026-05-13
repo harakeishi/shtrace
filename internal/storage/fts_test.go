@@ -12,30 +12,30 @@ import (
 	"github.com/harakeishi/shtrace/internal/storage"
 )
 
-func writeTempLog(t *testing.T, dir, sessionID, spanID string, chunks []storage.Chunk) string {
-	t.Helper()
+func writeTempLog(tb testing.TB, dir, sessionID, spanID string, chunks []storage.Chunk) string {
+	tb.Helper()
 	logPath := storage.OutputPath(dir, sessionID, spanID)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+		tb.Fatalf("mkdir: %v", err)
 	}
 	f, err := os.Create(logPath)
 	if err != nil {
-		t.Fatalf("create log: %v", err)
+		tb.Fatalf("create log: %v", err)
 	}
 	for _, c := range chunks {
 		b, err := json.Marshal(c)
 		if err != nil {
-			t.Fatalf("marshal chunk: %v", err)
+			tb.Fatalf("marshal chunk: %v", err)
 		}
 		if _, err := f.Write(b); err != nil {
-			t.Fatalf("write chunk: %v", err)
+			tb.Fatalf("write chunk: %v", err)
 		}
 		if _, err := f.Write([]byte("\n")); err != nil {
-			t.Fatalf("write newline: %v", err)
+			tb.Fatalf("write newline: %v", err)
 		}
 	}
 	if err := f.Close(); err != nil {
-		t.Fatalf("close log: %v", err)
+		tb.Fatalf("close log: %v", err)
 	}
 	return logPath
 }
