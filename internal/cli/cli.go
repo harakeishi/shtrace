@@ -31,7 +31,11 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 
 	// Parse optional --mode flag before dispatching subcommands.
-	mode, argv := parseMode(argv)
+	mode, argv, modeErr := parseMode(argv)
+	if modeErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", modeErr)
+		return 2
+	}
 
 	switch argv[1] {
 	case "ls":
@@ -157,16 +161,25 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 		var tty *os.File
 		if f, ok := stdout.(*os.File); ok {
 			tty = f
+		} else {
+			// stdout is not a *os.File (e.g. test buffer, redirected pipe).
+			// PTY output would be silently lost, so fall back to pipe mode.
+			_, _ = fmt.Fprintf(stderr, "shtrace: warning: --mode pty requested but stdout is not a terminal; falling back to pipe\n")
+			mode = "pipe"
 		}
-		res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
-			Argv:   cmdArgs,
-			Env:    childEnv,
-			Cwd:    cwd,
-			Writer: jsonl,
-			Tty:    tty,
-			Masker: masker,
-		})
-	} else {
+		if mode == "pty" {
+			res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
+				Argv:   cmdArgs,
+				Env:    childEnv,
+				Cwd:    cwd,
+				Writer: jsonl,
+				Tty:    tty,
+				Stderr: stderr,
+				Masker: masker,
+			})
+		}
+	}
+	if mode == "pipe" {
 		res, runErr = runner.RunPipe(ctx, runner.PipeOptions{
 			Argv:   cmdArgs,
 			Env:    childEnv,
@@ -577,18 +590,25 @@ func shellQuote(s string) string {
 
 // parseMode extracts an optional --mode <value> flag from argv (argv[0] is the
 // program name) and returns the mode string and the remaining argv. argv is
-// returned unmodified if --mode is absent.
-func parseMode(argv []string) (mode string, rest []string) {
+// returned unmodified if --mode is absent. Returns ("", argv, error) when an
+// invalid mode value is supplied.
+func parseMode(argv []string) (mode string, rest []string, err error) {
 	out := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
-		if argv[i] == "--mode" && i+1 < len(argv) {
+		if argv[i] == "--mode" {
+			if i+1 >= len(argv) {
+				return "", argv, fmt.Errorf("--mode requires a value (pipe or pty)")
+			}
 			mode = argv[i+1]
+			if mode != "pipe" && mode != "pty" {
+				return "", argv, fmt.Errorf("--mode %q is invalid: must be pipe or pty", mode)
+			}
 			i++ // skip value
 			continue
 		}
 		out = append(out, argv[i])
 	}
-	return mode, out
+	return mode, out, nil
 }
 
 func splitLines(b []byte) [][]byte {

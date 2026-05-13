@@ -10,9 +10,12 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -25,10 +28,11 @@ import (
 // PTYOptions configures one mode A invocation.
 type PTYOptions struct {
 	Argv   []string
-	Env    []string // optional; nil means inherit os.Environ
-	Cwd    string   // optional; empty means inherit current cwd
+	Env    []string  // optional; nil means inherit os.Environ
+	Cwd    string    // optional; empty means inherit current cwd
 	Writer ChunkWriter
-	Tty    *os.File // terminal to forward PTY output to (typically os.Stdout)
+	Tty    *os.File  // terminal to forward PTY output to (typically os.Stdout)
+	Stderr io.Writer // for soft-error messages (e.g. MakeRaw failure); may be nil
 	Masker *secret.Masker
 }
 
@@ -58,28 +62,44 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	// ptmx is closed last (registered first) so all defers that reference it
+	// run to completion before the fd is invalidated.
 	defer func() { _ = ptmx.Close() }()
 
 	// Mirror terminal resize events to the PTY.
+	// The goroutine is tracked by a WaitGroup so we can guarantee it has
+	// exited before ptmx is closed (LIFO: this defer runs before ptmx.Close).
 	if opt.Tty != nil {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGWINCH)
+
+		// Set initial size directly — avoids a race where the goroutine might
+		// not have entered its range loop before the first SIGWINCH fires.
+		_ = pty.InheritSize(opt.Tty, ptmx)
+
+		var wg sync.WaitGroup
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for range ch {
 				_ = pty.InheritSize(opt.Tty, ptmx)
 			}
 		}()
-		ch <- syscall.SIGWINCH // set initial size
 		defer func() {
 			signal.Stop(ch)
 			close(ch)
+			wg.Wait() // must complete before ptmx.Close (registered earlier)
 		}()
 	}
 
 	// Set the caller's terminal to raw mode so escape sequences pass through.
 	if opt.Tty != nil {
-		oldState, err := term.MakeRaw(int(opt.Tty.Fd()))
-		if err == nil {
+		oldState, rawErr := term.MakeRaw(int(opt.Tty.Fd()))
+		if rawErr != nil {
+			if opt.Stderr != nil {
+				_, _ = fmt.Fprintf(opt.Stderr, "shtrace: warning: could not set raw mode: %v\n", rawErr)
+			}
+		} else {
 			defer func() { _ = term.Restore(int(opt.Tty.Fd()), oldState) }()
 		}
 	}

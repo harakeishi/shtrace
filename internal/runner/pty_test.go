@@ -4,7 +4,7 @@ package runner
 
 import (
 	"context"
-	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -57,11 +57,14 @@ func TestPTYRunner_PropagatesExitCode(t *testing.T) {
 	}
 }
 
+// TestPTYRunner_MasksSecretsInRecordedChunks verifies that the Replacement
+// marker appears instead of the raw secret, independent of which regex fired.
 func TestPTYRunner_MasksSecretsInRecordedChunks(t *testing.T) {
 	rec := &recordingWriter{}
 
+	const rawSecret = "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF"
 	_, err := RunPTY(context.Background(), PTYOptions{
-		Argv:   []string{"sh", "-c", "printf 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890ABCDEF\\n'"},
+		Argv:   []string{"sh", "-c", "printf 'Authorization: Bearer " + rawSecret + "\\n'"},
 		Writer: rec,
 		Tty:    nil,
 		Masker: secret.DefaultMasker(),
@@ -74,49 +77,54 @@ func TestPTYRunner_MasksSecretsInRecordedChunks(t *testing.T) {
 	for _, c := range rec.snapshot() {
 		all += c.Data
 	}
-	if strings.Contains(all, "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
+	if strings.Contains(all, rawSecret) {
 		t.Fatalf("recorded PTY chunks leaked secret: %q", all)
+	}
+	if !strings.Contains(all, secret.Replacement) {
+		t.Fatalf("expected replacement marker %q in recorded output, got: %q", secret.Replacement, all)
 	}
 }
 
+// TestPTYRunner_ForwardsTTYOutput verifies that PTY output is written to the
+// Tty writer (pass-through to the user's terminal). os.Pipe() provides a real
+// *os.File so the Tty path in RunPTY is exercised.
 func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 	rec := &recordingWriter{}
 
-	// Use a pipe as a stand-in for the tty writer — just to verify bytes flow.
-	pr, pw := io.Pipe()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+
 	done := make(chan string, 1)
 	go func() {
 		var sb strings.Builder
 		buf := make([]byte, 4096)
 		for {
-			n, err := pr.Read(buf)
+			n, readErr := pr.Read(buf)
 			sb.Write(buf[:n])
-			if err != nil {
+			if readErr != nil {
 				break
 			}
 		}
 		done <- sb.String()
 	}()
 
-	// We can't pass a *os.File here, so RunPTY with Tty=nil is a valid path.
-	// This test verifies the no-tty path doesn't panic and still records.
-	_, err := RunPTY(context.Background(), PTYOptions{
+	_, runErr := RunPTY(context.Background(), PTYOptions{
 		Argv:   []string{"sh", "-c", "printf world"},
 		Writer: rec,
-		Tty:    nil,
+		Tty:    pw,
 		Masker: secret.DefaultMasker(),
 	})
+	// Close pw so the reader goroutine sees EOF.
 	_ = pw.Close()
-	<-done
+	_ = pr.Close()
+	ttyOutput := <-done
 
-	if err != nil {
-		t.Fatalf("RunPTY: %v", err)
+	if runErr != nil {
+		t.Fatalf("RunPTY: %v", runErr)
 	}
-	var all string
-	for _, c := range rec.snapshot() {
-		all += c.Data
-	}
-	if !strings.Contains(all, "world") {
-		t.Fatalf("recorded PTY output does not contain 'world': %q", all)
+	if !strings.Contains(ttyOutput, "world") {
+		t.Fatalf("tty output %q does not contain 'world'", ttyOutput)
 	}
 }
