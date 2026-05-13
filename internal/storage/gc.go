@@ -126,29 +126,41 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 		}
 	}
 
-	// Build result and, unless dry-run, execute deletions (oldest first).
+	// Execute deletions (oldest first). In dry-run mode only report; do not
+	// touch disk or DB.
 	var result GCResult
 	for _, s := range sessions {
 		if _, ok := toDelete[s.ID]; !ok {
 			continue
 		}
 		sz, _ := gcSessionSize(baseDir, s.ID)
-		result.Sessions = append(result.Sessions, s.ID)
-		result.BytesReclaimed += sz
-		result.SessionsRemoved++
 
 		if dryRun {
+			result.Sessions = append(result.Sessions, s.ID)
+			result.BytesReclaimed += sz
+			result.SessionsRemoved++
 			continue
 		}
 
-		if fts != nil {
-			// Best-effort: FTS errors must not abort the GC run.
-			_ = fts.DeleteSessionIndex(ctx, s.ID)
-		}
+		// Deletion order: authoritative DB first, then FTS (best-effort),
+		// then disk. This ensures that if the DB delete fails the FTS index
+		// and output files are left intact and consistent.
 		if err := store.DeleteSession(ctx, s.ID); err != nil {
 			return result, fmt.Errorf("gc: delete session %s: %w", s.ID, err)
 		}
-		_ = os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID))
+		if fts != nil {
+			// FTS errors are non-fatal: the session is already gone from the
+			// authoritative DB so stale index rows are harmless.
+			_ = fts.DeleteSessionIndex(ctx, s.ID)
+		}
+		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
+			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
+		}
+
+		// Only count after every deletion step succeeds.
+		result.Sessions = append(result.Sessions, s.ID)
+		result.BytesReclaimed += sz
+		result.SessionsRemoved++
 	}
 	return result, nil
 }
@@ -157,24 +169,26 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 // baseDir/outputs/. Returns 0 without error when the directory does not exist.
 func gcTotalOutputSize(baseDir string) (int64, error) {
 	dir := filepath.Join(baseDir, "outputs")
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return 0, nil
+	}
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
 			return err
 		}
 		if !d.IsDir() {
-			if info, infoErr := d.Info(); infoErr == nil {
-				total += info.Size()
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				if os.IsNotExist(infoErr) {
+					return nil // benign TOCTOU race: file removed between enumeration and stat
+				}
+				return infoErr
 			}
+			total += info.Size()
 		}
 		return nil
 	})
-	if err != nil && os.IsNotExist(err) {
-		return 0, nil
-	}
 	return total, err
 }
 
@@ -182,23 +196,25 @@ func gcTotalOutputSize(baseDir string) (int64, error) {
 // Returns 0 without error when the session directory does not exist.
 func gcSessionSize(baseDir, sessionID string) (int64, error) {
 	dir := filepath.Join(baseDir, "outputs", sessionID)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return 0, nil
+	}
 	var total int64
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
 			return err
 		}
 		if !d.IsDir() {
-			if info, infoErr := d.Info(); infoErr == nil {
-				total += info.Size()
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				if os.IsNotExist(infoErr) {
+					return nil // benign TOCTOU race
+				}
+				return infoErr
 			}
+			total += info.Size()
 		}
 		return nil
 	})
-	if err != nil && os.IsNotExist(err) {
-		return 0, nil
-	}
 	return total, err
 }
