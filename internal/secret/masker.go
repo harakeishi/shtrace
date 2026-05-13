@@ -102,12 +102,16 @@ func (m *Masker) MaskString(s string) (string, int) {
 		// lets us count occurrences while substituting.
 		out = re.ReplaceAllStringFunc(out, func(match string) string {
 			count++
-			// Preserve a leading "Bearer " (case-insensitive) so logs stay
-			// diagnosable.
-			if len(match) >= 7 {
-				lower := match[:7]
-				if equalFoldASCII(lower, "Bearer ") {
-					return match[:7] + replacement
+			// Preserve "Bearer<whitespace>" (case-insensitive) so logs stay
+			// diagnosable. Walk past the 6-char "Bearer" word then skip all
+			// consecutive space/tab characters to handle any \s+ variant.
+			if len(match) >= 6 && equalFoldASCII(match[:6], "Bearer") {
+				i := 6
+				for i < len(match) && (match[i] == ' ' || match[i] == '\t') {
+					i++
+				}
+				if i > 6 {
+					return match[:i] + replacement
 				}
 			}
 			return replacement

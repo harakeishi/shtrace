@@ -35,6 +35,21 @@ func TestMasker_MasksBearerToken(t *testing.T) {
 	}
 }
 
+func TestMasker_MasksBearerToken_TabSeparated(t *testing.T) {
+	m := DefaultMasker()
+	in := "Authorization: Bearer\tabcdefghijklmnopqrstuvwxyz1234567890ABCDEF"
+
+	got, _ := m.MaskString(in)
+
+	if strings.Contains(got, "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
+		t.Fatalf("tab-separated bearer token leaked: %q", got)
+	}
+	// The "Bearer\t" prefix should be preserved so logs stay diagnosable.
+	if !strings.Contains(got, "Bearer\t") {
+		t.Fatalf("Bearer\\t prefix should remain, got %q", got)
+	}
+}
+
 func TestMasker_MasksGitHubPAT(t *testing.T) {
 	m := DefaultMasker()
 	in := "token ghp_abcdefghijklmnopqrstuvwxyz0123456789"
