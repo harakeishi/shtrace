@@ -116,6 +116,37 @@ func TestStreamMasker_MasksAcrossWrites(t *testing.T) {
 	}
 }
 
+func TestStreamMasker_SecretSplitAcrossLargeWrite(t *testing.T) {
+	// Reproduce the flush-boundary split bug: a single Write that delivers
+	// more than safetyTail bytes, where a literal secret straddles the
+	// cutoff position. The secret must NOT appear in the final output.
+	secret := "LITERALSECRET_ABCDEFGH" // 22-char literal
+	m, err := NewMaskerWithLiterals(nil, []string{secret})
+	if err != nil {
+		t.Fatalf("NewMaskerWithLiterals: %v", err)
+	}
+
+	// Build a payload whose total size exceeds safetyTail (256) so that the
+	// writer attempts a flush. Place the secret near the flush boundary so
+	// it would have been split by the old "mask flushable only" approach.
+	prefix := strings.Repeat("A", safetyTail-4) // puts secret near boundary
+	suffix := strings.Repeat("B", safetyTail)
+	payload := prefix + secret + suffix
+
+	var buf bytes.Buffer
+	w := NewMaskingWriter(&buf, m)
+	if _, err := io.WriteString(w, payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if strings.Contains(buf.String(), secret) {
+		t.Errorf("secret leaked through flush boundary: %q", buf.String())
+	}
+}
+
 func TestMasker_FailsSecure_OnUserPatternCompileError(t *testing.T) {
 	// A bad user-supplied pattern should not silently drop masking;
 	// fail-secure means the constructor errors out.

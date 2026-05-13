@@ -170,17 +170,24 @@ func NewMaskingWriter(w io.Writer, m *Masker) io.WriteCloser {
 
 func (mw *maskingWriter) Write(p []byte) (int, error) {
 	mw.buf = append(mw.buf, p...)
-	// Only flush up to len(buf)-safetyTail bytes; keep the tail so a secret
-	// straddling writes can still match.
 	if len(mw.buf) <= safetyTail {
 		return len(p), nil
 	}
-	flushable := mw.buf[:len(mw.buf)-safetyTail]
-	masked, _ := mw.masker.MaskString(string(flushable))
-	if _, err := mw.w.Write([]byte(masked)); err != nil {
+	// Mask the full buffer (not just the flushable prefix) so that a secret
+	// whose start falls inside the safety tail of the previous flush is still
+	// caught. Emit all but the last safetyTail characters of the masked output
+	// and store those characters — already masked — as the new buffer. Storing
+	// masked bytes is safe: replacement markers cannot match any pattern.
+	masked, _ := mw.masker.MaskString(string(mw.buf))
+	if len(masked) <= safetyTail {
+		mw.buf = []byte(masked)
+		return len(p), nil
+	}
+	cutoff := len(masked) - safetyTail
+	if _, err := mw.w.Write([]byte(masked[:cutoff])); err != nil {
 		return 0, err
 	}
-	mw.buf = mw.buf[len(mw.buf)-safetyTail:]
+	mw.buf = []byte(masked[cutoff:])
 	return len(p), nil
 }
 

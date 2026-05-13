@@ -207,6 +207,47 @@ func TestForwardStream_FlushesAfterLargeOutput(t *testing.T) {
 	}
 }
 
+// TestForwardStream_LiteralSecretAtFlushBoundary is the regression test for
+// the flush-boundary split: when a single Read delivers more than safetyTail
+// bytes and a literal secret straddles the cutoff position, the old
+// "mask flushable only" approach leaked it. This test verifies the fix.
+func TestForwardStream_LiteralSecretAtFlushBoundary(t *testing.T) {
+	const litSecret = "LITERAL_SECRET_TOKEN_ABCDEFGH"
+	m, err := secret.NewMaskerWithLiterals(nil, []string{litSecret})
+	if err != nil {
+		t.Fatalf("NewMaskerWithLiterals: %v", err)
+	}
+
+	// Place the secret near the safetyTail boundary so it straddles the
+	// flush cutoff when delivered in a single large pipe write.
+	prefix := strings.Repeat("A", safetyTail-4)
+	suffix := strings.Repeat("B", safetyTail)
+	payload := prefix + litSecret + suffix
+
+	r, w := io.Pipe()
+	rec := &recordingWriter{}
+
+	done := make(chan struct{})
+	go func() {
+		forwardStream(r, storage.StreamStdout, io.Discard, rec, m)
+		close(done)
+	}()
+
+	if _, err := w.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = w.Close()
+	<-done
+
+	recorded := ""
+	for _, c := range rec.snapshot() {
+		recorded += c.Data
+	}
+	if strings.Contains(recorded, litSecret) {
+		t.Errorf("literal secret leaked at flush boundary; recorded=%q", recorded)
+	}
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
