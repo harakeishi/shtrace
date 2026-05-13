@@ -13,7 +13,7 @@ func TestStore_RecordsSessionAndSpan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
@@ -81,7 +81,7 @@ func TestStore_EnsureSession_NoopWhenExists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestStore_EnsureSession_InsertsWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestStore_InsertSession_PreservesEndedAtOnReinsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestStore_ListSessions_OrderedByStartedDesc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestStore_ListSessions_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestStore_SpansForSession_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}

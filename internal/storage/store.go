@@ -172,7 +172,7 @@ func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) (
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []Session
 	for rows.Next() {
@@ -224,7 +224,7 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string, warn func
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []Span
 	for rows.Next() {

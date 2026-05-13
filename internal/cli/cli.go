@@ -23,8 +23,8 @@ import (
 // convention (argv[0] is the program name).
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
-		fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
-		fmt.Fprintln(stderr, "subcommands: run (default), ls, show, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, session, shell-init")
 		return 2
 	}
 
@@ -49,35 +49,35 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 // metadata. This is the core MVP path.
 func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer) int {
 	if len(cmdArgs) == 0 {
-		fmt.Fprintln(stderr, "shtrace: no command to run")
+		_, _ = fmt.Fprintln(stderr, "shtrace: no command to run")
 		return 2
 	}
 
 	env := envMap()
 	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
 		return 1
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fmt.Fprintf(stderr, "shtrace: mkdir data dir: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: mkdir data dir: %v\n", err)
 		return 1
 	}
 
 	sessCtx, err := session.FromEnv(env, session.DefaultIDGenerator())
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
 		return 1
 	}
 
 	store, err := storage.Open(dataDir + "/sessions.db")
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
 		return 1
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	if err := store.Migrate(ctx); err != nil {
-		fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
 		return 1
 	}
 
@@ -88,7 +88,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 			StartedAt: startedAt,
 			Tags:      sessCtx.Tags,
 		}); err != nil {
-			fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
 			return 1
 		}
 	} else {
@@ -100,22 +100,22 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 			StartedAt: startedAt,
 			Tags:      sessCtx.Tags,
 		}); err != nil {
-			fmt.Fprintf(stderr, "shtrace: ensure session: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: ensure session: %v\n", err)
 			return 1
 		}
 	}
 
 	logPath := storage.OutputPath(dataDir, sessCtx.SessionID, sessCtx.SpanID)
 	if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
-		fmt.Fprintf(stderr, "shtrace: mkdir outputs: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: mkdir outputs: %v\n", err)
 		return 1
 	}
 	logFile, err := os.Create(logPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: open log: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: open log: %v\n", err)
 		return 1
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 
 	cwd, _ := os.Getwd()
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
@@ -137,7 +137,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		Masker: masker,
 	})
 	if runErr != nil {
-		fmt.Fprintf(stderr, "shtrace: run: %v\n", runErr)
+		_, _ = fmt.Fprintf(stderr, "shtrace: run: %v\n", runErr)
 		return 1
 	}
 
@@ -155,7 +155,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		EndedAt:      endedAt,
 		ExitCode:     &exitCode,
 	}); err != nil {
-		fmt.Fprintf(stderr, "shtrace: insert span: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: insert span: %v\n", err)
 		return 1
 	}
 	if sessCtx.IsRoot {
@@ -169,7 +169,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 			// The wrapped command's exit code still propagates — failing
 			// the whole invocation just because we couldn't stamp ended_at
 			// would be worse than reporting the issue on stderr.
-			fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
 		}
 	}
 
@@ -187,24 +187,24 @@ func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	env := envMap()
 	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
 		return 1
 	}
 	store, err := storage.Open(dataDir + "/sessions.db")
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
 		return 1
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	if err := store.Migrate(ctx); err != nil {
-		fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
 		return 1
 	}
 
-	warn := func(e error) { fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
+	warn := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
 	sessions, err := store.ListSessions(ctx, 50, warn)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: list: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: list: %v\n", err)
 		return 1
 	}
 
@@ -219,27 +219,27 @@ func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			entries = append(entries, entry{ID: s.ID, StartedAt: s.StartedAt.Format(time.RFC3339Nano), Tags: s.Tags})
 		}
 		b, _ := json.Marshal(entries)
-		fmt.Fprintln(stdout, string(b))
+		_, _ = fmt.Fprintln(stdout, string(b))
 		return 0
 	}
 
 	for _, s := range sessions {
 		spans, err := store.SpansForSession(ctx, s.ID, warn)
 		if err != nil {
-			fmt.Fprintf(stderr, "shtrace: spans for %s: %v\n", s.ID, err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: spans for %s: %v\n", s.ID, err)
 		}
 		cmdSummary := ""
 		if len(spans) > 0 {
 			cmdSummary = spans[0].Command
 		}
-		fmt.Fprintf(stdout, "%s  %s  spans=%d  %s\n", s.StartedAt.Format(time.RFC3339), s.ID, len(spans), cmdSummary)
+		_, _ = fmt.Fprintf(stdout, "%s  %s  spans=%d  %s\n", s.StartedAt.Format(time.RFC3339), s.ID, len(spans), cmdSummary)
 	}
 	return 0
 }
 
 func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: shtrace show <session_id>")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace show <session_id>")
 		return 2
 	}
 	sessionID := args[0]
@@ -247,37 +247,37 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	env := envMap()
 	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
 		return 1
 	}
 	store, err := storage.Open(dataDir + "/sessions.db")
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
 		return 1
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	if err := store.Migrate(ctx); err != nil {
-		fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
 		return 1
 	}
 
-	warn := func(e error) { fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
+	warn := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
 	spans, err := store.SpansForSession(ctx, sessionID, warn)
 	if err != nil {
-		fmt.Fprintf(stderr, "shtrace: spans: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shtrace: spans: %v\n", err)
 		return 1
 	}
 	if len(spans) == 0 {
-		fmt.Fprintf(stderr, "shtrace: no spans for session %s\n", sessionID)
+		_, _ = fmt.Fprintf(stderr, "shtrace: no spans for session %s\n", sessionID)
 		return 1
 	}
 
 	for _, sp := range spans {
-		fmt.Fprintf(stdout, "== span %s  cmd=%s  exit=%v  mode=%s\n", sp.ID, sp.Command, derefInt(sp.ExitCode), sp.Mode)
+		_, _ = fmt.Fprintf(stdout, "== span %s  cmd=%s  exit=%v  mode=%s\n", sp.ID, sp.Command, derefInt(sp.ExitCode), sp.Mode)
 		logPath := storage.OutputPath(dataDir, sessionID, sp.ID)
 		b, err := os.ReadFile(logPath)
 		if err != nil {
-			fmt.Fprintf(stderr, "shtrace: read log %s: %v\n", logPath, err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: read log %s: %v\n", logPath, err)
 			continue
 		}
 		// Render JSON Lines, routing each chunk to stdout or stderr based on
@@ -291,20 +291,20 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			var c storage.Chunk
 			if err := json.Unmarshal(line, &c); err != nil {
 				corrupt++
-				fmt.Fprintf(stderr, "shtrace: skipped corrupt line %d in %s: %v\n", i+1, logPath, err)
+				_, _ = fmt.Fprintf(stderr, "shtrace: skipped corrupt line %d in %s: %v\n", i+1, logPath, err)
 				continue
 			}
 			switch storage.Stream(c.Stream) {
 			case storage.StreamStderr:
-				fmt.Fprint(stderr, c.Data)
+				_, _ = fmt.Fprint(stderr, c.Data)
 			default:
 				// stdout, pty (mode A merged), or any future label
-				fmt.Fprint(stdout, c.Data)
+				_, _ = fmt.Fprint(stdout, c.Data)
 			}
 		}
-		fmt.Fprintln(stdout)
+		_, _ = fmt.Fprintln(stdout)
 		if corrupt > 0 {
-			fmt.Fprintf(stderr, "shtrace: %d corrupt line(s) skipped in %s\n", corrupt, logPath)
+			_, _ = fmt.Fprintf(stderr, "shtrace: %d corrupt line(s) skipped in %s\n", corrupt, logPath)
 		}
 	}
 	return 0
@@ -353,21 +353,21 @@ func derefInt(p *int) any {
 // currently unused because IDGenerator.NewSessionID has no cancellation point.
 func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: shtrace session <verb>")
-		fmt.Fprintln(stderr, "verbs: new")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace session <verb>")
+		_, _ = fmt.Fprintln(stderr, "verbs: new")
 		return 2
 	}
 	switch args[0] {
 	case "new":
 		id, err := session.DefaultIDGenerator().NewSessionID()
 		if err != nil {
-			fmt.Fprintf(stderr, "shtrace: generate session id: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: generate session id: %v\n", err)
 			return 1
 		}
-		fmt.Fprintln(stdout, id)
+		_, _ = fmt.Fprintln(stdout, id)
 		return 0
 	default:
-		fmt.Fprintf(stderr, "shtrace: unknown session verb %q\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "shtrace: unknown session verb %q\n", args[0])
 		return 2
 	}
 }
@@ -381,7 +381,7 @@ func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int 
 //	shtrace shell-init zsh
 func runShellInit(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: shtrace shell-init <bash|zsh>")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace shell-init <bash|zsh>")
 		return 2
 	}
 	shell := args[0]
@@ -395,23 +395,23 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 			// Rare (e.g. procfs unavailable, AppArmor restriction), but fall
 			// back to the bare name so the snippet is still usable. Warn so
 			// the user can diagnose if the generated snippet does not work.
-			fmt.Fprintf(stderr, "shtrace: warning: could not resolve binary path (%v); falling back to 'shtrace'\n", err)
+			_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not resolve binary path (%v); falling back to 'shtrace'\n", err)
 			self = "shtrace"
 		} else if strings.ContainsRune(self, '\x00') {
 			// A NUL byte in a shell snippet would terminate the string early
 			// in most shells. Guard defensively even though os.Executable()
 			// should never return a NUL-containing path.
-			fmt.Fprintf(stderr, "shtrace: warning: binary path contains NUL byte; falling back to 'shtrace'\n")
+			_, _ = fmt.Fprintf(stderr, "shtrace: warning: binary path contains NUL byte; falling back to 'shtrace'\n")
 			self = "shtrace"
 		}
 		// The snippet is intentionally POSIX-compatible so the same text
 		// works for both bash and zsh without separate branches.
 		// shellQuote wraps the path in single-quotes so that spaces and
 		// special characters in the binary path do not break the snippet.
-		fmt.Fprintf(stdout, "if [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
+		_, _ = fmt.Fprintf(stdout, "if [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
 		return 0
 	default:
-		fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
+		_, _ = fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
 		return 2
 	}
 }
