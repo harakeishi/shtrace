@@ -155,7 +155,7 @@ func TestCLI_ShowReportsCorruptLogToStderr(t *testing.T) {
 	if _, err := f.WriteString("{not-json\n"); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	var so, se bytes.Buffer
 	code := Run(context.Background(), []string{"shtrace", "ls", "--json"}, &so, &se)
@@ -197,7 +197,7 @@ func TestCLI_LsSurvivesCorruptSessionRow(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO sessions(id, started_at, tags_json) VALUES('corrupt', 'not-a-ts', '{}')`); err != nil {
 		t.Fatalf("inject corrupt row: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	var so, se bytes.Buffer
 	code := Run(context.Background(), []string{"shtrace", "ls"}, &so, &se)

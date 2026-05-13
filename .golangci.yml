@@ -1,16 +1,1 @@
 version: "2"
-
-linters:
-  settings:
-    errcheck:
-      exclude-functions:
-        # Writing to stderr/stdout in a CLI is best-effort; ignore write errors.
-        - fmt.Fprint
-        - fmt.Fprintf
-        - fmt.Fprintln
-        # Deferred Close calls: errors are unactionable in a defer context.
-        - (io.Closer).Close
-        - (*os.File).Close
-        - (*database/sql.Rows).Close
-        - (*database/sql.DB).Close
-        - (*github.com/harakeishi/shtrace/internal/storage.Store).Close
