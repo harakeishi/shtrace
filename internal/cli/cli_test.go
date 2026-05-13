@@ -246,6 +246,100 @@ func TestCLI_ShowOutputsTheRecordedJSONL(t *testing.T) {
 	}
 }
 
+// TestCLI_SessionNew_OutputsUUIDv7 verifies that `shtrace session new`
+// prints a single UUIDv7 string with the correct format.
+func TestCLI_SessionNew_OutputsUUIDv7(t *testing.T) {
+	stdout, stderr, exit, _ := runHarness(t, "shtrace", "session", "new")
+	if exit != 0 {
+		t.Fatalf("exit = %d, stderr=%q", exit, stderr)
+	}
+	id := strings.TrimSpace(stdout)
+	// UUIDv7: 8-4-4-4-12 hex chars
+	if len(id) != 36 {
+		t.Fatalf("id length = %d, want 36: %q", len(id), id)
+	}
+	parts := strings.Split(id, "-")
+	if len(parts) != 5 {
+		t.Fatalf("expected 5 dash-separated parts, got %d: %q", len(parts), id)
+	}
+	// version nibble must be 7
+	if len(parts[2]) != 4 || parts[2][0] != '7' {
+		t.Fatalf("expected version nibble '7', got %q", parts[2])
+	}
+}
+
+// TestCLI_SessionNew_DifferentEachCall ensures two consecutive calls produce
+// distinct IDs (collision probability with UUIDv7 is astronomically low).
+func TestCLI_SessionNew_DifferentEachCall(t *testing.T) {
+	s1, _, _, _ := runHarness(t, "shtrace", "session", "new")
+	s2, _, _, _ := runHarness(t, "shtrace", "session", "new")
+	if strings.TrimSpace(s1) == strings.TrimSpace(s2) {
+		t.Fatalf("two consecutive session new calls returned the same id: %q", s1)
+	}
+}
+
+// TestCLI_SessionNew_UnknownVerbErrors checks that an unrecognised verb exits 2.
+func TestCLI_SessionNew_UnknownVerbErrors(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "session", "bogus")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "bogus") {
+		t.Fatalf("stderr should mention the unknown verb, got %q", stderr)
+	}
+}
+
+// TestCLI_ShellInit_Bash verifies that `shtrace shell-init bash` outputs a
+// snippet that exports SHTRACE_SESSION_ID.
+func TestCLI_ShellInit_Bash(t *testing.T) {
+	stdout, _, exit, _ := runHarness(t, "shtrace", "shell-init", "bash")
+	if exit != 0 {
+		t.Fatalf("exit = %d", exit)
+	}
+	if !strings.Contains(stdout, "SHTRACE_SESSION_ID") {
+		t.Fatalf("snippet missing SHTRACE_SESSION_ID: %q", stdout)
+	}
+	if !strings.Contains(stdout, "shtrace session new") {
+		t.Fatalf("snippet should call 'shtrace session new': %q", stdout)
+	}
+	if !strings.Contains(stdout, "export") {
+		t.Fatalf("snippet must export the variable: %q", stdout)
+	}
+}
+
+// TestCLI_ShellInit_Zsh verifies that `shtrace shell-init zsh` produces the
+// same snippet structure as the bash variant.
+func TestCLI_ShellInit_Zsh(t *testing.T) {
+	stdout, _, exit, _ := runHarness(t, "shtrace", "shell-init", "zsh")
+	if exit != 0 {
+		t.Fatalf("exit = %d", exit)
+	}
+	if !strings.Contains(stdout, "SHTRACE_SESSION_ID") {
+		t.Fatalf("snippet missing SHTRACE_SESSION_ID: %q", stdout)
+	}
+}
+
+// TestCLI_ShellInit_UnsupportedShell verifies that an unknown shell arg
+// returns exit code 2 and an informative error.
+func TestCLI_ShellInit_UnsupportedShell(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "shell-init", "fish")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "fish") {
+		t.Fatalf("stderr should mention the unsupported shell, got %q", stderr)
+	}
+}
+
+// TestCLI_ShellInit_MissingArg verifies that `shtrace shell-init` without a
+// shell arg returns exit code 2.
+func TestCLI_ShellInit_MissingArg(t *testing.T) {
+	_, _, exit, _ := runHarness(t, "shtrace", "shell-init")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+}
+
 func walkLogFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string

@@ -23,7 +23,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
-		fmt.Fprintln(stderr, "subcommands: run (default), ls, show")
+		fmt.Fprintln(stderr, "subcommands: run (default), ls, show, session, shell-init")
 		return 2
 	}
 
@@ -32,6 +32,10 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runLs(ctx, argv[2:], stdout, stderr)
 	case "show":
 		return runShow(ctx, argv[2:], stdout, stderr)
+	case "session":
+		return runSession(ctx, argv[2:], stdout, stderr)
+	case "shell-init":
+		return runShellInit(argv[2:], stdout, stderr)
 	case "--":
 		return runWrapped(ctx, argv[2:], stdout, stderr)
 	default:
@@ -341,6 +345,56 @@ func derefInt(p *int) any {
 		return "?"
 	}
 	return *p
+}
+
+// runSession handles the `shtrace session <verb>` subtree.
+func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: shtrace session <verb>")
+		fmt.Fprintln(stderr, "verbs: new")
+		return 2
+	}
+	switch args[0] {
+	case "new":
+		id, err := session.DefaultIDGenerator().NewSessionID()
+		if err != nil {
+			fmt.Fprintf(stderr, "shtrace: generate session id: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, id)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "shtrace: unknown session verb %q\n", args[0])
+		return 2
+	}
+}
+
+// runShellInit outputs a shell snippet that, when eval'd in a user's rc file,
+// automatically exports SHTRACE_SESSION_ID for every new terminal session.
+//
+// Usage:
+//
+//	shtrace shell-init bash
+//	shtrace shell-init zsh
+func runShellInit(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: shtrace shell-init <bash|zsh>")
+		return 2
+	}
+	shell := args[0]
+	switch shell {
+	case "bash", "zsh":
+		// The snippet is intentionally POSIX-compatible so the same code
+		// works for both shells without separate branches.
+		fmt.Fprint(stdout, `if [ -z "${SHTRACE_SESSION_ID:-}" ]; then
+  export SHTRACE_SESSION_ID="$(shtrace session new)"
+fi
+`)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
+		return 2
+	}
 }
 
 func splitLines(b []byte) [][]byte {
