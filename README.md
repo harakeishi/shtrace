@@ -12,8 +12,9 @@ a SaaS.
 
 ## Status
 
-**Phase 1 (Collector MVP) — alpha.** Phases 2 (MCP server) and 3 (CI artifact
-+ HTML report) are planned but not yet implemented. See [Roadmap](#roadmap).
+**Phase 1 (Collector MVP) — alpha.** Phase 2 (MCP server) and the rest of
+Phase 3 (CI artifact + export/import) are planned but not yet implemented.
+See [Roadmap](#roadmap).
 
 ## Why
 
@@ -91,6 +92,26 @@ JSON output for scripting:
 ```sh
 shtrace ls --json | jq '.[0].id'
 ```
+
+## HTML report
+
+`shtrace report` renders one session into a single self-contained HTML file
+(inline CSS, no external assets) that can be opened with `file://` — no
+server needed. This is what reviewers will open after downloading the GitHub
+Actions artifact in the Phase 3 PR-verification flow.
+
+```sh
+shtrace report --latest --output report.html
+# or pick an explicit session:
+shtrace report --session <session-id> --output report.html
+# or stream to stdout for piping:
+shtrace report --latest > report.html
+```
+
+The report includes session metadata, a chronological timeline of spans,
+each span's stdout/stderr (colour-coded), exit code, mode, and duration.
+Browser find-in-page (Ctrl/Cmd+F) is sufficient for the Phase 3 scope; full
+text search and asciinema-style replay live in Phase 4.
 
 ## Automatic session grouping (shell-init)
 
@@ -194,7 +215,7 @@ design — CI integration should be a single env var, not a checked-in file).
 |---|---|---|
 | 1. Collector MVP | `shtrace <cmd>`, `ls`, `show`, mode B, secret masking, session propagation, SQLite + JSON L, `shell-init` | partially done (mode A, FTS5, GC, entropy masking still pending) |
 | 2. MCP server | `shtrace mcp` stdio server with `get_session`, `search_commands`, `detect_test_runs`, `compare_runs` | planned |
-| 3. PR verification + HTML report | `shtrace export/import`, `shtrace report --html`, GitHub Actions workflow, `shtrace pr-comment` | planned |
+| 3. PR verification + HTML report | `shtrace report` (done), `shtrace export/import`, GitHub Actions workflow, `shtrace pr-comment` | in progress |
 | 4. Web UI | `shtrace serve` with dynamic search, asciinema-style replay, diff view | stretch goal |
 | 5. attest layer | AI execution-verification score | stretch goal |
 

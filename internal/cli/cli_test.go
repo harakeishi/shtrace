@@ -383,6 +383,88 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+// TestCLI_Report_WritesHTMLFile is the end-to-end check: record a session,
+// call `shtrace report --latest --output report.html`, and verify the
+// resulting file is HTML with the recorded command's output.
+func TestCLI_Report_WritesHTMLFile(t *testing.T) {
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf report-marker; printf err-marker 1>&2; exit 0")
+	if exit != 0 {
+		t.Fatalf("setup run exit = %d", exit)
+	}
+
+	out := filepath.Join(dataDir, "report.html")
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest", "--output", out}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: stderr=%s", code, se.String())
+	}
+	if !strings.Contains(so.String(), "wrote report") {
+		t.Errorf("expected confirmation on stdout, got %q", so.String())
+	}
+
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	rendered := string(body)
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"shtrace session",
+		"report-marker", // stdout chunk
+		"err-marker",    // stderr chunk
+		`class="exit ok"`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("report missing %q in:\n%s", want, rendered)
+		}
+	}
+}
+
+// TestCLI_Report_FailsWithoutSelector ensures we surface a usage error when
+// neither --session nor --latest is provided, instead of silently writing
+// nothing.
+func TestCLI_Report_FailsWithoutSelector(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "session") {
+		t.Errorf("expected usage hint on stderr, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_UnknownFlag rejects unknown flags rather than silently
+// ignoring them (catches typos like --latests).
+func TestCLI_Report_UnknownFlag(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report", "--bogus")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "bogus") {
+		t.Errorf("expected stderr to mention unknown flag, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_StdoutWhenNoOutputFlag writes to stdout when --output is
+// omitted, so the command composes with shell redirection.
+func TestCLI_Report_StdoutWhenNoOutputFlag(t *testing.T) {
+	_, _, exit, _ := runHarness(t, "shtrace", "--", "sh", "-c", "printf stdout-only-test")
+	if exit != 0 {
+		t.Fatalf("setup run exit = %d", exit)
+	}
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest"}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: %s", code, se.String())
+	}
+	if !strings.Contains(so.String(), "<!DOCTYPE html>") {
+		t.Errorf("expected HTML on stdout, got %q", so.String())
+	}
+	if !strings.Contains(so.String(), "stdout-only-test") {
+		t.Errorf("expected recorded data in stdout, got %q", so.String())
+	}
+}
+
 func walkLogFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string

@@ -15,6 +15,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"github.com/harakeishi/shtrace/internal/report"
 	"github.com/harakeishi/shtrace/internal/runner"
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/session"
@@ -26,7 +27,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, session, shell-init")
 		return 2
 	}
 
@@ -40,7 +41,7 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, session, shell-init")
 		return 2
 	}
 
@@ -55,6 +56,8 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runReindex(ctx, argv[2:], stdout, stderr)
 	case "gc":
 		return runGC(ctx, argv[2:], stdout, stderr)
+	case "report":
+		return runReport(ctx, argv[2:], stdout, stderr)
 	case "session":
 		return runSession(ctx, argv[2:], stdout, stderr)
 	case "shell-init":
@@ -556,6 +559,127 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		verb, result.SessionsRemoved, result.BytesReclaimed)
 	for _, id := range result.Sessions {
 		_, _ = fmt.Fprintf(stdout, "  %s\n", id)
+	}
+	return 0
+}
+
+// runReport generates a self-contained HTML report for a single session.
+//
+// Usage:
+//
+//	shtrace report --session <id>           # write to stdout
+//	shtrace report --session <id> --output report.html
+//	shtrace report --latest --output report.html
+//
+// The output is one HTML file with inline CSS and no external assets, so it
+// can be viewed with `file://` after `gh run download` (Phase 3 workflow).
+func runReport(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	var (
+		sessionID string
+		output    string
+		latest    bool
+	)
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "--session":
+			if i+1 >= len(args) {
+				_, _ = fmt.Fprintln(stderr, "shtrace: --session requires a value")
+				return 2
+			}
+			sessionID = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--session="):
+			sessionID = strings.TrimPrefix(a, "--session=")
+		case a == "--output", a == "-o":
+			if i+1 >= len(args) {
+				_, _ = fmt.Fprintln(stderr, "shtrace: --output requires a value")
+				return 2
+			}
+			output = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--output="):
+			output = strings.TrimPrefix(a, "--output=")
+		case a == "--latest":
+			latest = true
+		default:
+			_, _ = fmt.Fprintf(stderr, "shtrace: unknown report flag %q\n", a)
+			_, _ = fmt.Fprintln(stderr, "usage: shtrace report (--session <id> | --latest) [--output <path>]")
+			return 2
+		}
+	}
+	if sessionID == "" && !latest {
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace report (--session <id> | --latest) [--output <path>]")
+		return 2
+	}
+
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+	store, err := storage.Open(dataDir + "/sessions.db")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		return 1
+	}
+
+	warn := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
+
+	// Resolve the output sink before calling Render. When --output is given
+	// we write to a tmp file and rename on success, so a failed render does
+	// not leave a half-written file at the requested path.
+	var sink io.Writer = stdout
+	var tmpPath, finalPath string
+	if output != "" {
+		finalPath = output
+		// Same dir as the destination so os.Rename stays on one filesystem.
+		f, err := os.CreateTemp(parentDir(finalPath), ".shtrace-report-*.html")
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: open output: %v\n", err)
+			return 1
+		}
+		tmpPath = f.Name()
+		// We close+rename ourselves; don't double-close in defer.
+		defer func() {
+			if tmpPath != "" {
+				_ = os.Remove(tmpPath)
+			}
+		}()
+		sink = f
+		defer func() { _ = f.Close() }()
+	}
+
+	resolvedID, err := report.Render(ctx, store, sink, report.Options{
+		SessionID: sessionID,
+		Latest:    latest,
+		DataDir:   dataDir,
+		Warn:      warn,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+
+	if output != "" {
+		// Close the temp file before renaming so Windows-style holders
+		// don't trip — and so the OS sees the final bytes. The deferred
+		// Close above will be a no-op double-close, which os returns
+		// ErrClosed for; ignore that.
+		if f, ok := sink.(*os.File); ok {
+			_ = f.Close()
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: rename output: %v\n", err)
+			return 1
+		}
+		tmpPath = "" // ownership transferred; suppress the deferred Remove
+		_, _ = fmt.Fprintf(stdout, "wrote report for session %s to %s\n", resolvedID, finalPath)
 	}
 	return 0
 }
