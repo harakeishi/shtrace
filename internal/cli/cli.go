@@ -218,6 +218,9 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 	}
 	if sessCtx.IsRoot {
 		ended := endedAt
+		// InsertSession uses ON CONFLICT DO UPDATE (UPSERT), so calling it a
+		// second time for the same session ID is safe: it updates ended_at
+		// without violating the UNIQUE constraint.
 		if err := store.InsertSession(ctx, storage.Session{
 			ID:        sessCtx.SessionID,
 			StartedAt: startedAt,

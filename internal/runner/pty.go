@@ -114,7 +114,14 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 		}
 	}
 
-	// Single goroutine: PTY merges stdout+stderr onto one fd.
+	// forwardStream runs synchronously and blocks until the PTY master returns
+	// EOF. On Linux, EOF arrives after the slave side is fully closed, which
+	// happens once the child (and any grandchildren holding the slave open)
+	// have exited. cmd.Wait is called only after forwardStream returns, so all
+	// output is captured before the exit status is collected.
+	//
+	// Do NOT move forwardStream into a goroutine: doing so would introduce a
+	// race between output collection and cmd.Wait's internal pipe draining.
 	forwardStream(ptmx, storage.StreamPTY, opt.Tty, opt.Writer, opt.Masker)
 
 	if err := cmd.Wait(); err != nil {

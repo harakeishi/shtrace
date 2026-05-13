@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/harakeishi/shtrace/internal/secret"
@@ -117,10 +118,16 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		done <- sb.String()
 	}()
 
-	// Defer pw.Close() so it is called even if RunPTY panics, preventing the
-	// reader goroutine from blocking on pr.Read indefinitely.
-	defer func() { _ = pw.Close() }()
 	defer func() { _ = pr.Close() }()
+
+	// sync.Once ensures pw is closed exactly once:
+	// - on the normal path, we close it explicitly after RunPTY so the reader
+	//   goroutine sees EOF before we block on <-done.
+	// - if RunPTY panics, the deferred Once.Do fires instead, preventing the
+	//   reader goroutine from blocking on pr.Read indefinitely.
+	var closePWOnce sync.Once
+	closePW := func() { _ = pw.Close() }
+	defer closePWOnce.Do(closePW)
 
 	_, runErr := RunPTY(context.Background(), PTYOptions{
 		Argv:   []string{"sh", "-c", "printf world"},
@@ -128,9 +135,7 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		Tty:    pw,
 		Masker: secret.DefaultMasker(),
 	})
-	// Close pw so the reader goroutine sees EOF, then wait for it to finish
-	// before the deferred pr.Close to avoid a read-on-closed-fd race.
-	_ = pw.Close()
+	closePWOnce.Do(closePW) // signal EOF to reader before blocking on <-done
 	ttyOutput := <-done
 
 	if runErr != nil {
