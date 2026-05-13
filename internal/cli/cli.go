@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -563,6 +564,77 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// reportUsage is the single source of truth for the help line so all error
+// paths agree on the recommended invocation.
+const reportUsage = "usage: shtrace report (--session <id> | --latest) [--output <path>]"
+
+// parseReportArgs is split out from runReport so the flag-validation rules
+// can be unit-tested without spinning up a Store.
+func parseReportArgs(args []string) (sessionID, output string, latest bool, err error) {
+	// takeValue extracts a flag value, rejecting accidental flag-eats-flag
+	// patterns: `--session --output foo` would otherwise assign sessionID
+	// = "--output", which then trips an unknown-positional error far from
+	// the actual bug site.
+	takeValue := func(flag, raw string) (string, error) {
+		if raw == "" {
+			return "", fmt.Errorf("%s requires a non-empty value", flag)
+		}
+		if strings.HasPrefix(raw, "--") {
+			return "", fmt.Errorf("%s requires a value but got the next flag %q", flag, raw)
+		}
+		return raw, nil
+	}
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--session":
+			if i+1 >= len(args) {
+				return "", "", false, fmt.Errorf("--session requires a value")
+			}
+			v, e := takeValue("--session", args[i+1])
+			if e != nil {
+				return "", "", false, e
+			}
+			sessionID = v
+			i++
+		case strings.HasPrefix(a, "--session="):
+			v, e := takeValue("--session", strings.TrimPrefix(a, "--session="))
+			if e != nil {
+				return "", "", false, e
+			}
+			sessionID = v
+		case a == "--output", a == "-o":
+			if i+1 >= len(args) {
+				return "", "", false, fmt.Errorf("%s requires a value", a)
+			}
+			v, e := takeValue(a, args[i+1])
+			if e != nil {
+				return "", "", false, e
+			}
+			output = v
+			i++
+		case strings.HasPrefix(a, "--output="):
+			v, e := takeValue("--output", strings.TrimPrefix(a, "--output="))
+			if e != nil {
+				return "", "", false, e
+			}
+			output = v
+		case a == "--latest":
+			latest = true
+		default:
+			return "", "", false, fmt.Errorf("unknown report flag %q", a)
+		}
+	}
+	if sessionID == "" && !latest {
+		return "", "", false, fmt.Errorf("either --session <id> or --latest is required")
+	}
+	if sessionID != "" && latest {
+		return "", "", false, fmt.Errorf("--session and --latest are mutually exclusive")
+	}
+	return sessionID, output, latest, nil
+}
+
 // runReport generates a self-contained HTML report for a single session.
 //
 // Usage:
@@ -574,41 +646,10 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 // The output is one HTML file with inline CSS and no external assets, so it
 // can be viewed with `file://` after `gh run download` (Phase 3 workflow).
 func runReport(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	var (
-		sessionID string
-		output    string
-		latest    bool
-	)
-	for i := 0; i < len(args); i++ {
-		switch a := args[i]; {
-		case a == "--session":
-			if i+1 >= len(args) {
-				_, _ = fmt.Fprintln(stderr, "shtrace: --session requires a value")
-				return 2
-			}
-			sessionID = args[i+1]
-			i++
-		case strings.HasPrefix(a, "--session="):
-			sessionID = strings.TrimPrefix(a, "--session=")
-		case a == "--output", a == "-o":
-			if i+1 >= len(args) {
-				_, _ = fmt.Fprintln(stderr, "shtrace: --output requires a value")
-				return 2
-			}
-			output = args[i+1]
-			i++
-		case strings.HasPrefix(a, "--output="):
-			output = strings.TrimPrefix(a, "--output=")
-		case a == "--latest":
-			latest = true
-		default:
-			_, _ = fmt.Fprintf(stderr, "shtrace: unknown report flag %q\n", a)
-			_, _ = fmt.Fprintln(stderr, "usage: shtrace report (--session <id> | --latest) [--output <path>]")
-			return 2
-		}
-	}
-	if sessionID == "" && !latest {
-		_, _ = fmt.Fprintln(stderr, "usage: shtrace report (--session <id> | --latest) [--output <path>]")
+	sessionID, output, latest, err := parseReportArgs(args)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		_, _ = fmt.Fprintln(stderr, reportUsage)
 		return 2
 	}
 
@@ -631,31 +672,50 @@ func runReport(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	warn := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: warning: %v\n", e) }
 
-	// Resolve the output sink before calling Render. When --output is given
-	// we write to a tmp file and rename on success, so a failed render does
-	// not leave a half-written file at the requested path.
-	var sink io.Writer = stdout
-	var tmpPath, finalPath string
-	if output != "" {
-		finalPath = output
-		// Same dir as the destination so os.Rename stays on one filesystem.
-		f, err := os.CreateTemp(parentDir(finalPath), ".shtrace-report-*.html")
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "shtrace: open output: %v\n", err)
+	// When --output is omitted, stream to stdout — composes with shell
+	// redirection (`shtrace report --latest > r.html`). When set, render
+	// into a temp file in the destination directory and atomically rename
+	// on success; on any failure the destination path is left untouched
+	// (including a pre-existing file at that path).
+	if output == "" {
+		if _, err := report.Render(ctx, store, stdout, report.Options{
+			SessionID: sessionID,
+			Latest:    latest,
+			DataDir:   dataDir,
+			Warn:      warn,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
 			return 1
 		}
-		tmpPath = f.Name()
-		// We close+rename ourselves; don't double-close in defer.
-		defer func() {
-			if tmpPath != "" {
-				_ = os.Remove(tmpPath)
-			}
-		}()
-		sink = f
-		defer func() { _ = f.Close() }()
+		return 0
 	}
 
-	resolvedID, err := report.Render(ctx, store, sink, report.Options{
+	// filepath.Dir keeps CreateTemp and Rename on the same filesystem.
+	// parentDir("/x.html") returns "" → os.TempDir() at create time, which
+	// produces a cross-device Rename failure on hosts where /tmp is a
+	// separate mount (Docker, many CI runners).
+	tmpDir := filepath.Dir(output)
+	f, err := os.CreateTemp(tmpDir, ".shtrace-report-*.html")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open output: %v\n", err)
+		return 1
+	}
+	tmpPath := f.Name()
+	// closed tracks whether we've already closed f, so the deferred
+	// cleanup doesn't double-close and obscure a real error from the
+	// first close. tmpPath is cleared once ownership transfers to the
+	// final path via Rename, suppressing the deferred Remove.
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		if tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	resolvedID, err := report.Render(ctx, store, f, report.Options{
 		SessionID: sessionID,
 		Latest:    latest,
 		DataDir:   dataDir,
@@ -666,21 +726,23 @@ func runReport(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return 1
 	}
 
-	if output != "" {
-		// Close the temp file before renaming so Windows-style holders
-		// don't trip — and so the OS sees the final bytes. The deferred
-		// Close above will be a no-op double-close, which os returns
-		// ErrClosed for; ignore that.
-		if f, ok := sink.(*os.File); ok {
-			_ = f.Close()
-		}
-		if err := os.Rename(tmpPath, finalPath); err != nil {
-			_, _ = fmt.Fprintf(stderr, "shtrace: rename output: %v\n", err)
-			return 1
-		}
-		tmpPath = "" // ownership transferred; suppress the deferred Remove
-		_, _ = fmt.Fprintf(stdout, "wrote report for session %s to %s\n", resolvedID, finalPath)
+	// Surface a Close failure (ENOSPC, EIO) so we never Rename a truncated
+	// file into place. The deferred Close still runs but as a no-op
+	// because we set closed=true.
+	if err := f.Close(); err != nil {
+		closed = true
+		_, _ = fmt.Fprintf(stderr, "shtrace: close output: %v\n", err)
+		return 1
 	}
+	closed = true
+
+	if err := os.Rename(tmpPath, output); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: rename output: %v\n", err)
+		return 1
+	}
+	tmpPath = "" // suppress deferred Remove now that the file is at output
+
+	_, _ = fmt.Fprintf(stdout, "wrote report for session %s to %s\n", resolvedID, output)
 	return 0
 }
 

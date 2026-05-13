@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -317,6 +318,88 @@ func TestStore_SpansForSession_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
 	}
 	if len(warned) == 0 {
 		t.Fatalf("warn callback not invoked")
+	}
+}
+
+func TestStore_GetSession_ReturnsNotFoundWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	_, err = s.GetSession(context.Background(), "does-not-exist")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("GetSession on absent id returned %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestStore_GetSession_ReturnsCorruptOnBadTimestamp(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	// Inject a corrupt row directly so we don't rely on InsertSession
+	// being permissive — that would couple this test to insert validation.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('corrupt', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject corrupt row: %v", err)
+	}
+
+	_, err = s.GetSession(context.Background(), "corrupt")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("GetSession on corrupt row returned %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+func TestStore_GetSession_RoundTripsHealthyRow(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	started := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	ended := started.Add(7 * time.Second)
+	want := Session{
+		ID:        "sess-rt",
+		StartedAt: started,
+		EndedAt:   &ended,
+		Tags:      map[string]string{"k": "v"},
+	}
+	if err := s.InsertSession(context.Background(), want); err != nil {
+		t.Fatalf("InsertSession: %v", err)
+	}
+
+	got, err := s.GetSession(context.Background(), "sess-rt")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ID != want.ID {
+		t.Errorf("ID = %q, want %q", got.ID, want.ID)
+	}
+	if !got.StartedAt.Equal(want.StartedAt) {
+		t.Errorf("StartedAt = %v, want %v", got.StartedAt, want.StartedAt)
+	}
+	if got.EndedAt == nil || !got.EndedAt.Equal(ended) {
+		t.Errorf("EndedAt = %v, want %v", got.EndedAt, ended)
+	}
+	if got.Tags["k"] != "v" {
+		t.Errorf("Tags = %v, want k=v", got.Tags)
 	}
 }
 

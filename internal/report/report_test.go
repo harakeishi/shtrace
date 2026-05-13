@@ -3,6 +3,8 @@ package report
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,24 @@ import (
 type fakeSource struct {
 	sessions []storage.Session
 	spans    map[string][]storage.Span
+	// corruptIDs, if non-nil, returns ErrSessionCorrupt for those ids so
+	// the corrupt-row path can be exercised without injecting bad data.
+	corruptIDs map[string]bool
+	// spansErr, if non-nil, replaces the SpansForSession return so tests
+	// can exercise the render-failure path.
+	spansErr error
+}
+
+func (f *fakeSource) GetSession(_ context.Context, id string) (storage.Session, error) {
+	if f.corruptIDs[id] {
+		return storage.Session{}, fmt.Errorf("%w: synthetic", storage.ErrSessionCorrupt)
+	}
+	for _, s := range f.sessions {
+		if s.ID == id {
+			return s, nil
+		}
+	}
+	return storage.Session{}, storage.ErrSessionNotFound
 }
 
 func (f *fakeSource) ListSessions(_ context.Context, limit int, _ func(error)) ([]storage.Session, error) {
@@ -28,6 +48,9 @@ func (f *fakeSource) ListSessions(_ context.Context, limit int, _ func(error)) (
 }
 
 func (f *fakeSource) SpansForSession(_ context.Context, id string, _ func(error)) ([]storage.Span, error) {
+	if f.spansErr != nil {
+		return nil, f.spansErr
+	}
 	return f.spans[id], nil
 }
 
@@ -244,5 +267,114 @@ func TestRender_RequiresSessionIDOrLatest(t *testing.T) {
 	_, err := Render(context.Background(), src, &buf, Options{DataDir: t.TempDir()})
 	if err == nil {
 		t.Fatalf("expected error when neither SessionID nor Latest is set")
+	}
+}
+
+// TestRender_SurfacesCorruptSessionDistinctly ensures a corrupt session row
+// produces a "corrupt" error rather than the ambiguous "not found" — the
+// reviewer flagged that conflation as a data-loss masking risk.
+func TestRender_SurfacesCorruptSessionDistinctly(t *testing.T) {
+	src := &fakeSource{corruptIDs: map[string]bool{"bad": true}}
+	var buf bytes.Buffer
+	_, err := Render(context.Background(), src, &buf, Options{SessionID: "bad", DataDir: t.TempDir()})
+	if err == nil {
+		t.Fatalf("expected error for corrupt session, got nil")
+	}
+	if !errors.Is(err, storage.ErrSessionCorrupt) {
+		t.Errorf("err = %v, want one wrapping ErrSessionCorrupt", err)
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Errorf("err message should not say 'not found' for a corrupt row: %q", err.Error())
+	}
+}
+
+// TestRender_TagsAreDeterministic verifies that two renders of the same
+// session produce byte-identical tag ordering, so CI artifact diffing
+// stays meaningful. Map iteration order is randomised per process, so this
+// test would flake without an explicit sort.
+func TestRender_TagsAreDeterministic(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Now().UTC()
+	src := &fakeSource{
+		sessions: []storage.Session{{
+			ID:        "tags",
+			StartedAt: now,
+			Tags:      map[string]string{"z": "1", "a": "2", "m": "3", "b": "4"},
+		}},
+		spans: map[string][]storage.Span{
+			"tags": {{ID: "sp", SessionID: "tags", Command: "sh", Mode: "pipe", StartedAt: now, EndedAt: now, ExitCode: intPtr(0)}},
+		},
+	}
+	var first bytes.Buffer
+	if _, err := Render(context.Background(), src, &first, Options{SessionID: "tags", DataDir: dataDir}); err != nil {
+		t.Fatalf("Render 1: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		var next bytes.Buffer
+		if _, err := Render(context.Background(), src, &next, Options{SessionID: "tags", DataDir: dataDir}); err != nil {
+			t.Fatalf("Render %d: %v", i+2, err)
+		}
+		if next.String() != first.String() {
+			t.Fatalf("render %d differs from render 1 — non-deterministic output", i+2)
+		}
+	}
+}
+
+// TestRender_StripsC0ControlBytes verifies that ANSI escape sequences and
+// other control bytes are removed from rendered data, so the report stays
+// readable in a browser (full ANSI-to-HTML rendering is Phase 4 #15).
+func TestRender_StripsC0ControlBytes(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Now().UTC()
+	src := &fakeSource{
+		sessions: []storage.Session{{ID: "ansi", StartedAt: now}},
+		spans: map[string][]storage.Span{
+			"ansi": {{ID: "sp", SessionID: "ansi", Command: "sh", Mode: "pipe", StartedAt: now, EndedAt: now, ExitCode: intPtr(0)}},
+		},
+	}
+	// On disk the runner emits json.Marshal output, which encodes control
+	// bytes via \uXXXX escapes — never as raw bytes (raw control bytes
+	// would make the line invalid JSON). So the fixture matches that
+	// shape: \u001b for ESC, \u0000 for NUL, plus literal \t / \n.
+	line := `{"ts":"2026-05-13T10:00:00Z","stream":"stdout","data":"\u001b[31mred\u001b[0m\tafter\u0000nul\nnewline"}`
+	writeJSONL(t, dataDir, "ansi", "sp", []string{line})
+	var buf bytes.Buffer
+	if _, err := Render(context.Background(), src, &buf, Options{SessionID: "ansi", DataDir: dataDir}); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	out := buf.String()
+	// \x1b should be stripped — the surrounding "[31m...red...[0m" survives
+	// as readable text noise; \x00 should be gone; \t and \n preserved.
+	if strings.ContainsRune(out, 0x1b) {
+		t.Errorf("ESC byte should have been stripped from output")
+	}
+	if strings.ContainsRune(out, 0x00) {
+		t.Errorf("NUL byte should have been stripped from output")
+	}
+	if !strings.Contains(out, "[31mred[0m\tafter") {
+		t.Errorf("expected surrounding text after C0 stripping, got:\n%s", out)
+	}
+	// After stripping NUL between "after" and "nul", the two tokens are
+	// adjacent. A surviving \n must separate "nul" from "newline".
+	if !strings.Contains(out, "afternul\nnewline") {
+		t.Errorf("expected NUL dropped (afternul) and \\n preserved (nul\\nnewline), got:\n%q", out)
+	}
+}
+
+func TestSanitizeForHTML_PassthroughCommonChars(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"hello", "hello"},
+		{"line1\nline2", "line1\nline2"},
+		{"tabs\tand\rnewlines\n", "tabs\tand\rnewlines\n"},
+		{"日本語", "日本語"}, // UTF-8 multi-byte stays intact
+		{"esc:\x1b[31m", "esc:[31m"},
+		{"nul:\x00", "nul:"},
+		{"del:\x7f", "del:"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeForHTML(c.in); got != c.want {
+			t.Errorf("sanitizeForHTML(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

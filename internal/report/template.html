@@ -157,7 +157,7 @@ footer {
     {{if .EndedAt}}<dt>ended</dt><dd>{{.EndedAt}}</dd>{{end}}
     <dt>spans</dt><dd>{{len .Spans}}</dd>
     <dt>chunks</dt><dd>{{.TotalChunks}}</dd>
-    {{if .Tags}}<dt>tags</dt><dd>{{range $k, $v := .Tags}}<span class="tag">{{$k}}={{$v}}</span>{{end}}</dd>{{end}}
+    {{if .Tags}}<dt>tags</dt><dd>{{range .Tags}}<span class="tag">{{.K}}={{.V}}</span>{{end}}</dd>{{end}}
   </dl>
 </section>
 
