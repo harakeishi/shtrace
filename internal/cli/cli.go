@@ -26,7 +26,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, session, shell-init")
 		return 2
 	}
 
@@ -40,7 +40,7 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, session, shell-init")
 		return 2
 	}
 
@@ -53,6 +53,8 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runSearch(ctx, argv[2:], stdout, stderr)
 	case "reindex":
 		return runReindex(ctx, argv[2:], stdout, stderr)
+	case "gc":
+		return runGC(ctx, argv[2:], stdout, stderr)
 	case "session":
 		return runSession(ctx, argv[2:], stdout, stderr)
 	case "shell-init":
@@ -486,6 +488,75 @@ func runReindex(ctx context.Context, _ []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	_, _ = fmt.Fprintln(stdout, "done")
+	return 0
+}
+
+// runGC removes sessions that exceed the configured TTL or push total output
+// storage over the size cap. Reads SHTRACE_TTL_DAYS and SHTRACE_MAX_SIZE_BYTES
+// from the environment. Supports --dry-run to preview without deleting.
+func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	dryRun := false
+	for _, a := range args {
+		if a == "--dry-run" {
+			dryRun = true
+		}
+	}
+
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+
+	store, err := storage.Open(dataDir + "/sessions.db")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		return 1
+	}
+
+	// Attach FTS index when it exists; skip quietly when it doesn't.
+	var fts *storage.FTSStore
+	ftsPath := storage.FTSPath(dataDir)
+	if _, statErr := os.Stat(ftsPath); statErr == nil {
+		fts, err = storage.OpenFTS(ftsPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (index cleanup skipped): %v\n", err)
+		} else {
+			defer func() { _ = fts.Close() }()
+			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
+				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (index cleanup skipped): %v\n", migrErr)
+				fts = nil
+			}
+		}
+	}
+
+	cfg := storage.GCConfigFromEnv(env)
+	if dryRun {
+		_, _ = fmt.Fprintf(stdout, "dry-run  ttl=%d days  max-size=%d bytes\n",
+			cfg.EffectiveTTLDays(), cfg.EffectiveMaxBytes())
+	}
+
+	result, err := storage.RunGC(ctx, store, fts, dataDir, cfg, dryRun)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: gc: %v\n", err)
+		return 1
+	}
+
+	verb := "removed"
+	if dryRun {
+		verb = "would remove"
+	}
+	_, _ = fmt.Fprintf(stdout, "%s %d session(s), %d bytes reclaimed\n",
+		verb, result.SessionsRemoved, result.BytesReclaimed)
+	for _, id := range result.Sessions {
+		_, _ = fmt.Fprintf(stdout, "  %s\n", id)
+	}
 	return 0
 }
 

@@ -227,6 +227,16 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 	return tx.Commit()
 }
 
+// DeleteSessionIndex removes all span_contents entries for sessionID from the
+// FTS index. The triggers propagate the deletes to outputs_fts automatically.
+func (f *FTSStore) DeleteSessionIndex(ctx context.Context, sessionID string) error {
+	_, err := f.db.ExecContext(ctx, `DELETE FROM span_contents WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return fmt.Errorf("fts delete session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
 // FTSPath returns the canonical path of the FTS index file given the data dir.
 func FTSPath(baseDir string) string {
 	return filepath.Join(baseDir, "outputs.idx")
