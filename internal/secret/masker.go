@@ -131,10 +131,10 @@ func (m *Masker) MaskArgv(argv []string) []string {
 	return out
 }
 
-// utf8Boundary returns the largest byte index ≤ pos at which s begins a
-// valid UTF-8 rune (or a continuation byte has not been split). This ensures
-// that slicing s[:result] never produces an incomplete multi-byte sequence.
-func utf8Boundary(s string, pos int) int {
+// UTF8Boundary returns the largest byte index ≤ pos at which s begins a valid
+// UTF-8 rune, ensuring s[:result] never contains an incomplete multi-byte
+// sequence. If pos ≥ len(s) it is clamped to len(s)-1.
+func UTF8Boundary(s string, pos int) int {
 	if pos >= len(s) {
 		pos = len(s) - 1
 	}
@@ -197,7 +197,7 @@ func (mw *maskingWriter) Write(p []byte) (int, error) {
 		mw.buf = []byte(masked)
 		return len(p), nil
 	}
-	cutoff := utf8Boundary(masked, len(masked)-safetyTail)
+	cutoff := UTF8Boundary(masked, len(masked)-safetyTail)
 	if _, err := mw.w.Write([]byte(masked[:cutoff])); err != nil {
 		return 0, err
 	}
