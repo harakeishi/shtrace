@@ -104,9 +104,9 @@ func (f *FTSStore) MigrateFTS(ctx context.Context) error {
 				VALUES (new.rowid, new.span_id, new.session_id, new.content);
 			END`,
 	}
-	for _, q := range stmts {
+	for i, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("fts migrate (%.40q): %w", q, err)
+			return fmt.Errorf("fts migrate stmt %d (%.40q): %w", i, q, err)
 		}
 	}
 	return tx.Commit()
@@ -132,7 +132,10 @@ func (f *FTSStore) IndexSpan(ctx context.Context, spanID, sessionID, logPath str
 			content    = excluded.content`,
 		spanID, sessionID, content,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("fts index: upsert span %s: %w", spanID, err)
+	}
+	return nil
 }
 
 // Search performs a full-text query and returns up to limit results.

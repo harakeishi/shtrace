@@ -185,15 +185,17 @@ func TestFTS_ReindexAll(t *testing.T) {
 	}
 
 	// Pre-index stale content so we can verify ReindexAll replaces it.
+	// Use tokens that are completely disjoint to avoid tokenizer-boundary
+	// ambiguity when verifying presence/absence after reindex.
 	staleLog := writeTempLog(t, dir, "s1", "sp1", []storage.Chunk{
-		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "stale old content"},
+		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "staletoken99999"},
 	})
 	if err := fts.IndexSpan(ctx, "sp1", "s1", staleLog); err != nil {
 		t.Fatalf("IndexSpan stale: %v", err)
 	}
-	// Overwrite the log file with fresh content (simulates a corrupt/outdated index).
+	// Overwrite the log file with fresh content (simulates an outdated index).
 	writeTempLog(t, dir, "s1", "sp1", []storage.Chunk{
-		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "reindex target content"},
+		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "freshtoken12345"},
 	})
 
 	if err := storage.ReindexAll(ctx, fts, metaStore, dir); err != nil {
@@ -201,7 +203,7 @@ func TestFTS_ReindexAll(t *testing.T) {
 	}
 
 	// Fresh content must be findable exactly once (no duplicate entries).
-	results, err := fts.Search(ctx, "reindex", 10)
+	results, err := fts.Search(ctx, "freshtoken12345", 10)
 	if err != nil {
 		t.Fatalf("Search after reindex: %v", err)
 	}
@@ -215,13 +217,13 @@ func TestFTS_ReindexAll(t *testing.T) {
 		t.Errorf("expected sp1, got %s", results[0].SpanID)
 	}
 
-	// Stale content must no longer be findable.
-	stale, err := fts.Search(ctx, "stale", 10)
+	// Stale token must no longer be findable.
+	stale, err := fts.Search(ctx, "staletoken99999", 10)
 	if err != nil {
-		t.Fatalf("Search for stale content: %v", err)
+		t.Fatalf("Search for stale token: %v", err)
 	}
 	if len(stale) != 0 {
-		t.Errorf("expected stale content to be gone after ReindexAll, got %d results", len(stale))
+		t.Errorf("expected stale token to be gone after ReindexAll, got %d results", len(stale))
 	}
 }
 

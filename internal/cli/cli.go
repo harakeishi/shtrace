@@ -182,11 +182,11 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 	//
 	// Sync the log file first so that IndexSpan's os.Open sees all written
 	// data even though logFile is still open (closed by the deferred Close).
+	// If Sync fails, skip FTS indexing entirely to avoid indexing truncated
+	// content that would silently corrupt the index.
 	if syncErr := logFile.Sync(); syncErr != nil {
-		_, _ = fmt.Fprintf(stderr, "shtrace: log sync: %v\n", syncErr)
-	}
-	fts, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir))
-	if ftsErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: log sync (index will be skipped): %v\n", syncErr)
+	} else if fts, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: fts open (index will be skipped): %v\n", ftsErr)
 	} else {
 		defer func() { _ = fts.Close() }()
@@ -349,7 +349,13 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return 1
 	}
 
-	fts, err := storage.OpenFTS(storage.FTSPath(dataDir))
+	ftsPath := storage.FTSPath(dataDir)
+	if _, statErr := os.Stat(ftsPath); os.IsNotExist(statErr) {
+		_, _ = fmt.Fprintln(stderr, "shtrace: no search index found — run a command under shtrace first")
+		return 1
+	}
+
+	fts, err := storage.OpenFTS(ftsPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: open fts: %v\n", err)
 		return 1
