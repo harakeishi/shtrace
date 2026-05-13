@@ -96,6 +96,9 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 			}
 		}()
 		defer func() {
+			// signal.Stop guarantees "c will receive no more signals" before it
+			// returns (Go signal package docs), so closing ch immediately after
+			// is safe — the runtime will not send to the closed channel.
 			signal.Stop(ch)
 			close(ch)
 			wg.Wait() // must complete before ptmx.Close (registered earlier)

@@ -129,6 +129,9 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 	// Defers execute LIFO: closePW first, then readerWG.Wait, then pr.Close.
 	// This order guarantees the reader goroutine exits before pr is closed,
 	// and holds even when t.Fatalf triggers runtime.Goexit() early.
+	// Note: if os.Pipe() failed above, t.Fatalf fires before these defers are
+	// registered, so readerWG is never Add(1)'d and Wait() is never called —
+	// no deadlock is possible in that early-exit path.
 	defer func() { _ = pr.Close() }()
 	defer func() { readerWG.Wait() }()
 	var closePWOnce sync.Once
