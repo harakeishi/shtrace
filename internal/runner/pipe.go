@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/storage"
@@ -89,6 +90,15 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 	return res, err
 }
 
+// utf8Boundary returns the largest byte index ≤ pos at which s begins a valid
+// UTF-8 rune, so that s[:result] never contains an incomplete multi-byte sequence.
+func utf8Boundary(s string, pos int) int {
+	for pos > 0 && !utf8.RuneStart(s[pos]) {
+		pos--
+	}
+	return pos
+}
+
 // forward is the goroutine wrapper around forwardStream.
 func forward(wg *sync.WaitGroup, src io.Reader, stream storage.Stream, tee io.Writer, rec ChunkWriter, m *secret.Masker) {
 	defer wg.Done()
@@ -126,7 +136,7 @@ func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec Chun
 			if len(pending) > safetyTail {
 				masked, _ := m.MaskString(string(pending))
 				if len(masked) > safetyTail {
-					cutoff := len(masked) - safetyTail
+					cutoff := utf8Boundary(masked, len(masked)-safetyTail)
 					_ = rec.WriteChunk(stream, []byte(masked[:cutoff]))
 					pending = []byte(masked[cutoff:])
 				} else {
