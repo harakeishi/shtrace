@@ -218,10 +218,33 @@ Development workflow:
 ```sh
 go test -race ./...      # all tests must pass under -race
 go vet ./...
+go test -bench=. ./...   # benchmarks must stay green; see SLIs below
 ```
 
 The codebase follows a strict TDD discipline — write a failing test first,
 then the minimum implementation that makes it pass.
+
+### Performance SLIs
+
+`shtrace` is a wrapper, so its overhead has to be invisible against the
+wrapped command. Concrete SLIs (committed-to ceilings, measured by the
+benchmarks above):
+
+| SLI | Target | Benchmark |
+|---|---|---|
+| Wrapper overhead on a short command | wall-clock `shtrace -- printf hi` adds < 5 ms over a bare `printf hi` on the same host | `BenchmarkRunPipe_SmallOutput` |
+| Streaming overhead on bulk stdout | sustained throughput ≥ 10 MB/s through the masker + recorder pipeline for printable ASCII | `BenchmarkRunPipe_MediumOutput` (reports MB/s) |
+| Span insert | `InsertSpan` < 5 ms p50 on local SSD | `BenchmarkInsertSpan` |
+| Session list (50 rows out of 1 000) | < 10 ms p50 | `BenchmarkListSessions` |
+| Spans-for-session (100 rows) | < 10 ms p50 | `BenchmarkSpansForSession` |
+| FTS index of one span (100 lines) | < 10 ms p50 | `BenchmarkFTSIndexSpan` |
+| FTS search across 100 indexed spans | < 20 ms p50 | `BenchmarkFTSSearch` |
+
+These targets are intentionally generous for the v0.x line — the goal is to
+catch regressions, not to chase microseconds. Once shtrace is integrated into
+a real pytest/Go test suite (Phase 3.5), the headline SLI becomes "`shtrace
+pytest tests/` adds ≤ X % wall-clock over a bare `pytest tests/` on the same
+host", with X to be pinned from production measurements.
 
 ## License
 
