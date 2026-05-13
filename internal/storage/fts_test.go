@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,13 +193,16 @@ func TestFTS_ReindexAll(t *testing.T) {
 		t.Fatalf("ReindexAll: %v", err)
 	}
 
-	// Fresh content must be findable.
+	// Fresh content must be findable exactly once (no duplicate entries).
 	results, err := fts.Search(ctx, "reindex", 10)
 	if err != nil {
 		t.Fatalf("Search after reindex: %v", err)
 	}
 	if len(results) == 0 {
 		t.Fatal("expected result after ReindexAll, got none")
+	}
+	if len(results) != 1 {
+		t.Errorf("expected exactly 1 result after ReindexAll (duplicate entries?), got %d (span IDs: %v)", len(results), spanIDs(results))
 	}
 	if results[0].SpanID != "sp1" {
 		t.Errorf("expected sp1, got %s", results[0].SpanID)
@@ -211,6 +215,62 @@ func TestFTS_ReindexAll(t *testing.T) {
 	}
 	if len(stale) != 0 {
 		t.Errorf("expected stale content to be gone after ReindexAll, got %d results", len(stale))
+	}
+}
+
+// TestFTS_ReindexAll_ManySessionsIndexesAll verifies that ReindexAll processes
+// more than 50 sessions — the default cap that ListSessions applies when limit
+// is 0 or negative. Regression test for the math.MaxInt32 fix.
+func TestFTS_ReindexAll_ManySessionsIndexesAll(t *testing.T) {
+	const total = 55 // intentionally > the former 50-session default cap
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	metaStore, err := storage.Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	if err := metaStore.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	exitCode := 0
+	for i := 0; i < total; i++ {
+		sessID := fmt.Sprintf("sess%03d", i)
+		spanID := fmt.Sprintf("span%03d", i)
+		_ = metaStore.InsertSession(ctx, storage.Session{ID: sessID})
+		_ = metaStore.InsertSpan(ctx, storage.Span{
+			ID: spanID, SessionID: sessID, Command: "echo", Mode: "pipe", ExitCode: &exitCode,
+		})
+		writeTempLog(t, dir, sessID, spanID, []storage.Chunk{
+			{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: fmt.Sprintf("uniquetoken%03d output", i)},
+		})
+	}
+
+	fts, err := storage.OpenFTS(filepath.Join(dir, "outputs.idx"))
+	if err != nil {
+		t.Fatalf("OpenFTS: %v", err)
+	}
+	defer func() { _ = fts.Close() }()
+	if err := fts.MigrateFTS(ctx); err != nil {
+		t.Fatalf("MigrateFTS: %v", err)
+	}
+
+	if err := storage.ReindexAll(ctx, fts, metaStore, dir); err != nil {
+		t.Fatalf("ReindexAll: %v", err)
+	}
+
+	// Every session's span must be indexed. Check a sample at the boundaries.
+	for _, i := range []int{0, 49, 50, total - 1} {
+		token := fmt.Sprintf("uniquetoken%03d", i)
+		results, err := fts.Search(ctx, token, 10)
+		if err != nil {
+			t.Fatalf("Search %q: %v", token, err)
+		}
+		if len(results) == 0 {
+			t.Errorf("session %d (token %q) not indexed after ReindexAll", i, token)
+		}
 	}
 }
 

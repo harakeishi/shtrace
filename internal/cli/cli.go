@@ -179,16 +179,22 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 
 	// Best-effort FTS indexing: errors here must not affect the wrapped
 	// command's exit code.
+	//
+	// Sync the log file first so that IndexSpan's os.Open sees all written
+	// data even though logFile is still open (closed by the deferred Close).
+	if syncErr := logFile.Sync(); syncErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: log sync: %v\n", syncErr)
+	}
 	fts, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir))
 	if ftsErr != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: fts open (index will be skipped): %v\n", ftsErr)
 	} else {
+		defer func() { _ = fts.Close() }()
 		if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate: %v\n", migrErr)
 		} else if indexErr := fts.IndexSpan(ctx, sessCtx.SpanID, sessCtx.SessionID, logPath); indexErr != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: fts index: %v\n", indexErr)
 		}
-		_ = fts.Close()
 	}
 
 	return exitCode

@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,9 +35,15 @@ type SearchResult struct {
 // effect for all subsequent queries (modernc.org/sqlite opens a new file
 // handle per connection, so each connection needs the pragma re-applied;
 // a single connection sidesteps the issue entirely).
+// The path is encoded via url.URL so that spaces and other special characters
+// in the data directory do not corrupt the SQLite URI query string.
 func OpenFTS(path string) (*FTSStore, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", path)
-	db, err := sql.Open("sqlite", dsn)
+	u := &url.URL{
+		Scheme:   "file",
+		Path:     path,
+		RawQuery: "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+	}
+	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return nil, fmt.Errorf("open fts sqlite: %w", err)
 	}
@@ -163,7 +171,8 @@ func (f *FTSStore) Search(ctx context.Context, query string, limit int) ([]Searc
 // span_contents, correcting any internal inconsistency that accumulated
 // during the delete+re-insert phase.
 func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string) error {
-	sessions, err := store.ListSessions(ctx, 0, nil)
+	// math.MaxInt32 fetches all sessions; passing 0 would silently cap at 50.
+	sessions, err := store.ListSessions(ctx, math.MaxInt32, nil)
 	if err != nil {
 		return fmt.Errorf("reindex: list sessions: %w", err)
 	}
@@ -174,6 +183,7 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Clear the content table; triggers propagate the deletes to outputs_fts.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM span_contents`); err != nil {
 		return fmt.Errorf("reindex: clear content: %w", err)
 	}
@@ -194,6 +204,9 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 				fmt.Fprintf(os.Stderr, "shtrace: reindex span %s: %v\n", sp.ID, readErr)
 				continue
 			}
+			// The span_contents_ai trigger propagates each insert to outputs_fts.
+			// Do NOT call 'rebuild' afterwards: triggers already populate the FTS
+			// index, and an additional 'rebuild' would double every entry.
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO span_contents(span_id, session_id, content)
 				VALUES (?, ?, ?)`,
@@ -202,13 +215,6 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 				return fmt.Errorf("reindex: insert span %s: %w", sp.ID, err)
 			}
 		}
-	}
-
-	// Rebuild the FTS virtual table from span_contents. This single operation
-	// replaces all the per-row trigger updates that fired during the
-	// delete+insert phase above, ensuring a consistent index state.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO outputs_fts(outputs_fts) VALUES('rebuild')`); err != nil {
-		return fmt.Errorf("reindex: fts rebuild: %w", err)
 	}
 
 	return tx.Commit()
