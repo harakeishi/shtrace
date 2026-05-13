@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/harakeishi/shtrace/internal/runner"
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/session"
@@ -23,10 +25,13 @@ import (
 // convention (argv[0] is the program name).
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
-		_, _ = fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
 		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
 		return 2
 	}
+
+	// Parse optional --mode flag before dispatching subcommands.
+	mode, argv := parseMode(argv)
 
 	switch argv[1] {
 	case "ls":
@@ -42,16 +47,16 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	case "shell-init":
 		return runShellInit(argv[2:], stdout, stderr)
 	case "--":
-		return runWrapped(ctx, argv[2:], stdout, stderr)
+		return runWrapped(ctx, mode, argv[2:], stdout, stderr)
 	default:
 		// Treat `shtrace cmd args...` the same as `shtrace -- cmd args...`
-		return runWrapped(ctx, argv[1:], stdout, stderr)
+		return runWrapped(ctx, mode, argv[1:], stdout, stderr)
 	}
 }
 
 // runWrapped executes `cmd args...`, records stdout/stderr, and persists span
 // metadata. This is the core MVP path.
-func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer) int {
+func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stderr io.Writer) int {
 	if len(cmdArgs) == 0 {
 		_, _ = fmt.Fprintln(stderr, "shtrace: no command to run")
 		return 2
@@ -136,15 +141,42 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		return 1
 	}
 
-	res, runErr := runner.RunPipe(ctx, runner.PipeOptions{
-		Argv:   cmdArgs,
-		Env:    childEnv,
-		Cwd:    cwd,
-		Writer: jsonl,
-		Stdout: stdout,
-		Stderr: stderr,
-		Masker: masker,
-	})
+	// Choose mode A (PTY) or mode B (pipe).
+	// Auto-detect: use PTY when stdout is a real terminal, unless overridden.
+	if mode == "" {
+		if f, ok := stdout.(*os.File); ok && isatty.IsTerminal(f.Fd()) {
+			mode = "pty"
+		} else {
+			mode = "pipe"
+		}
+	}
+
+	var res runner.Result
+	var runErr error
+	if mode == "pty" {
+		var tty *os.File
+		if f, ok := stdout.(*os.File); ok {
+			tty = f
+		}
+		res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
+			Argv:   cmdArgs,
+			Env:    childEnv,
+			Cwd:    cwd,
+			Writer: jsonl,
+			Tty:    tty,
+			Masker: masker,
+		})
+	} else {
+		res, runErr = runner.RunPipe(ctx, runner.PipeOptions{
+			Argv:   cmdArgs,
+			Env:    childEnv,
+			Cwd:    cwd,
+			Writer: jsonl,
+			Stdout: stdout,
+			Stderr: stderr,
+			Masker: masker,
+		})
+	}
 	if runErr != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: run: %v\n", runErr)
 		return 1
@@ -159,7 +191,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		Command:      cmdArgs[0],
 		Argv:         masker.MaskArgv(cmdArgs),
 		Cwd:          cwd,
-		Mode:         "pipe",
+		Mode:         mode,
 		StartedAt:    startedAt,
 		EndedAt:      endedAt,
 		ExitCode:     &exitCode,
@@ -541,6 +573,22 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 // Single-quote characters within s are handled via the '\''-idiom.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// parseMode extracts an optional --mode <value> flag from argv (argv[0] is the
+// program name) and returns the mode string and the remaining argv. argv is
+// returned unmodified if --mode is absent.
+func parseMode(argv []string) (mode string, rest []string) {
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--mode" && i+1 < len(argv) {
+			mode = argv[i+1]
+			i++ // skip value
+			continue
+		}
+		out = append(out, argv[i])
+	}
+	return mode, out
 }
 
 func splitLines(b []byte) [][]byte {
