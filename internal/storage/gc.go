@@ -157,28 +157,30 @@ func RunGC(ctx context.Context, store *Store, fts *FTSStore, baseDir string, cfg
 			continue
 		}
 
-		// Deletion order: authoritative DB first, then FTS (best-effort),
-		// then disk. This ensures that if the DB delete fails the FTS index
-		// and output files are left intact and consistent.
+		// Deletion order: disk first, then DB, then FTS (best-effort).
+		//
+		// Removing disk files before the DB row ensures that a mid-sequence
+		// failure leaves the system in a retry-safe state:
+		//   - RemoveAll fails  → DB+FTS untouched; session retried on next run ✓
+		//   - RemoveAll ok, DeleteSession fails → disk already clean; next run
+		//     finds the session, calls RemoveAll on missing dir (no-op), then
+		//     retries DeleteSession ✓
+		//   - Both succeed → fully clean ✓
+		// This avoids the permanent orphan scenario where a DB row is deleted
+		// but disk files remain inaccessible to future GC runs.
+		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
+			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
+		}
 		if err := store.DeleteSession(ctx, s.ID); err != nil {
 			return result, fmt.Errorf("gc: delete session %s: %w", s.ID, err)
 		}
 		if fts != nil {
-			// FTS errors are non-fatal: the session is already gone from the
-			// authoritative DB so stale index rows are harmless.
+			// FTS errors are non-fatal: the session is already removed from
+			// disk and DB so stale FTS rows are harmless.
 			_ = fts.DeleteSessionIndex(ctx, s.ID)
 		}
-		// Record the session and increment the counter before disk cleanup:
-		// the DB row is already gone so this session will not appear in future
-		// GC runs regardless of whether RemoveAll succeeds. Callers can use
-		// result.Sessions to identify any partially-cleaned sessions.
-		// BytesReclaimed is updated only after successful disk removal so it
-		// accurately reflects bytes actually freed from disk.
 		result.Sessions = append(result.Sessions, s.ID)
 		result.SessionsRemoved++
-		if err := os.RemoveAll(filepath.Join(baseDir, "outputs", s.ID)); err != nil {
-			return result, fmt.Errorf("gc: remove outputs for session %s: %w", s.ID, err)
-		}
 		result.BytesReclaimed += sz
 	}
 	return result, nil
