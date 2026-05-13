@@ -24,7 +24,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
 		return 2
 	}
 
@@ -33,6 +33,10 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runLs(ctx, argv[2:], stdout, stderr)
 	case "show":
 		return runShow(ctx, argv[2:], stdout, stderr)
+	case "search":
+		return runSearch(ctx, argv[2:], stdout, stderr)
+	case "reindex":
+		return runReindex(ctx, argv[2:], stdout, stderr)
 	case "session":
 		return runSession(ctx, argv[2:], stdout, stderr)
 	case "shell-init":
@@ -173,6 +177,17 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		}
 	}
 
+	// Best-effort FTS indexing: errors here must not affect the wrapped
+	// command's exit code.
+	if fts, err := storage.OpenFTS(storage.FTSPath(dataDir)); err == nil {
+		if err := fts.MigrateFTS(ctx); err == nil {
+			if indexErr := fts.IndexSpan(ctx, sessCtx.SpanID, sessCtx.SessionID, logPath); indexErr != nil {
+				_, _ = fmt.Fprintf(stderr, "shtrace: fts index: %v\n", indexErr)
+			}
+		}
+		_ = fts.Close()
+	}
+
 	return exitCode
 }
 
@@ -307,6 +322,87 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "shtrace: %d corrupt line(s) skipped in %s\n", corrupt, logPath)
 		}
 	}
+	return 0
+}
+
+// runSearch performs a full-text search over recorded span outputs.
+func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace search <query>")
+		return 2
+	}
+	query := strings.Join(args, " ")
+
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+
+	fts, err := storage.OpenFTS(storage.FTSPath(dataDir))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open fts: %v\n", err)
+		return 1
+	}
+	defer func() { _ = fts.Close() }()
+	if err := fts.MigrateFTS(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate: %v\n", err)
+		return 1
+	}
+
+	results, err := fts.Search(ctx, query, 20)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: search: %v\n", err)
+		return 1
+	}
+	if len(results) == 0 {
+		_, _ = fmt.Fprintln(stdout, "no results")
+		return 0
+	}
+	for _, r := range results {
+		_, _ = fmt.Fprintf(stdout, "session=%s span=%s\n  %s\n", r.SessionID, r.SpanID, r.Snippet)
+	}
+	return 0
+}
+
+// runReindex rebuilds the FTS index from the raw JSON Lines files on disk.
+func runReindex(ctx context.Context, _ []string, stdout, stderr io.Writer) int {
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+
+	store, err := storage.Open(dataDir + "/sessions.db")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		return 1
+	}
+
+	fts, err := storage.OpenFTS(storage.FTSPath(dataDir))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open fts: %v\n", err)
+		return 1
+	}
+	defer func() { _ = fts.Close() }()
+	if err := fts.MigrateFTS(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate: %v\n", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintln(stdout, "reindexing...")
+	if err := storage.ReindexAll(ctx, fts, store, dataDir); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: reindex: %v\n", err)
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, "done")
 	return 0
 }
 
