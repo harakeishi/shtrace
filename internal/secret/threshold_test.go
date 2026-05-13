@@ -219,12 +219,16 @@ func TestMaskEnv_MasksHighEntropyValues(t *testing.T) {
 func TestMaskEnv_SecretsAreSorted(t *testing.T) {
 	// Verify that the returned secrets slice is sorted regardless of map
 	// iteration order, so downstream code sees a deterministic result.
+	// All three values must be genuinely high-entropy so they are masked.
 	env := map[string]string{
 		"KEY_A": "Xk9f2pL8nQ3rJ7vM0wA1sD4tY6uI5oP",
 		"KEY_B": "N4vK8xP2mQ6wT1hL9rY5bJ3cZ7sG0dFe",
-		"KEY_C": "AKIAT3LGPZEQH5XMR4NW",
+		"KEY_C": "p3Qw8xZ2mA7sK1vN4hT6rF9dL0jB5yUc",
 	}
 	_, secrets := MaskEnv(env)
+	if len(secrets) != 3 {
+		t.Fatalf("expected 3 masked secrets, got %d: %v", len(secrets), secrets)
+	}
 	for i := 1; i < len(secrets); i++ {
 		if secrets[i] < secrets[i-1] {
 			t.Errorf("secrets not sorted: secrets[%d]=%q < secrets[%d]=%q",

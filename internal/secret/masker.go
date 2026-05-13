@@ -85,8 +85,14 @@ func NewMasker(extra []string) (*Masker, error) {
 	return &Masker{patterns: compiled}, nil
 }
 
-// MaskString returns s with every match replaced by `***`, plus the number of
-// replacements made (the count is what `shtrace pr-comment` will surface).
+// MaskString returns s with every match replaced by Replacement, plus the
+// number of replacements made (the count is what `shtrace pr-comment` will
+// surface).
+//
+// Patterns are applied sequentially: once a span of text has been replaced by
+// Replacement it cannot be matched again by a later pattern. In practice this
+// means the count is accurate for non-overlapping matches; the rare case where
+// a single span would match multiple patterns is counted only once.
 func (m *Masker) MaskString(s string) (string, int) {
 	count := 0
 	out := s

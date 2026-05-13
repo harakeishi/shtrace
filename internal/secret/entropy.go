@@ -95,7 +95,7 @@ func MaskEnv(env map[string]string) (masked map[string]string, secrets []string)
 			masked[k] = v
 			continue
 		}
-		masked[k] = replacement
+		masked[k] = Replacement
 		secrets = append(secrets, v)
 	}
 	sort.Strings(secrets)
