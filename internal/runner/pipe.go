@@ -93,6 +93,9 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 // utf8Boundary returns the largest byte index ≤ pos at which s begins a valid
 // UTF-8 rune, so that s[:result] never contains an incomplete multi-byte sequence.
 func utf8Boundary(s string, pos int) int {
+	if pos >= len(s) {
+		pos = len(s) - 1
+	}
 	for pos > 0 && !utf8.RuneStart(s[pos]) {
 		pos--
 	}

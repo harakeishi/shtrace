@@ -135,6 +135,9 @@ func (m *Masker) MaskArgv(argv []string) []string {
 // valid UTF-8 rune (or a continuation byte has not been split). This ensures
 // that slicing s[:result] never produces an incomplete multi-byte sequence.
 func utf8Boundary(s string, pos int) int {
+	if pos >= len(s) {
+		pos = len(s) - 1
+	}
 	for pos > 0 && !utf8.RuneStart(s[pos]) {
 		pos--
 	}
