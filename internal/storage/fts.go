@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,23 +30,26 @@ type SearchResult struct {
 }
 
 // OpenFTS opens (or creates) the FTS index at path.
-// SetMaxOpenConns(1) ensures the WAL pragma applied at open time stays in
-// effect for all subsequent queries (modernc.org/sqlite opens a new file
-// handle per connection, so each connection needs the pragma re-applied;
-// a single connection sidesteps the issue entirely).
-// The path is encoded via url.URL so that spaces and other special characters
-// in the data directory do not corrupt the SQLite URI query string.
+// SetMaxOpenConns(1) ensures the WAL/busy_timeout pragmas applied at open time
+// stay in effect for every query (modernc.org/sqlite opens a new file handle
+// per connection; a single connection sidesteps needing to re-apply them).
+// Pragmas are executed as SQL statements rather than embedded in the DSN to
+// avoid implementation-dependent URI parsing behaviour.
 func OpenFTS(path string) (*FTSStore, error) {
-	u := &url.URL{
-		Scheme:   "file",
-		Path:     path,
-		RawQuery: "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
-	}
-	db, err := sql.Open("sqlite", u.String())
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open fts sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA busy_timeout=5000`,
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open fts sqlite pragma: %w", err)
+		}
+	}
 	return &FTSStore{db: db}, nil
 }
 
@@ -114,6 +116,9 @@ func (f *FTSStore) MigrateFTS(ctx context.Context) error {
 // and inserts (or replaces) a row in the FTS index for the given span. Chunks
 // with stream="stderr" are included so that error output is also searchable.
 // The file is read line-by-line to avoid loading large log files into memory.
+//
+// MigrateFTS must be called before IndexSpan; calling IndexSpan on an
+// uninitialised store will return a "no such table" error.
 func (f *FTSStore) IndexSpan(ctx context.Context, spanID, sessionID, logPath string) error {
 	content, err := readLogContent(logPath)
 	if err != nil {

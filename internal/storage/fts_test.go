@@ -23,9 +23,16 @@ func writeTempLog(t *testing.T, dir, sessionID, spanID string, chunks []storage.
 		t.Fatalf("create log: %v", err)
 	}
 	for _, c := range chunks {
-		b, _ := json.Marshal(c)
-		_, _ = f.Write(b)
-		_, _ = f.Write([]byte("\n"))
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("marshal chunk: %v", err)
+		}
+		if _, err := f.Write(b); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+		if _, err := f.Write([]byte("\n")); err != nil {
+			t.Fatalf("write newline: %v", err)
+		}
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close log: %v", err)
