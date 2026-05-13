@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/harakeishi/shtrace/internal/runner"
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/session"
@@ -23,7 +25,21 @@ import (
 // convention (argv[0] is the program name).
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
-		_, _ = fmt.Fprintln(stderr, "usage: shtrace <subcommand> [args...]")
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
+		return 2
+	}
+
+	// Parse optional --mode flag before dispatching subcommands.
+	// Re-check length after parsing because --mode consumes two tokens and
+	// `shtrace --mode pty` (no subcommand) would otherwise panic on argv[1].
+	mode, argv, modeErr := parseMode(argv)
+	if modeErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", modeErr)
+		return 2
+	}
+	if len(argv) < 2 {
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
 		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
 		return 2
 	}
@@ -42,16 +58,16 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	case "shell-init":
 		return runShellInit(argv[2:], stdout, stderr)
 	case "--":
-		return runWrapped(ctx, argv[2:], stdout, stderr)
+		return runWrapped(ctx, mode, argv[2:], stdout, stderr)
 	default:
 		// Treat `shtrace cmd args...` the same as `shtrace -- cmd args...`
-		return runWrapped(ctx, argv[1:], stdout, stderr)
+		return runWrapped(ctx, mode, argv[1:], stdout, stderr)
 	}
 }
 
 // runWrapped executes `cmd args...`, records stdout/stderr, and persists span
 // metadata. This is the core MVP path.
-func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer) int {
+func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stderr io.Writer) int {
 	if len(cmdArgs) == 0 {
 		_, _ = fmt.Fprintln(stderr, "shtrace: no command to run")
 		return 2
@@ -121,7 +137,10 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 	}
 	defer func() { _ = logFile.Close() }()
 
-	cwd, _ := os.Getwd()
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+	}
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
 
 	jsonl := storage.NewJSONLWriter(logFile, nil)
@@ -136,15 +155,52 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		return 1
 	}
 
-	res, runErr := runner.RunPipe(ctx, runner.PipeOptions{
-		Argv:   cmdArgs,
-		Env:    childEnv,
-		Cwd:    cwd,
-		Writer: jsonl,
-		Stdout: stdout,
-		Stderr: stderr,
-		Masker: masker,
-	})
+	// Resolve the effective mode. isatty.IsTerminal is evaluated once here so
+	// the check is not duplicated between auto-detection and explicit --mode.
+	//
+	// PTY requires stdout to be a real terminal. If it is not (e.g. redirected
+	// to a file, pipe, or non-*os.File writer), fall back to pipe so output is
+	// not silently lost and ioctls don't fail mid-run.
+	var ptyTty *os.File
+	if f, ok := stdout.(*os.File); ok && isatty.IsTerminal(f.Fd()) {
+		ptyTty = f
+	}
+	switch {
+	case mode == "":
+		if ptyTty != nil {
+			mode = "pty"
+		} else {
+			mode = "pipe"
+		}
+	case mode == "pty" && ptyTty == nil:
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: --mode pty requested but stdout is not a TTY; falling back to pipe\n")
+		mode = "pipe"
+	}
+
+	var res runner.Result
+	var runErr error
+	switch mode {
+	case "pty":
+		res, runErr = runner.RunPTY(ctx, runner.PTYOptions{
+			Argv:   cmdArgs,
+			Env:    childEnv,
+			Cwd:    cwd,
+			Writer: jsonl,
+			Tty:    ptyTty,
+			Stderr: stderr,
+			Masker: masker,
+		})
+	default: // "pipe"
+		res, runErr = runner.RunPipe(ctx, runner.PipeOptions{
+			Argv:   cmdArgs,
+			Env:    childEnv,
+			Cwd:    cwd,
+			Writer: jsonl,
+			Stdout: stdout,
+			Stderr: stderr,
+			Masker: masker,
+		})
+	}
 	if runErr != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: run: %v\n", runErr)
 		return 1
@@ -159,7 +215,7 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 		Command:      cmdArgs[0],
 		Argv:         masker.MaskArgv(cmdArgs),
 		Cwd:          cwd,
-		Mode:         "pipe",
+		Mode:         mode,
 		StartedAt:    startedAt,
 		EndedAt:      endedAt,
 		ExitCode:     &exitCode,
@@ -169,6 +225,9 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 	}
 	if sessCtx.IsRoot {
 		ended := endedAt
+		// InsertSession uses ON CONFLICT DO UPDATE (UPSERT), so calling it a
+		// second time for the same session ID is safe: it updates ended_at
+		// without violating the UNIQUE constraint.
 		if err := store.InsertSession(ctx, storage.Session{
 			ID:        sessCtx.SessionID,
 			StartedAt: startedAt,
@@ -541,6 +600,40 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 // Single-quote characters within s are handled via the '\''-idiom.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// parseMode extracts an optional --mode <value> (or --mode=<value>) flag from
+// argv (argv[0] is the program name) and returns the mode string and the
+// remaining argv. argv is returned unmodified if --mode is absent.
+// Returns ("", argv, error) when the flag is malformed or an unsupported value.
+func parseMode(argv []string) (mode string, rest []string, err error) {
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		var val string
+		switch {
+		case arg == "--mode":
+			if i+1 >= len(argv) {
+				return "", argv, fmt.Errorf("--mode requires a value (pipe or pty)")
+			}
+			val = argv[i+1]
+			i++ // skip value token
+		case strings.HasPrefix(arg, "--mode="):
+			val = strings.TrimPrefix(arg, "--mode=")
+		default:
+			out = append(out, arg)
+			continue
+		}
+		if val != "pipe" && val != "pty" {
+			return "", argv, fmt.Errorf("--mode %q is invalid: must be pipe or pty", val)
+		}
+		if mode != "" && mode != val {
+			return "", argv, fmt.Errorf("--mode specified multiple times with conflicting values (%q and %q)", mode, val)
+		}
+		// Same-value duplicates (e.g. --mode pty --mode pty) are idempotent and accepted.
+		mode = val
+	}
+	return mode, out, nil
 }
 
 func splitLines(b []byte) [][]byte {
