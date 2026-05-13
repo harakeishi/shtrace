@@ -179,11 +179,14 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 
 	// Best-effort FTS indexing: errors here must not affect the wrapped
 	// command's exit code.
-	if fts, err := storage.OpenFTS(storage.FTSPath(dataDir)); err == nil {
-		if err := fts.MigrateFTS(ctx); err == nil {
-			if indexErr := fts.IndexSpan(ctx, sessCtx.SpanID, sessCtx.SessionID, logPath); indexErr != nil {
-				_, _ = fmt.Fprintf(stderr, "shtrace: fts index: %v\n", indexErr)
-			}
+	fts, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir))
+	if ftsErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: fts open (index will be skipped): %v\n", ftsErr)
+	} else {
+		if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate: %v\n", migrErr)
+		} else if indexErr := fts.IndexSpan(ctx, sessCtx.SpanID, sessCtx.SessionID, logPath); indexErr != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: fts index: %v\n", indexErr)
 		}
 		_ = fts.Close()
 	}

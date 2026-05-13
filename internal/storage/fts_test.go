@@ -21,13 +21,23 @@ func writeTempLog(t *testing.T, dir, sessionID, spanID string, chunks []storage.
 	if err != nil {
 		t.Fatalf("create log: %v", err)
 	}
-	defer func() { _ = f.Close() }()
 	for _, c := range chunks {
 		b, _ := json.Marshal(c)
 		_, _ = f.Write(b)
 		_, _ = f.Write([]byte("\n"))
 	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close log: %v", err)
+	}
 	return logPath
+}
+
+func spanIDs(results []storage.SearchResult) []string {
+	ids := make([]string, len(results))
+	for i, r := range results {
+		ids[i] = r.SpanID
+	}
+	return ids
 }
 
 func TestFTS_InsertAndSearch(t *testing.T) {
@@ -118,12 +128,23 @@ func TestFTS_MultipleSpans(t *testing.T) {
 		}
 	}
 
+	// Verify that searching "pytest" returns exactly span-a and not the others.
 	results, err := fts.Search(ctx, "pytest", 10)
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(results) != 1 || results[0].SpanID != "span-a" {
-		t.Errorf("expected span-a, got %+v", results)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for 'pytest', got %d (span IDs: %v)", len(results), spanIDs(results))
+	}
+	if results[0].SpanID != "span-a" {
+		t.Errorf("expected span-a, got %q", results[0].SpanID)
+	}
+
+	// Verify span-b and span-c are not returned for "pytest".
+	for _, r := range results {
+		if r.SpanID == "span-b" || r.SpanID == "span-c" {
+			t.Errorf("unexpected span in results: %q", r.SpanID)
+		}
 	}
 }
 
@@ -146,11 +167,6 @@ func TestFTS_ReindexAll(t *testing.T) {
 		ID: "sp1", SessionID: "s1", Command: "echo", Mode: "pipe", ExitCode: &exitCode,
 	})
 
-	// Write the log file.
-	writeTempLog(t, dir, "s1", "sp1", []storage.Chunk{
-		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "reindex target content"},
-	})
-
 	fts, err := storage.OpenFTS(filepath.Join(dir, "outputs.idx"))
 	if err != nil {
 		t.Fatalf("OpenFTS: %v", err)
@@ -160,10 +176,23 @@ func TestFTS_ReindexAll(t *testing.T) {
 		t.Fatalf("MigrateFTS: %v", err)
 	}
 
+	// Pre-index stale content so we can verify ReindexAll replaces it.
+	staleLog := writeTempLog(t, dir, "s1", "sp1", []storage.Chunk{
+		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "stale old content"},
+	})
+	if err := fts.IndexSpan(ctx, "sp1", "s1", staleLog); err != nil {
+		t.Fatalf("IndexSpan stale: %v", err)
+	}
+	// Overwrite the log file with fresh content (simulates a corrupt/outdated index).
+	writeTempLog(t, dir, "s1", "sp1", []storage.Chunk{
+		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "reindex target content"},
+	})
+
 	if err := storage.ReindexAll(ctx, fts, metaStore, dir); err != nil {
 		t.Fatalf("ReindexAll: %v", err)
 	}
 
+	// Fresh content must be findable.
 	results, err := fts.Search(ctx, "reindex", 10)
 	if err != nil {
 		t.Fatalf("Search after reindex: %v", err)
@@ -173,6 +202,15 @@ func TestFTS_ReindexAll(t *testing.T) {
 	}
 	if results[0].SpanID != "sp1" {
 		t.Errorf("expected sp1, got %s", results[0].SpanID)
+	}
+
+	// Stale content must no longer be findable.
+	stale, err := fts.Search(ctx, "stale", 10)
+	if err != nil {
+		t.Fatalf("Search for stale content: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("expected stale content to be gone after ReindexAll, got %d results", len(stale))
 	}
 }
 
@@ -205,6 +243,10 @@ func TestFTS_IdempotentIndex(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(results) != 1 {
-		t.Errorf("expected exactly 1 result after double-index, got %d", len(results))
+		t.Errorf("expected exactly 1 result after double-index, got %d (span IDs: %v)", len(results), spanIDs(results))
+	}
+	// Verify the snippet contains the correct content (confirms rowid alignment).
+	if len(results) == 1 && !strings.Contains(results[0].Snippet, "unique") {
+		t.Errorf("snippet after re-index does not contain 'unique': %q", results[0].Snippet)
 	}
 }

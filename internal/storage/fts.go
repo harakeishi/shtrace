@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -28,12 +29,17 @@ type SearchResult struct {
 }
 
 // OpenFTS opens (or creates) the FTS index at path.
+// SetMaxOpenConns(1) ensures the WAL pragma applied at open time stays in
+// effect for all subsequent queries (modernc.org/sqlite opens a new file
+// handle per connection, so each connection needs the pragma re-applied;
+// a single connection sidesteps the issue entirely).
 func OpenFTS(path string) (*FTSStore, error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open fts sqlite: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	return &FTSStore{db: db}, nil
 }
 
@@ -41,11 +47,18 @@ func OpenFTS(path string) (*FTSStore, error) {
 func (f *FTSStore) Close() error { return f.db.Close() }
 
 // MigrateFTS creates the FTS5 virtual table and the content-tracking table if
-// they do not exist. Safe to call on every startup.
+// they do not exist. All DDL runs inside a single transaction so a partial
+// failure does not leave an inconsistent schema. Safe to call on every startup.
 func (f *FTSStore) MigrateFTS(ctx context.Context) error {
+	tx, err := f.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("fts migrate: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	stmts := []string{
 		// shadow table that stores the raw text so we can rebuild the FTS
-		// index from it (used by Reindex).
+		// index from it (used by ReindexAll).
 		`CREATE TABLE IF NOT EXISTS span_contents (
 			span_id    TEXT NOT NULL,
 			session_id TEXT NOT NULL,
@@ -82,42 +95,29 @@ func (f *FTSStore) MigrateFTS(ctx context.Context) error {
 			END`,
 	}
 	for _, q := range stmts {
-		if _, err := f.db.ExecContext(ctx, q); err != nil {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("fts migrate (%.40q): %w", q, err)
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // IndexSpan reads the JSON Lines log at logPath, concatenates all chunk data,
 // and inserts (or replaces) a row in the FTS index for the given span. Chunks
 // with stream="stderr" are included so that error output is also searchable.
+// The file is read line-by-line to avoid loading large log files into memory.
 func (f *FTSStore) IndexSpan(ctx context.Context, spanID, sessionID, logPath string) error {
-	raw, err := os.ReadFile(logPath)
+	content, err := readLogContent(logPath)
 	if err != nil {
-		return fmt.Errorf("fts index: read %s: %w", logPath, err)
+		return fmt.Errorf("fts index: %w", err)
 	}
-
-	var sb strings.Builder
-	for _, line := range splitFTSLines(raw) {
-		if len(line) == 0 {
-			continue
-		}
-		var c Chunk
-		if err := json.Unmarshal(line, &c); err != nil {
-			continue // skip corrupt lines; index whatever we can
-		}
-		sb.WriteString(c.Data)
-		sb.WriteByte('\n')
-	}
-
 	_, err = f.db.ExecContext(ctx, `
 		INSERT INTO span_contents(span_id, session_id, content)
 		VALUES (?, ?, ?)
 		ON CONFLICT(span_id) DO UPDATE SET
 			session_id = excluded.session_id,
 			content    = excluded.content`,
-		spanID, sessionID, sb.String(),
+		spanID, sessionID, content,
 	)
 	return err
 }
@@ -152,20 +152,30 @@ func (f *FTSStore) Search(ctx context.Context, query string, limit int) ([]Searc
 	return out, rows.Err()
 }
 
-// Reindex drops and rebuilds the FTS index from the raw JSON Lines files on
-// disk. Call this when the index is suspected to be corrupt or out-of-date.
+// ReindexAll atomically rebuilds the FTS index from the raw JSON Lines files
+// on disk. Call this when the index is suspected to be corrupt or out-of-date.
 // baseDir is the shtrace data directory (same as passed to OutputPath).
 // store is the metadata Store used to enumerate sessions and spans.
+//
+// The entire operation runs inside a single transaction so callers always see
+// either the old index or the fully rebuilt one — never a partial state.
+// A final FTS5 'rebuild' command synchronises the virtual table from
+// span_contents, correcting any internal inconsistency that accumulated
+// during the delete+re-insert phase.
 func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string) error {
-	// Wipe the FTS content table; triggers will propagate deletes to the
-	// virtual table automatically.
-	if _, err := fts.db.ExecContext(ctx, `DELETE FROM span_contents`); err != nil {
-		return fmt.Errorf("reindex: clear content: %w", err)
-	}
-
 	sessions, err := store.ListSessions(ctx, 0, nil)
 	if err != nil {
 		return fmt.Errorf("reindex: list sessions: %w", err)
+	}
+
+	tx, err := fts.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("reindex: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM span_contents`); err != nil {
+		return fmt.Errorf("reindex: clear content: %w", err)
 	}
 
 	for _, sess := range sessions {
@@ -178,13 +188,30 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 			if _, statErr := os.Stat(logPath); statErr != nil {
 				continue // log file missing — skip silently
 			}
-			if err := fts.IndexSpan(ctx, sp.ID, sess.ID, logPath); err != nil {
+			content, readErr := readLogContent(logPath)
+			if readErr != nil {
 				// Non-fatal: report but continue with remaining spans.
-				fmt.Fprintf(os.Stderr, "shtrace: reindex span %s: %v\n", sp.ID, err)
+				fmt.Fprintf(os.Stderr, "shtrace: reindex span %s: %v\n", sp.ID, readErr)
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO span_contents(span_id, session_id, content)
+				VALUES (?, ?, ?)`,
+				sp.ID, sess.ID, content,
+			); err != nil {
+				return fmt.Errorf("reindex: insert span %s: %w", sp.ID, err)
 			}
 		}
 	}
-	return nil
+
+	// Rebuild the FTS virtual table from span_contents. This single operation
+	// replaces all the per-row trigger updates that fired during the
+	// delete+insert phase above, ensuring a consistent index state.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO outputs_fts(outputs_fts) VALUES('rebuild')`); err != nil {
+		return fmt.Errorf("reindex: fts rebuild: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // FTSPath returns the canonical path of the FTS index file given the data dir.
@@ -192,17 +219,29 @@ func FTSPath(baseDir string) string {
 	return filepath.Join(baseDir, "outputs.idx")
 }
 
-func splitFTSLines(b []byte) [][]byte {
-	var out [][]byte
-	start := 0
-	for i := 0; i < len(b); i++ {
-		if b[i] == '\n' {
-			out = append(out, b[start:i])
-			start = i + 1
+// readLogContent opens a JSON Lines log file and concatenates the Data field
+// of every Chunk. The file is scanned line by line to avoid loading large
+// files into memory at once. Corrupt lines are silently skipped so that a
+// single bad entry does not block indexing of the rest of the span.
+func readLogContent(logPath string) (string, error) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", logPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	var sb strings.Builder
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 10<<20) // 10 MB per-line cap
+	for sc.Scan() {
+		var c Chunk
+		if json.Unmarshal(sc.Bytes(), &c) == nil {
+			sb.WriteString(c.Data)
+			sb.WriteByte('\n')
 		}
 	}
-	if start < len(b) {
-		out = append(out, b[start:])
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("scan %s: %w", logPath, err)
 	}
-	return out
+	return sb.String(), nil
 }
