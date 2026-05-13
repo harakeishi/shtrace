@@ -218,10 +218,41 @@ Development workflow:
 ```sh
 go test -race ./...      # all tests must pass under -race
 go vet ./...
+go test -bench=. ./...   # benchmarks must stay green; see SLIs below
 ```
 
 The codebase follows a strict TDD discipline — write a failing test first,
 then the minimum implementation that makes it pass.
+
+### Performance SLIs
+
+`shtrace` is a wrapper, so its overhead has to be invisible against the
+wrapped command. Concrete SLIs (committed-to ceilings, all measured as
+**mean ns/op** by `go test -bench`; aggregate across `-count=N` runs with
+`benchstat` if you need a distribution):
+
+| SLI | Target (mean) | Benchmark |
+|---|---|---|
+| Wrapping a near-zero-output command (spawn floor) | wrapped wall-clock of `sh -c 'printf hi'` < 5 ms | `BenchmarkRunPipe_SpawnFloor` |
+| Masker + recorder streaming throughput (in-process, no child) | ≥ 10 MB/s for printable ASCII | `BenchmarkForwardStream_Throughput` (reports MB/s) |
+| Span insert (sqlite WAL, `synchronous=NORMAL`) | `InsertSpan` < 5 ms | `BenchmarkInsertSpan` |
+| Session list (50 rows out of 1 000) | < 10 ms | `BenchmarkListSessions` |
+| Spans-for-session (100 rows) | < 10 ms | `BenchmarkSpansForSession` |
+| FTS first-time index of one span (100 lines, fresh `span_id`) | < 10 ms | `BenchmarkFTSIndexSpan` |
+| FTS search across 100 indexed spans (~20 % selectivity) | < 20 ms | `BenchmarkFTSSearch` |
+
+The spawn-floor SLI measures wrapped wall-clock, not "wrapper overhead
+relative to a bare command" — the latter requires a separate baseline run
+and is currently out of scope. The storage SLIs assume the pragma settings
+applied by `storage.Open` (WAL journal, default `synchronous=NORMAL`); if a
+future change tightens durability to `FULL`, retune the ceilings or document
+the new floor.
+
+These targets are intentionally generous for the v0.x line — the goal is to
+catch regressions, not to chase microseconds. Once shtrace is integrated into
+a real pytest/Go test suite (Phase 3.5), the headline SLI becomes "`shtrace
+pytest tests/` adds ≤ X % wall-clock over a bare `pytest tests/` on the same
+host", with X to be pinned from production measurements.
 
 ## License
 
