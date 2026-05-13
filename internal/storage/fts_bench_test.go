@@ -80,11 +80,11 @@ func BenchmarkFTSSearch(b *testing.B) {
 	ctx := context.Background()
 
 	const (
-		spans      = 100
-		matching   = 20 // ~20 % selectivity
-		linesEach  = 50
-		probeTerm  = "compiled"
-		searchCap  = 20
+		spans     = 100
+		matching  = 20 // ~20 % selectivity
+		linesEach = 50
+		probeTerm = "compiled"
+		searchCap = 20
 	)
 	for i := 0; i < spans; i++ {
 		spanID := "span-" + strconv.Itoa(i)
