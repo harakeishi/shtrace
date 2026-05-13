@@ -350,8 +350,12 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 
 	ftsPath := storage.FTSPath(dataDir)
-	if _, statErr := os.Stat(ftsPath); os.IsNotExist(statErr) {
-		_, _ = fmt.Fprintln(stderr, "shtrace: no search index found — run a command under shtrace first")
+	if _, statErr := os.Stat(ftsPath); statErr != nil {
+		if os.IsNotExist(statErr) {
+			_, _ = fmt.Fprintln(stderr, "shtrace: no search index found — run a command under shtrace first")
+		} else {
+			_, _ = fmt.Fprintf(stderr, "shtrace: stat fts index: %v\n", statErr)
+		}
 		return 1
 	}
 
