@@ -12,12 +12,20 @@ import (
 // NewMaskerWithLiterals returns a Masker that uses the built-in patterns plus
 // any extra user-supplied regexes and additional literal strings. Literals are
 // escaped with regexp.QuoteMeta before use, so they match as-is in output.
+// Empty strings in literals are silently skipped to prevent an empty-pattern
+// regex from matching every position in the output.
 func NewMaskerWithLiterals(extraPatterns []string, literals []string) (*Masker, error) {
-	quoted := make([]string, len(literals))
-	for i, lit := range literals {
-		quoted[i] = regexp.QuoteMeta(lit)
+	quoted := make([]string, 0, len(literals))
+	for _, lit := range literals {
+		if lit == "" {
+			continue
+		}
+		quoted = append(quoted, regexp.QuoteMeta(lit))
 	}
-	return NewMasker(append(extraPatterns, quoted...))
+	combined := make([]string, 0, len(extraPatterns)+len(quoted))
+	combined = append(combined, extraPatterns...)
+	combined = append(combined, quoted...)
+	return NewMasker(combined)
 }
 
 // defaultPatterns are the built-in secret patterns. They are intentionally
@@ -37,7 +45,11 @@ var defaultPatterns = []string{
 	`eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`,
 }
 
-const replacement = "***"
+// Replacement is the string substituted in place of detected secrets.
+// It is exported so callers can compare against it without hard-coding "***".
+const Replacement = "***"
+
+const replacement = Replacement
 
 // Masker rewrites known-secret substrings to a fixed redaction marker.
 type Masker struct {

@@ -128,7 +128,8 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 
 	// Scan env vars for high-entropy values and extend the masker so those
 	// values are also redacted from I/O streams (not just env display).
-	_, envSecrets := secret.MaskEnv(envMap())
+	// Reuse the env map already built above to avoid a second os.Environ() call.
+	_, envSecrets := secret.MaskEnv(env)
 	masker, err := secret.NewMaskerWithLiterals(nil, envSecrets)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: build masker: %v\n", err)
