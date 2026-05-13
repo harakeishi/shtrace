@@ -110,7 +110,9 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := pr.Read(buf)
-			sb.Write(buf[:n])
+			if n > 0 {
+				sb.Write(buf[:n])
+			}
 			if readErr != nil {
 				break
 			}

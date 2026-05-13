@@ -620,6 +620,9 @@ func parseMode(argv []string) (mode string, rest []string, err error) {
 		if val != "pipe" && val != "pty" {
 			return "", argv, fmt.Errorf("--mode %q is invalid: must be pipe or pty", val)
 		}
+		if mode != "" && mode != val {
+			return "", argv, fmt.Errorf("--mode specified multiple times with conflicting values (%q and %q)", mode, val)
+		}
 		mode = val
 	}
 	return mode, out, nil
