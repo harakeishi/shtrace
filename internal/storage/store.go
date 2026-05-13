@@ -263,6 +263,23 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string, warn func
 	return out, rows.Err()
 }
 
+// DeleteSession removes a session and all of its spans from the metadata DB
+// in a single transaction.
+func (s *Store) DeleteSession(ctx context.Context, sessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete session: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM spans WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("delete session: delete spans: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, sessionID); err != nil {
+		return fmt.Errorf("delete session: delete session row: %w", err)
+	}
+	return tx.Commit()
+}
+
 func reportWarn(warn func(error), err error) {
 	if warn != nil {
 		warn(err)
