@@ -623,6 +623,7 @@ func parseMode(argv []string) (mode string, rest []string, err error) {
 		if mode != "" && mode != val {
 			return "", argv, fmt.Errorf("--mode specified multiple times with conflicting values (%q and %q)", mode, val)
 		}
+		// Same-value duplicates (e.g. --mode pty --mode pty) are idempotent and accepted.
 		mode = val
 	}
 	return mode, out, nil

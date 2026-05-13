@@ -105,7 +105,13 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 	}
 
 	done := make(chan string, 1)
+	// readerWG tracks whether the reader goroutine has fully exited so that
+	// pr.Close() in the defer chain is only called after the goroutine is done
+	// with pr.Read — this covers both normal completion and t.Fatalf paths.
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
 	go func() {
+		defer readerWG.Done()
 		var sb strings.Builder
 		buf := make([]byte, 4096)
 		for {
@@ -120,16 +126,14 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		done <- sb.String()
 	}()
 
+	// Defers execute LIFO: closePW first, then readerWG.Wait, then pr.Close.
+	// This order guarantees the reader goroutine exits before pr is closed,
+	// and holds even when t.Fatalf triggers runtime.Goexit() early.
 	defer func() { _ = pr.Close() }()
-
-	// sync.Once ensures pw is closed exactly once:
-	// - on the normal path, we close it explicitly after RunPTY so the reader
-	//   goroutine sees EOF before we block on <-done.
-	// - if RunPTY panics, the deferred Once.Do fires instead, preventing the
-	//   reader goroutine from blocking on pr.Read indefinitely.
+	defer func() { readerWG.Wait() }()
 	var closePWOnce sync.Once
 	closePW := func() { _ = pw.Close() }
-	defer closePWOnce.Do(closePW)
+	defer func() { closePWOnce.Do(closePW) }()
 
 	_, runErr := RunPTY(context.Background(), PTYOptions{
 		Argv:   []string{"sh", "-c", "printf world"},
@@ -137,7 +141,7 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 		Tty:    pw,
 		Masker: secret.DefaultMasker(),
 	})
-	closePWOnce.Do(closePW) // signal EOF to reader before blocking on <-done
+	closePWOnce.Do(closePW) // signal EOF; goroutine drains and sends to done
 	ttyOutput := <-done
 
 	if runErr != nil {
