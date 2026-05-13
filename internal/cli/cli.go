@@ -126,10 +126,14 @@ func runWrapped(ctx context.Context, cmdArgs []string, stdout, stderr io.Writer)
 
 	jsonl := storage.NewJSONLWriter(logFile, nil)
 
-	// Construct the masker once and share between the runner and the
-	// argv-persisting code so that any future user-supplied patterns apply
-	// uniformly.
-	masker := secret.DefaultMasker()
+	// Scan env vars for high-entropy values and extend the masker so those
+	// values are also redacted from I/O streams (not just env display).
+	_, envSecrets := secret.MaskEnv(envMap())
+	masker, err := secret.NewMaskerWithLiterals(nil, envSecrets)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: build masker: %v\n", err)
+		return 1
+	}
 
 	res, runErr := runner.RunPipe(ctx, runner.PipeOptions{
 		Argv:   cmdArgs,

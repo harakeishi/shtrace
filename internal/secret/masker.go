@@ -9,6 +9,17 @@ import (
 	"regexp"
 )
 
+// NewMaskerWithLiterals returns a Masker that uses the built-in patterns plus
+// any extra user-supplied regexes and additional literal strings. Literals are
+// escaped with regexp.QuoteMeta before use, so they match as-is in output.
+func NewMaskerWithLiterals(extraPatterns []string, literals []string) (*Masker, error) {
+	quoted := make([]string, len(literals))
+	for i, lit := range literals {
+		quoted[i] = regexp.QuoteMeta(lit)
+	}
+	return NewMasker(append(extraPatterns, quoted...))
+}
+
 // defaultPatterns are the built-in secret patterns. They are intentionally
 // conservative so we can keep extending them without breaking callers.
 //
