@@ -31,9 +31,16 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 
 	// Parse optional --mode flag before dispatching subcommands.
+	// Re-check length after parsing because --mode consumes two tokens and
+	// `shtrace --mode pty` (no subcommand) would otherwise panic on argv[1].
 	mode, argv, modeErr := parseMode(argv)
 	if modeErr != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", modeErr)
+		return 2
+	}
+	if len(argv) < 2 {
+		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, session, shell-init")
 		return 2
 	}
 
