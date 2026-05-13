@@ -35,6 +35,21 @@ func TestMasker_MasksBearerToken(t *testing.T) {
 	}
 }
 
+func TestMasker_MasksBearerToken_TabSeparated(t *testing.T) {
+	m := DefaultMasker()
+	in := "Authorization: Bearer\tabcdefghijklmnopqrstuvwxyz1234567890ABCDEF"
+
+	got, _ := m.MaskString(in)
+
+	if strings.Contains(got, "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
+		t.Fatalf("tab-separated bearer token leaked: %q", got)
+	}
+	// The "Bearer\t" prefix should be preserved so logs stay diagnosable.
+	if !strings.Contains(got, "Bearer\t") {
+		t.Fatalf("Bearer\\t prefix should remain, got %q", got)
+	}
+}
+
 func TestMasker_MasksGitHubPAT(t *testing.T) {
 	m := DefaultMasker()
 	in := "token ghp_abcdefghijklmnopqrstuvwxyz0123456789"
@@ -98,6 +113,37 @@ func TestStreamMasker_MasksAcrossWrites(t *testing.T) {
 	out := buf.String()
 	if strings.Contains(out, "abcdefghijklmnopqrstuvwxyz1234567890ABCDEF") {
 		t.Fatalf("streamed bearer token leaked: %q", out)
+	}
+}
+
+func TestStreamMasker_SecretSplitAcrossLargeWrite(t *testing.T) {
+	// Reproduce the flush-boundary split bug: a single Write that delivers
+	// more than safetyTail bytes, where a literal secret straddles the
+	// cutoff position. The secret must NOT appear in the final output.
+	secret := "LITERALSECRET_ABCDEFGH" // 22-char literal
+	m, err := NewMaskerWithLiterals(nil, []string{secret})
+	if err != nil {
+		t.Fatalf("NewMaskerWithLiterals: %v", err)
+	}
+
+	// Build a payload whose total size exceeds safetyTail (256) so that the
+	// writer attempts a flush. Place the secret near the flush boundary so
+	// it would have been split by the old "mask flushable only" approach.
+	prefix := strings.Repeat("A", safetyTail-4) // puts secret near boundary
+	suffix := strings.Repeat("B", safetyTail)
+	payload := prefix + secret + suffix
+
+	var buf bytes.Buffer
+	w := NewMaskingWriter(&buf, m)
+	if _, err := io.WriteString(w, payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if strings.Contains(buf.String(), secret) {
+		t.Errorf("secret leaked through flush boundary: %q", buf.String())
 	}
 }
 

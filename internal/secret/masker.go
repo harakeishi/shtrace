@@ -7,7 +7,27 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"unicode/utf8"
 )
+
+// NewMaskerWithLiterals returns a Masker that uses the built-in patterns plus
+// any extra user-supplied regexes and additional literal strings. Literals are
+// escaped with regexp.QuoteMeta before use, so they match as-is in output.
+// Empty strings in literals are silently skipped to prevent an empty-pattern
+// regex from matching every position in the output.
+func NewMaskerWithLiterals(extraPatterns []string, literals []string) (*Masker, error) {
+	quoted := make([]string, 0, len(literals))
+	for _, lit := range literals {
+		if lit == "" {
+			continue
+		}
+		quoted = append(quoted, regexp.QuoteMeta(lit))
+	}
+	combined := make([]string, 0, len(extraPatterns)+len(quoted))
+	combined = append(combined, extraPatterns...)
+	combined = append(combined, quoted...)
+	return NewMasker(combined)
+}
 
 // defaultPatterns are the built-in secret patterns. They are intentionally
 // conservative so we can keep extending them without breaking callers.
@@ -26,7 +46,11 @@ var defaultPatterns = []string{
 	`eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`,
 }
 
-const replacement = "***"
+// Replacement is the string substituted in place of detected secrets.
+// It is exported so callers can compare against it without hard-coding "***".
+const Replacement = "***"
+
+const replacement = Replacement
 
 // Masker rewrites known-secret substrings to a fixed redaction marker.
 type Masker struct {
@@ -62,8 +86,14 @@ func NewMasker(extra []string) (*Masker, error) {
 	return &Masker{patterns: compiled}, nil
 }
 
-// MaskString returns s with every match replaced by `***`, plus the number of
-// replacements made (the count is what `shtrace pr-comment` will surface).
+// MaskString returns s with every match replaced by Replacement, plus the
+// number of replacements made (the count is what `shtrace pr-comment` will
+// surface).
+//
+// Patterns are applied sequentially: once a span of text has been replaced by
+// Replacement it cannot be matched again by a later pattern. In practice this
+// means the count is accurate for non-overlapping matches; the rare case where
+// a single span would match multiple patterns is counted only once.
 func (m *Masker) MaskString(s string) (string, int) {
 	count := 0
 	out := s
@@ -73,12 +103,16 @@ func (m *Masker) MaskString(s string) (string, int) {
 		// lets us count occurrences while substituting.
 		out = re.ReplaceAllStringFunc(out, func(match string) string {
 			count++
-			// Preserve a leading "Bearer " (case-insensitive) so logs stay
-			// diagnosable.
-			if len(match) >= 7 {
-				lower := match[:7]
-				if equalFoldASCII(lower, "Bearer ") {
-					return match[:7] + replacement
+			// Preserve "Bearer<whitespace>" (case-insensitive) so logs stay
+			// diagnosable. Walk past the 6-char "Bearer" word then skip all
+			// consecutive space/tab characters to handle any \s+ variant.
+			if len(match) >= 6 && equalFoldASCII(match[:6], "Bearer") {
+				i := 6
+				for i < len(match) && (match[i] == ' ' || match[i] == '\t') {
+					i++
+				}
+				if i > 6 {
+					return match[:i] + replacement
 				}
 			}
 			return replacement
@@ -95,6 +129,19 @@ func (m *Masker) MaskArgv(argv []string) []string {
 		out[i] = masked
 	}
 	return out
+}
+
+// UTF8Boundary returns the largest byte index ≤ pos at which s begins a valid
+// UTF-8 rune, ensuring s[:result] never contains an incomplete multi-byte
+// sequence. If pos ≥ len(s) it is clamped to len(s)-1.
+func UTF8Boundary(s string, pos int) int {
+	if pos >= len(s) {
+		pos = len(s) - 1
+	}
+	for pos > 0 && !utf8.RuneStart(s[pos]) {
+		pos--
+	}
+	return pos
 }
 
 func equalFoldASCII(a, b string) bool {
@@ -137,17 +184,24 @@ func NewMaskingWriter(w io.Writer, m *Masker) io.WriteCloser {
 
 func (mw *maskingWriter) Write(p []byte) (int, error) {
 	mw.buf = append(mw.buf, p...)
-	// Only flush up to len(buf)-safetyTail bytes; keep the tail so a secret
-	// straddling writes can still match.
 	if len(mw.buf) <= safetyTail {
 		return len(p), nil
 	}
-	flushable := mw.buf[:len(mw.buf)-safetyTail]
-	masked, _ := mw.masker.MaskString(string(flushable))
-	if _, err := mw.w.Write([]byte(masked)); err != nil {
+	// Mask the full buffer (not just the flushable prefix) so that a secret
+	// whose start falls inside the safety tail of the previous flush is still
+	// caught. Emit all but the last safetyTail characters of the masked output
+	// and store those characters — already masked — as the new buffer. Storing
+	// masked bytes is safe: replacement markers cannot match any pattern.
+	masked, _ := mw.masker.MaskString(string(mw.buf))
+	if len(masked) <= safetyTail {
+		mw.buf = []byte(masked)
+		return len(p), nil
+	}
+	cutoff := UTF8Boundary(masked, len(masked)-safetyTail)
+	if _, err := mw.w.Write([]byte(masked[:cutoff])); err != nil {
 		return 0, err
 	}
-	mw.buf = mw.buf[len(mw.buf)-safetyTail:]
+	mw.buf = []byte(masked[cutoff:])
 	return len(p), nil
 }
 

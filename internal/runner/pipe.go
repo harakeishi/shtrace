@@ -102,10 +102,17 @@ const safetyTail = 256
 
 // forwardStream reads from src and routes each chunk to (a) the user tee
 // (raw bytes — the user already sees them on their terminal) and (b) the
-// recorder, after secret masking. Crucially, it buffers a small trailing
-// window between Reads so a secret that straddles a pipe-buffer boundary
-// still gets caught by a regex match. The previous implementation called
-// MaskString on each Read in isolation, which leaked split secrets.
+// recorder, after secret masking. It buffers a trailing window between Reads
+// so a secret that straddles a pipe-buffer boundary is still caught.
+//
+// Masking is always applied to the full pending buffer (not just the flushable
+// prefix) so that a secret whose start falls inside the safety tail of the
+// previous flush is still caught. After masking the full buffer we emit all
+// but the last safetyTail characters of the masked output and store those
+// safetyTail characters — already masked — as the new pending buffer. Storing
+// masked bytes (rather than original bytes) is safe: replacement markers
+// cannot match any secret pattern, so re-scanning them on the next iteration
+// is a no-op.
 func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec ChunkWriter, m *secret.Masker) {
 	var pending []byte
 	buf := make([]byte, 32*1024)
@@ -117,13 +124,14 @@ func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec Chun
 			}
 			pending = append(pending, buf[:n]...)
 			if len(pending) > safetyTail {
-				flushable := pending[:len(pending)-safetyTail]
-				masked, _ := m.MaskString(string(flushable))
-				_ = rec.WriteChunk(stream, []byte(masked))
-				// Keep the tail; reuse the underlying array to avoid churn.
-				tailLen := safetyTail
-				copy(pending, pending[len(pending)-tailLen:])
-				pending = pending[:tailLen]
+				masked, _ := m.MaskString(string(pending))
+				if len(masked) > safetyTail {
+					cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
+					_ = rec.WriteChunk(stream, []byte(masked[:cutoff]))
+					pending = []byte(masked[cutoff:])
+				} else {
+					pending = []byte(masked)
+				}
 			}
 		}
 		if err != nil {
