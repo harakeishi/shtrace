@@ -120,6 +120,29 @@ func TestDetectTestRuns_PytestWithSkipped(t *testing.T) {
 	}
 }
 
+func TestDetectTestRuns_PytestFailFirst(t *testing.T) {
+	// pytest outputs "N failed, N passed in Zs" when failures exist.
+	det := findDetector(t, "pytest")
+
+	sp := storage.Span{
+		ID:        "span5",
+		SessionID: "sess1",
+		Command:   "pytest",
+		Argv:      []string{"pytest", "tests/"},
+	}
+	lines := []string{
+		"1 failed, 3 passed in 0.50s",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Passed == nil || *run.Passed != 3 {
+		t.Errorf("passed: got %v, want 3", run.Passed)
+	}
+	if run.Failed == nil || *run.Failed != 1 {
+		t.Errorf("failed: got %v, want 1", run.Failed)
+	}
+}
+
 func TestDetectTestRuns_Rspec(t *testing.T) {
 	det := findDetector(t, "rspec")
 

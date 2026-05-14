@@ -29,8 +29,17 @@ type TestRun struct {
 // Pre-compiled regexes for each framework's output-summary line.
 // Compiled once at package init to avoid repeated compilation per span.
 var (
-	pytestCmdRe    = regexp.MustCompile(`(?i)\bpytest\b`)
-	pytestResultRe = regexp.MustCompile(`(?i)(\d+)\s+passed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+skipped)?`)
+	pytestCmdRe = regexp.MustCompile(`(?i)\bpytest\b`)
+	// pytestResultRe matches both orderings of pytest's summary line:
+	//   "N passed, N failed in Zs"  (pass-first, no failures or minor failures)
+	//   "N failed, N passed in Zs"  (fail-first, when failures exist)
+	// Group 1: failed count (fail-first branch)
+	// Group 2: passed count (fail-first branch)
+	// Group 3: passed count (pass-first branch)
+	// Group 4: failed count (pass-first branch)
+	// Group 5: skipped count (either branch)
+	pytestResultRe = regexp.MustCompile(
+		`(?i)(?:(\d+)\s+failed,\s*(\d+)\s+passed|(\d+)\s+passed(?:,\s*(\d+)\s+failed)?)(?:,\s*(\d+)\s+skipped)?`)
 
 	jestCmdRe    = regexp.MustCompile(`(?i)\bjest\b`)
 	jestResultRe = regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
@@ -70,14 +79,26 @@ var detectors = []frameworkDetector{
 				}
 				run := newRun(sp, "pytest")
 				run.Summary = strings.TrimSpace(lines[i])
-				p := atoi(m[1])
-				run.Passed = &p
-				if m[2] != "" {
-					f := atoi(m[2])
+				// Groups 1,2: fail-first  "N failed, N passed"
+				// Groups 3,4: pass-first  "N passed[, N failed]"
+				// Group 5: skipped (either branch)
+				if m[1] != "" {
+					// fail-first branch
+					f := atoi(m[1])
+					p := atoi(m[2])
 					run.Failed = &f
+					run.Passed = &p
+				} else {
+					// pass-first branch
+					p := atoi(m[3])
+					run.Passed = &p
+					if m[4] != "" {
+						f := atoi(m[4])
+						run.Failed = &f
+					}
 				}
-				if m[3] != "" {
-					sk := atoi(m[3])
+				if m[5] != "" {
+					sk := atoi(m[5])
 					run.Skipped = &sk
 				}
 				return run
@@ -290,6 +311,12 @@ func safeOutputPath(dataDir, sessionID, spanID string) (string, error) {
 	return p, nil
 }
 
+// maxOutputLines is the maximum number of output lines retained by
+// readOutputLines. All framework detectors only inspect the last 30 lines;
+// keeping 200 provides a comfortable safety margin while bounding memory use
+// even for very large build logs.
+const maxOutputLines = 200
+
 func readOutputLines(logPath string) []string {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -299,10 +326,7 @@ func readOutputLines(logPath string) []string {
 
 	var lines []string
 	sc := bufio.NewScanner(f)
-	// Conservative buffer: 64 KB initial, 1 MB max per line.
-	// detect_test_runs only needs the last ~30 lines, so large output files
-	// are read sequentially but we never hold more than one line in memory
-	// at once beyond what the scanner buffers.
+	// 64 KB initial, 1 MB max per JSON line.
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
 		var c storage.Chunk
@@ -311,6 +335,12 @@ func readOutputLines(logPath string) []string {
 				lines = append(lines, l)
 			}
 		}
+	}
+	// Trim to the tail so that callers examining the last N lines of output
+	// see the summary section even for very long logs, and we don't hold
+	// the entire file in memory.
+	if len(lines) > maxOutputLines {
+		lines = lines[len(lines)-maxOutputLines:]
 	}
 	return lines
 }

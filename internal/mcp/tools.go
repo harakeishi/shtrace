@@ -73,8 +73,10 @@ func (s *Server) toolSearchCommands(ctx context.Context, raw json.RawMessage) (a
 
 	const maxSearchLimit = 200
 	limit := args.Limit
-	if limit <= 0 || limit > maxSearchLimit {
+	if limit <= 0 {
 		limit = 20
+	} else if limit > maxSearchLimit {
+		limit = maxSearchLimit
 	}
 
 	results, err := s.fts.Search(ctx, args.Query, limit)
@@ -215,6 +217,9 @@ func (s *Server) toolCompareRuns(ctx context.Context, raw json.RawMessage) (any,
 		})
 	}
 
+	if entries == nil {
+		entries = []compareEntry{}
+	}
 	return compareResult{
 		SessionA: args.SessionA,
 		SessionB: args.SessionB,
@@ -236,6 +241,13 @@ func (s *Server) detectForSession(ctx context.Context, sessionID string) ([]Test
 	return DetectTestRuns(spans, s.dataDir), nil
 }
 
+// indexRuns builds a map from normalised (framework, command) key to TestRun.
+//
+// Known limitation (MVP): when a session contains multiple invocations of the
+// same framework (e.g. two separate `go test` calls), only the last one is
+// retained per key. This is acceptable for the Phase 2 MVP where sessions
+// typically have one test invocation per framework; a future iteration can
+// extend the key or store a list.
 func indexRuns(runs []TestRun) map[testKey]TestRun {
 	m := make(map[testKey]TestRun, len(runs))
 	for _, r := range runs {
