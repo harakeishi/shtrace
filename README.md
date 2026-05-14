@@ -115,6 +115,51 @@ each span's stdout/stderr (colour-coded), exit code, mode, and duration.
 Browser find-in-page (Ctrl/Cmd+F) is sufficient for the Phase 3 scope; full
 text search and asciinema-style replay live in Phase 4.
 
+## Export and import
+
+Export a session as a self-contained `.tar.gz` artifact (for sharing via
+GitHub Actions or between machines):
+
+```sh
+shtrace export --latest --output session.tar.gz
+# Include an HTML report in the archive:
+shtrace export --latest --with-report --output session.tar.gz
+# Export a specific session:
+shtrace export --session <session-id> --output session.tar.gz
+```
+
+The archive contains `manifest.json`, `session.json`, span output logs, and
+optionally `report.html`.
+
+Import a previously exported archive into the local store:
+
+```sh
+shtrace import session.tar.gz
+# Overwrite if the session ID already exists:
+shtrace import session.tar.gz --overwrite
+# Generate a new ID on collision (original ID is preserved in metadata):
+shtrace import session.tar.gz --rename
+```
+
+## GitHub Actions integration
+
+Copy `.github/workflows/shtrace-sample.yml` from this repo into your own
+repository as a starting point. It records test runs with shtrace, uploads
+the session as a workflow artifact, and posts a PR comment with a test-result
+summary and artifact download instructions.
+
+### `shtrace pr-comment`
+
+Posts a comment to a GitHub PR summarising the recorded session. Designed to
+run inside GitHub Actions where `GITHUB_TOKEN` and `GITHUB_REPOSITORY` are
+set automatically:
+
+```sh
+shtrace pr-comment --latest --pr 42
+# or with an explicit session:
+shtrace pr-comment --session <id> --pr 42
+```
+
 ## Automatic session grouping (shell-init)
 
 By default each `shtrace` invocation starts a fresh session. To group every
@@ -281,4 +326,4 @@ host", with X to be pinned from production measurements.
 
 ## License
 
-MIT. See [LICENSE](./LICENSE).
+Apache-2.0. See [LICENSE](./LICENSE).
