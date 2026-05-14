@@ -383,6 +383,263 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+// TestCLI_Report_WritesHTMLFile is the end-to-end check: record a session,
+// call `shtrace report --latest --output report.html`, and verify the
+// resulting file is HTML with the recorded command's output.
+func TestCLI_Report_WritesHTMLFile(t *testing.T) {
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf report-marker; printf err-marker 1>&2; exit 0")
+	if exit != 0 {
+		t.Fatalf("setup run exit = %d", exit)
+	}
+
+	out := filepath.Join(dataDir, "report.html")
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest", "--output", out}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: stderr=%s", code, se.String())
+	}
+	if !strings.Contains(so.String(), "wrote report") {
+		t.Errorf("expected confirmation on stdout, got %q", so.String())
+	}
+
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	rendered := string(body)
+	for _, want := range []string{
+		"<!DOCTYPE html>",
+		"shtrace session",
+		"report-marker", // stdout chunk
+		"err-marker",    // stderr chunk
+		`class="exit ok"`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("report missing %q in:\n%s", want, rendered)
+		}
+	}
+}
+
+// TestCLI_Report_FailsWithoutSelector ensures we surface a usage error when
+// neither --session nor --latest is provided, instead of silently writing
+// nothing.
+func TestCLI_Report_FailsWithoutSelector(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "session") {
+		t.Errorf("expected usage hint on stderr, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_UnknownFlag rejects unknown flags rather than silently
+// ignoring them (catches typos like --latests).
+func TestCLI_Report_UnknownFlag(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report", "--bogus")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "bogus") {
+		t.Errorf("expected stderr to mention unknown flag, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_RejectsSessionLatestTogether catches a confusing UX bug:
+// passing both flags previously silently picked --latest and dropped the
+// explicit session id. Reject up front instead.
+func TestCLI_Report_RejectsSessionLatestTogether(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report", "--session", "anything", "--latest")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Errorf("expected mutually-exclusive error, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_RejectsFlagAsValue catches `shtrace report --session
+// --output foo` swallowing the next flag as the session id.
+func TestCLI_Report_RejectsFlagAsValue(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report", "--session", "--output", "x.html")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "--session") {
+		t.Errorf("expected stderr to mention --session, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_RejectsEmptySessionValue: `--session=` is an explicit empty
+// value (e.g. a truncated shell expansion); reject so the user doesn't
+// silently get a different session via --latest.
+func TestCLI_Report_RejectsEmptySessionValue(t *testing.T) {
+	_, stderr, exit, _ := runHarness(t, "shtrace", "report", "--session=", "--latest")
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2", exit)
+	}
+	if !strings.Contains(stderr, "non-empty") && !strings.Contains(stderr, "value") {
+		t.Errorf("expected stderr to mention empty value, got %q", stderr)
+	}
+}
+
+// TestCLI_Report_EqualsForm verifies that --output=PATH and --session=ID
+// work, since the explicit-equals branch in the parser had no test coverage.
+func TestCLI_Report_EqualsForm(t *testing.T) {
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf equals-marker")
+	if exit != 0 {
+		t.Fatalf("setup exit = %d", exit)
+	}
+	out := filepath.Join(dataDir, "eq.html")
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest", "--output=" + out}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: %s", code, se.String())
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if !strings.Contains(string(body), "equals-marker") {
+		t.Errorf("--output=PATH form did not produce expected content")
+	}
+}
+
+// TestCLI_Report_ReplacesExistingFile: an existing file at --output should
+// be replaced atomically. The os.Rename semantics make this trivial on
+// POSIX, but the test guards against a future regression to direct write.
+func TestCLI_Report_ReplacesExistingFile(t *testing.T) {
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf replace-marker")
+	if exit != 0 {
+		t.Fatalf("setup exit = %d", exit)
+	}
+	out := filepath.Join(dataDir, "report.html")
+	if err := os.WriteFile(out, []byte("OLD CONTENT"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest", "--output", out}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: %s", code, se.String())
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read replaced report: %v", err)
+	}
+	if strings.Contains(string(body), "OLD CONTENT") {
+		t.Errorf("--output should replace the pre-existing file, not concatenate")
+	}
+	if !strings.Contains(string(body), "replace-marker") {
+		t.Errorf("replaced file missing new content")
+	}
+}
+
+// TestCLI_Report_FailureLeavesExistingFileUntouched is the half-applied
+// state guard: if Render fails (here, by giving a session id that doesn't
+// exist), the pre-existing file at --output must NOT be clobbered, and no
+// stray temp files must remain in its directory.
+func TestCLI_Report_FailureLeavesExistingFileUntouched(t *testing.T) {
+	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "printf x")
+	if exit != 0 {
+		t.Fatalf("setup exit = %d", exit)
+	}
+	out := filepath.Join(dataDir, "report.html")
+	const sentinel = "OLD CONTENT MUST SURVIVE"
+	if err := os.WriteFile(out, []byte(sentinel), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var so, se bytes.Buffer
+	// Use a session id that doesn't exist so Render fails.
+	code := Run(context.Background(), []string{"shtrace", "report", "--session", "no-such-session", "--output", out}, &so, &se)
+	if code == 0 {
+		t.Fatalf("report should have failed with unknown session, got exit 0")
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read after failed report: %v", err)
+	}
+	if string(body) != sentinel {
+		t.Errorf("pre-existing file was clobbered by failed render — content = %q", body)
+	}
+	// Temp files should be cleaned up.
+	entries, err := os.ReadDir(filepath.Dir(out))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".shtrace-report-") {
+			t.Errorf("leftover temp file after failed render: %s", e.Name())
+		}
+	}
+}
+
+// TestParseReportArgs covers the flag parser in isolation so the validation
+// rules are exercised without the storage setup that runReport pulls in.
+func TestParseReportArgs(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantErr   string // substring; "" means success
+		wantSess  string
+		wantOut   string
+		wantLatst bool
+	}{
+		{name: "session only", args: []string{"--session", "abc"}, wantSess: "abc"},
+		{name: "session= form", args: []string{"--session=abc"}, wantSess: "abc"},
+		{name: "latest", args: []string{"--latest"}, wantLatst: true},
+		{name: "output -o", args: []string{"--latest", "-o", "r.html"}, wantOut: "r.html", wantLatst: true},
+		{name: "output= form", args: []string{"--latest", "--output=r.html"}, wantOut: "r.html", wantLatst: true},
+		{name: "missing selector", args: nil, wantErr: "either --session"},
+		{name: "session and latest", args: []string{"--session", "x", "--latest"}, wantErr: "mutually exclusive"},
+		{name: "session swallows flag", args: []string{"--session", "--output", "r.html"}, wantErr: "--session requires a value but got the next flag"},
+		{name: "session swallows single-dash flag", args: []string{"--session", "-o", "r.html"}, wantErr: "--session requires a value but got the next flag"},
+		{name: "output swallows single-dash flag", args: []string{"--output", "-o"}, wantErr: "requires a value but got the next flag"},
+		{name: "empty session=", args: []string{"--session=", "--latest"}, wantErr: "non-empty"},
+		{name: "session missing trailing value", args: []string{"--session"}, wantErr: "requires a value"},
+		{name: "unknown flag", args: []string{"--bogus"}, wantErr: "unknown report flag"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, o, l, err := parseReportArgs(c.args)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if s != c.wantSess || o != c.wantOut || l != c.wantLatst {
+					t.Fatalf("got (%q, %q, %v), want (%q, %q, %v)", s, o, l, c.wantSess, c.wantOut, c.wantLatst)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", c.wantErr)
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), c.wantErr)
+			}
+		})
+	}
+}
+
+// TestCLI_Report_StdoutWhenNoOutputFlag writes to stdout when --output is
+// omitted, so the command composes with shell redirection.
+func TestCLI_Report_StdoutWhenNoOutputFlag(t *testing.T) {
+	_, _, exit, _ := runHarness(t, "shtrace", "--", "sh", "-c", "printf stdout-only-test")
+	if exit != 0 {
+		t.Fatalf("setup run exit = %d", exit)
+	}
+	var so, se bytes.Buffer
+	code := Run(context.Background(), []string{"shtrace", "report", "--latest"}, &so, &se)
+	if code != 0 {
+		t.Fatalf("report exit = %d: %s", code, se.String())
+	}
+	if !strings.Contains(so.String(), "<!DOCTYPE html>") {
+		t.Errorf("expected HTML on stdout, got %q", so.String())
+	}
+	if !strings.Contains(so.String(), "stdout-only-test") {
+		t.Errorf("expected recorded data in stdout, got %q", so.String())
+	}
+}
+
 func walkLogFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -207,6 +208,70 @@ func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) (
 		out = append(out, sess)
 	}
 	return out, rows.Err()
+}
+
+// ErrSessionNotFound is returned by GetSession when no row matches the given
+// id. Callers can errors.Is against this to distinguish "absent" from
+// "corrupt" — which matters for `shtrace report --session <id>`, where the
+// two cases need different user-facing messages.
+var ErrSessionNotFound = errors.New("session not found")
+
+// ErrSessionCorrupt is returned by GetSession when the row exists but one
+// of its columns fails to parse. GetSession joins ErrSessionCorrupt with
+// the underlying parse error via errors.Join, so:
+//
+//   - errors.Is(err, ErrSessionCorrupt) is true.
+//   - errors.As against concrete parse error types (e.g. *time.ParseError,
+//     *json.SyntaxError) works through the join.
+//   - The underlying error's message appears in err.Error() for diagnostics.
+//
+// Note: errors.Unwrap returns nil on a joined error (the join exposes
+// Unwrap() []error, not Unwrap() error). Use errors.Is / errors.As, not
+// errors.Unwrap, to inspect causes.
+var ErrSessionCorrupt = errors.New("session row corrupt")
+
+// GetSession returns the single session row with the given id.
+//
+// The two failure modes are reported via the sentinel errors above so a
+// caller (e.g. `shtrace report --session X`) can render "not found" and
+// "corrupt row" distinctly instead of conflating them — important because
+// ListSessions silently skips corrupt rows, which would otherwise make a
+// targeted lookup of a corrupt session indistinguishable from a typo.
+func (s *Store) GetSession(ctx context.Context, id string) (Session, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, started_at, ended_at, tags_json
+		FROM sessions
+		WHERE id = ?`, id)
+
+	var (
+		sess      Session
+		startedAt string
+		endedAt   sql.NullString
+		tagsJSON  string
+	)
+	if err := row.Scan(&sess.ID, &startedAt, &endedAt, &tagsJSON); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Session{}, ErrSessionNotFound
+		}
+		return Session{}, err
+	}
+	t, err := time.Parse(time.RFC3339Nano, startedAt)
+	if err != nil {
+		return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse started_at %q: %w", startedAt, err))
+	}
+	sess.StartedAt = t
+	if endedAt.Valid {
+		t, err := time.Parse(time.RFC3339Nano, endedAt.String)
+		if err != nil {
+			return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse ended_at %q: %w", endedAt.String, err))
+		}
+		sess.EndedAt = &t
+	}
+	sess.Tags = map[string]string{}
+	if err := json.Unmarshal([]byte(tagsJSON), &sess.Tags); err != nil {
+		return Session{}, errors.Join(ErrSessionCorrupt, fmt.Errorf("parse tags_json: %w", err))
+	}
+	return sess, nil
 }
 
 // SpansForSession returns spans for sessionID, ordered by start time ascending

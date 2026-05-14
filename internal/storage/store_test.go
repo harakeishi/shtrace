@@ -2,7 +2,9 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -317,6 +319,170 @@ func TestStore_SpansForSession_SkipsCorruptRowAndReportsViaWarn(t *testing.T) {
 	}
 	if len(warned) == 0 {
 		t.Fatalf("warn callback not invoked")
+	}
+}
+
+func TestStore_GetSession_ReturnsNotFoundWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	_, err = s.GetSession(context.Background(), "does-not-exist")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("GetSession on absent id returned %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestStore_GetSession_ReturnsCorruptOnBadTimestamp(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	// Inject a corrupt row directly so we don't rely on InsertSession
+	// being permissive — that would couple this test to insert validation.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('corrupt', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject corrupt row: %v", err)
+	}
+
+	_, err = s.GetSession(context.Background(), "corrupt")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("GetSession on corrupt row returned %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+func TestStore_GetSession_ReturnsCorruptOnBadEndedAt(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	// Valid started_at, junk ended_at: covers the second of the three
+	// corrupt-column branches in GetSession.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, ended_at, tags_json) VALUES('e', '2026-05-13T10:00:00Z', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "e")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("err = %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+func TestStore_GetSession_ReturnsCorruptOnBadTagsJSON(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	// Valid timestamps, junk tags_json: covers the third corrupt branch
+	// and guards against a refactor accidentally dropping its sentinel.
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('t', '2026-05-13T10:00:00Z', '{not-json')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "t")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("err = %v, want wrapping ErrSessionCorrupt", err)
+	}
+}
+
+// TestStore_GetSession_CorruptExposesUnderlyingCause locks in the doc
+// contract that the underlying parse error is reachable through the
+// errors.Join wrap: errors.As against the concrete parse error type works,
+// and the offending input appears in err.Error() for human diagnostics.
+//
+// (errors.Unwrap returns nil on a joined error because the join exposes
+// Unwrap() []error, not Unwrap() error — see the doc on ErrSessionCorrupt.)
+func TestStore_GetSession_CorruptExposesUnderlyingCause(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO sessions(id, started_at, tags_json) VALUES('u', 'not-a-ts', '{}')`); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	_, err = s.GetSession(context.Background(), "u")
+	if !errors.Is(err, ErrSessionCorrupt) {
+		t.Fatalf("missing ErrSessionCorrupt sentinel: %v", err)
+	}
+	// errors.As must traverse the join and find the concrete time.ParseError
+	// that started_at parsing produced — this is the strong "cause reachable"
+	// assertion, distinct from substring-matching the message.
+	var parseErr *time.ParseError
+	if !errors.As(err, &parseErr) {
+		t.Errorf("expected errors.As to expose *time.ParseError through the join, got %T (%v)", err, err)
+	}
+	// And the offending input should surface in err.Error() for humans.
+	if msg := err.Error(); !strings.Contains(msg, "not-a-ts") {
+		t.Errorf("error message should reference the offending value, got %q", msg)
+	}
+}
+
+func TestStore_GetSession_RoundTripsHealthyRow(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	started := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	ended := started.Add(7 * time.Second)
+	want := Session{
+		ID:        "sess-rt",
+		StartedAt: started,
+		EndedAt:   &ended,
+		Tags:      map[string]string{"k": "v"},
+	}
+	if err := s.InsertSession(context.Background(), want); err != nil {
+		t.Fatalf("InsertSession: %v", err)
+	}
+
+	got, err := s.GetSession(context.Background(), "sess-rt")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.ID != want.ID {
+		t.Errorf("ID = %q, want %q", got.ID, want.ID)
+	}
+	if !got.StartedAt.Equal(want.StartedAt) {
+		t.Errorf("StartedAt = %v, want %v", got.StartedAt, want.StartedAt)
+	}
+	if got.EndedAt == nil || !got.EndedAt.Equal(ended) {
+		t.Errorf("EndedAt = %v, want %v", got.EndedAt, ended)
+	}
+	if got.Tags["k"] != "v" {
+		t.Errorf("Tags = %v, want k=v", got.Tags)
 	}
 }
 
