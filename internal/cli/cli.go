@@ -919,13 +919,27 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 
 	sessionStartedAt := time.Now().UTC()
-	if err := store.InsertSession(ctx, storage.Session{
-		ID:        sessCtx.SessionID,
-		StartedAt: sessionStartedAt,
-		Tags:      sessCtx.Tags,
-	}); err != nil {
-		_, _ = fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
-		return 1
+	// Mirror runWrapped's IsRoot guard: only insert when starting a new root
+	// session. If SHTRACE_SESSION_ID is already set, use EnsureSession so we
+	// don't overwrite an existing session row.
+	if sessCtx.IsRoot {
+		if err := store.InsertSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
+			return 1
+		}
+	} else {
+		if err := store.EnsureSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: ensure session: %v\n", err)
+			return 1
+		}
 	}
 
 	idGen := session.DefaultIDGenerator()
@@ -937,12 +951,23 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 
+	// Open FTS once for the whole session to avoid per-span open/migrate/close.
+	var fts *storage.FTSStore
+	if ftsStore, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr == nil {
+		if migrErr := ftsStore.MigrateFTS(ctx); migrErr == nil {
+			fts = ftsStore
+			defer func() { _ = fts.Close() }()
+		} else {
+			_ = ftsStore.Close()
+		}
+	}
+
 	// Per-span state; mutated by the Begin/End callbacks below.
 	var (
-		curSpanID      string
-		curLogPath     string
-		curLogFile     *os.File
-		curStartedAt   time.Time
+		curSpanID    string
+		curLogPath   string
+		curLogFile   *os.File
+		curStartedAt time.Time
 	)
 
 	spanBegin := func() (runner.ChunkWriter, error) {
@@ -979,36 +1004,38 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if curSpanID == "" {
 			return nil
 		}
+		// Clear span state before the DB write so a failure leaves a clean
+		// slate (prevents stale curSpanID/curStartedAt from persisting).
+		spanID := curSpanID
+		logPath := curLogPath
+		startedAt := curStartedAt
+		curSpanID = ""
+		curLogPath = ""
+		curStartedAt = time.Time{}
+
 		endedAt := time.Now().UTC()
 		code := exitCode
 		if code < 0 {
 			code = -1
 		}
 		if err := store.InsertSpan(ctx, storage.Span{
-			ID:        curSpanID,
+			ID:        spanID,
 			SessionID: sessCtx.SessionID,
 			Command:   shell,
 			Argv:      []string{shell},
 			Cwd:       "",
 			Mode:      "pty",
-			StartedAt: curStartedAt,
+			StartedAt: startedAt,
 			EndedAt:   endedAt,
 			ExitCode:  &code,
 		}); err != nil {
 			return fmt.Errorf("insert span: %w", err)
 		}
 
-		// Best-effort FTS indexing.
-		if fts, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr == nil {
-			defer func() { _ = fts.Close() }()
-			if migrErr := fts.MigrateFTS(ctx); migrErr == nil {
-				_ = fts.IndexSpan(ctx, curSpanID, sessCtx.SessionID, curLogPath)
-			}
+		// Best-effort FTS indexing using the session-scoped FTS handle.
+		if fts != nil {
+			_ = fts.IndexSpan(ctx, spanID, sessCtx.SessionID, logPath)
 		}
-
-		spanID := curSpanID
-		curSpanID = ""
-		_ = spanID
 		return nil
 	}
 
@@ -1017,7 +1044,10 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		tty = f
 	}
 
-	cwd, _ := os.Getwd()
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+	}
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
 
 	_, _ = fmt.Fprintf(stderr, "shtrace: recording session %s (type 'exit' to stop)\r\n", sessCtx.SessionID)
@@ -1035,10 +1065,15 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		},
 	})
 
-	// Close any span still open (e.g. shell killed mid-command).
+	// Close any span still open (e.g. shell killed mid-command) and insert
+	// the partial span into the DB so it is visible to shtrace show/ls.
 	if curLogFile != nil {
+		_ = curLogFile.Sync()
 		_ = curLogFile.Close()
 		curLogFile = nil
+	}
+	if curSpanID != "" {
+		_ = spanEnd(-1)
 	}
 
 	// Stamp session end time.

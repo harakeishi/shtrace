@@ -109,6 +109,8 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 	}
 
 	// Forward user's stdin to the shell (required for interactive use).
+	// This goroutine exits naturally once ptmx is closed (the next write
+	// attempt fails), which happens via the deferred ptmx.Close above.
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
 
 	// Read PTY output: forward to terminal and record spans.
@@ -128,12 +130,64 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 
 // shellOutputLoop reads from the PTY master, forwards all bytes to the user
 // terminal, and drives span recording by reacting to OSC 133 markers.
+// Events from the parser are processed in stream order so that command output
+// appearing between a B and D marker is correctly attributed to its span.
 func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 	var (
 		parser  oscParser
 		writer  ChunkWriter
 		spanEnd func(int) error
+		pending []byte // masking safety-tail buffer for the current span
 	)
+
+	// flushPending emits all buffered bytes through the masker to writer,
+	// then resets the buffer.
+	flushPending := func() {
+		if writer == nil || len(pending) == 0 {
+			pending = pending[:0]
+			return
+		}
+		masked, _ := opt.Masker.MaskString(string(pending))
+		_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
+		pending = pending[:0]
+	}
+
+	// endSpan flushes any remaining buffered output, calls spanEnd(code),
+	// and resets writer/spanEnd/pending. The implicit flag indicates the span
+	// ended without a D marker (abnormal path).
+	endSpan := func(code int, implicit bool) {
+		flushPending()
+		if spanEnd != nil {
+			label := "shtrace: span end"
+			if implicit {
+				label = "shtrace: span end (implicit)"
+			}
+			if eerr := spanEnd(code); eerr != nil && opt.Stderr != nil {
+				_, _ = fmt.Fprintf(opt.Stderr, "%s: %v\n", label, eerr)
+			}
+		}
+		writer = nil
+		spanEnd = nil
+	}
+
+	// writeCleaned applies the safety-tail masking pattern (same as
+	// forwardStream in pipe.go) so secrets straddling read boundaries are caught.
+	writeCleaned := func(b []byte) {
+		if writer == nil || len(b) == 0 {
+			return
+		}
+		pending = append(pending, b...)
+		if len(pending) > safetyTail {
+			masked, _ := opt.Masker.MaskString(string(pending))
+			if len(masked) > safetyTail {
+				cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
+				_ = writer.WriteChunk(storage.StreamPTY, []byte(masked[:cutoff]))
+				pending = []byte(masked[cutoff:])
+			} else {
+				pending = []byte(masked)
+			}
+		}
+	}
 
 	buf := make([]byte, 32*1024)
 	for {
@@ -147,50 +201,38 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 				_, _ = opt.Tty.Write(raw)
 			}
 
-			// Strip OSC sequences from the recorded stream and collect events.
-			cleaned, seqs := parser.Feed(raw)
-
-			for _, seq := range seqs {
-				kind, code, ok := parseOSC133(seq)
-				if !ok {
+			// Process parser events in stream order so bytes and OSC markers
+			// are handled relative to each other (not bytes-then-markers).
+			for _, ev := range parser.Feed(raw) {
+				if ev.Seq != "" {
+					kind, code, ok := parseOSC133(ev.Seq)
+					if !ok {
+						continue
+					}
+					switch kind {
+					case "B": // command output begins
+						if spanEnd != nil {
+							endSpan(-1, true)
+						}
+						if opt.Span.Begin != nil {
+							w, berr := opt.Span.Begin()
+							if berr != nil {
+								if opt.Stderr != nil {
+									_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
+								}
+							} else {
+								writer = w
+								spanEnd = opt.Span.End
+							}
+						}
+					case "D": // command done
+						if spanEnd != nil {
+							endSpan(code, false)
+						}
+					}
 					continue
 				}
-				switch kind {
-				case "B": // command output begins
-					if spanEnd != nil {
-						// Previous span did not receive a D marker; close it.
-						if eerr := spanEnd(-1); eerr != nil && opt.Stderr != nil {
-							_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span end (implicit): %v\n", eerr)
-						}
-						writer = nil
-						spanEnd = nil
-					}
-					if opt.Span.Begin != nil {
-						w, berr := opt.Span.Begin()
-						if berr != nil {
-							if opt.Stderr != nil {
-								_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
-							}
-						} else {
-							writer = w
-							spanEnd = opt.Span.End
-						}
-					}
-				case "D": // command done
-					if spanEnd != nil {
-						if eerr := spanEnd(code); eerr != nil && opt.Stderr != nil {
-							_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span end: %v\n", eerr)
-						}
-						writer = nil
-						spanEnd = nil
-					}
-				}
-			}
-
-			// Record cleaned output into the current active span.
-			if writer != nil && len(cleaned) > 0 {
-				masked, _ := opt.Masker.MaskString(string(cleaned))
-				_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
+				writeCleaned(ev.Bytes)
 			}
 		}
 		if err != nil {
@@ -258,26 +300,42 @@ fi
 `
 
 // zshRC is written to ZDOTDIR/.zshrc so zsh sources it on startup.
+// add-zsh-hook is used so user-defined preexec/precmd hooks are preserved.
 const zshRC = `# shtrace: source user rc (skip if ZDOTDIR was already our dir)
 [ -f "$HOME/.zshrc" ] && [ "$HOME/.zshrc" != "$ZDOTDIR/.zshrc" ] && . "$HOME/.zshrc"
 
 # shtrace span boundary detection via OSC 133 markers.
-preexec() {
-    printf '\033]133;B\007'
-}
-precmd() {
-    printf '\033]133;D;%d\007' "$?"
-}
+# add-zsh-hook is used instead of direct assignment so existing
+# preexec/precmd hooks (e.g. from powerlevel10k, zsh-syntax-highlighting)
+# are not overwritten.
+autoload -Uz add-zsh-hook
+__shtrace_preexec() { printf '\033]133;B\007' }
+__shtrace_precmd()  { printf '\033]133;D;%d\007' "$?" }
+add-zsh-hook preexec __shtrace_preexec
+add-zsh-hook precmd  __shtrace_precmd
 `
 
-// oscParser strips OSC escape sequences from a PTY byte stream. It returns the
-// cleaned bytes (with OSC sequences removed) plus the payload strings of any
-// complete OSC sequences encountered (without their ESC] / BEL / ST framing).
+// maxOSCBuf is the upper bound on the number of bytes accumulated in oscBuf.
+// If an unterminated OSC sequence exceeds this limit the sequence is discarded
+// to prevent unbounded memory growth.
+const maxOSCBuf = 64 * 1024
+
+// parserEvent is one item yielded by oscParser.Feed in stream order.
+// Exactly one of Bytes or Seq is non-empty.
+type parserEvent struct {
+	Bytes []byte // cleaned (non-OSC) bytes at this position in the stream
+	Seq   string // complete OSC sequence payload (without ESC]/BEL/ST framing)
+}
+
+// oscParser strips OSC escape sequences from a PTY byte stream and emits
+// cleaned bytes and OSC payloads in stream order, so the caller can process
+// them relative to each other.
 //
 // OSC syntax: ESC ] <payload> BEL  or  ESC ] <payload> ESC \
 type oscParser struct {
-	state  int
-	oscBuf []byte
+	state       int
+	oscBuf      []byte
+	oscOverflow bool // true when the current OSC payload exceeded maxOSCBuf
 }
 
 const (
@@ -287,9 +345,31 @@ const (
 	oscStateInST   = 3 // saw \033 while in OSC (may be start of ST = \033\)
 )
 
-// Feed processes a chunk of raw PTY bytes. Multiple calls accumulate state, so
-// partial sequences that straddle calls are handled correctly.
-func (p *oscParser) Feed(input []byte) (cleaned []byte, seqs []string) {
+// Feed processes a chunk of raw PTY bytes. Multiple calls accumulate parser
+// state, so partial sequences that straddle calls are handled correctly.
+// Events are emitted in the order the corresponding bytes appeared in the input.
+func (p *oscParser) Feed(input []byte) []parserEvent {
+	var events []parserEvent
+	var cur []byte // accumulates cleaned bytes between OSC sequences
+
+	flushCur := func() {
+		if len(cur) > 0 {
+			b := make([]byte, len(cur))
+			copy(b, cur)
+			events = append(events, parserEvent{Bytes: b})
+			cur = cur[:0]
+		}
+	}
+
+	emitSeq := func() {
+		if !p.oscOverflow {
+			flushCur()
+			events = append(events, parserEvent{Seq: string(p.oscBuf)})
+		}
+		p.oscBuf = p.oscBuf[:0]
+		p.oscOverflow = false
+	}
+
 	for i := 0; i < len(input); i++ {
 		b := input[i]
 		switch p.state {
@@ -297,41 +377,51 @@ func (p *oscParser) Feed(input []byte) (cleaned []byte, seqs []string) {
 			if b == '\033' {
 				p.state = oscStateESC
 			} else {
-				cleaned = append(cleaned, b)
+				cur = append(cur, b)
 			}
 		case oscStateESC:
 			if b == ']' {
 				p.state = oscStateInOSC
 				p.oscBuf = p.oscBuf[:0]
+				p.oscOverflow = false
 			} else {
 				// Not an OSC introducer — emit the ESC plus this byte verbatim.
-				cleaned = append(cleaned, '\033', b)
+				cur = append(cur, '\033', b)
 				p.state = oscStateNormal
 			}
 		case oscStateInOSC:
 			switch b {
 			case '\007': // BEL terminates the OSC
-				seqs = append(seqs, string(p.oscBuf))
-				p.oscBuf = p.oscBuf[:0]
+				emitSeq()
 				p.state = oscStateNormal
 			case '\033': // might be start of ST (ESC \)
 				p.state = oscStateInST
 			default:
-				p.oscBuf = append(p.oscBuf, b)
+				if len(p.oscBuf) < maxOSCBuf {
+					p.oscBuf = append(p.oscBuf, b)
+				} else {
+					p.oscOverflow = true
+				}
 			}
 		case oscStateInST:
 			if b == '\\' {
 				// ESC \ = String Terminator, completes the OSC sequence.
-				seqs = append(seqs, string(p.oscBuf))
-				p.oscBuf = p.oscBuf[:0]
+				emitSeq()
+				p.state = oscStateNormal
 			} else {
 				// Not ST — treat the ESC as a literal inside the OSC payload.
-				p.oscBuf = append(p.oscBuf, '\033', b)
+				if len(p.oscBuf) < maxOSCBuf {
+					p.oscBuf = append(p.oscBuf, '\033', b)
+				} else {
+					p.oscOverflow = true
+				}
+				// Remain inside the OSC sequence; do not return to Normal.
+				p.state = oscStateInOSC
 			}
-			p.state = oscStateNormal
 		}
 	}
-	return
+	flushCur()
+	return events
 }
 
 // parseOSC133 parses an OSC payload and returns the marker kind (A/B/C/D),
