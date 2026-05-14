@@ -122,6 +122,21 @@ func TestServe_MethodNotFound(t *testing.T) {
 	}
 }
 
+func TestServe_InvalidVersionNotificationNoResponse(t *testing.T) {
+	srv := newTestServer()
+	// A Notification (no "id") with an invalid jsonrpc version must also not
+	// receive a response per JSON-RPC 2.0 §4.
+	input := `{"jsonrpc":"1.0","method":"tools/list"}` + "\n"
+
+	var buf bytes.Buffer
+	if err := srv.Serve(context.Background(), strings.NewReader(input), &buf); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for invalid-version notification, got: %q", buf.String())
+	}
+}
+
 func TestServe_NotificationNoResponse(t *testing.T) {
 	srv := newTestServer()
 	// notifications/initialized is a JSON-RPC 2.0 Notification: the server

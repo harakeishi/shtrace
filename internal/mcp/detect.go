@@ -48,8 +48,13 @@ var (
 	//   m[1]=failed  m[2]=skipped  m[3]=passed  m[4]=total
 	jestResultRe = regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(?:\d+\s+todo,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
 
-	vitestCmdRe    = regexp.MustCompile(`(?i)\bvitest\b`)
-	vitestResultRe = regexp.MustCompile(`(?i)Tests\s+(\d+)\s+passed(?:\s+\|\s+(\d+)\s+failed)?(?:\s+\((\d+)\))?`)
+	vitestCmdRe = regexp.MustCompile(`(?i)\bvitest\b`)
+	// vitest changed its output format between versions:
+	//   v0.x (pass-first): "Tests  4 passed | 1 failed (5)"
+	//   v1.x (fail-first): "Tests  1 failed | 4 passed (5)"
+	// Two separate patterns are used; fail-first is tried first.
+	vitestFailFirstRe = regexp.MustCompile(`(?i)Tests\s+(\d+)\s+failed\s*\|\s*(\d+)\s+passed(?:\s+\((\d+)\))?`)
+	vitestPassFirstRe = regexp.MustCompile(`(?i)Tests\s+(\d+)\s+passed(?:\s*\|\s*(\d+)\s+failed)?(?:\s+\((\d+)\))?`)
 
 	phpunitCmdRe     = regexp.MustCompile(`(?i)\bphpunit\b`)
 	phpunitOKRe      = regexp.MustCompile(`(?i)OK\s+\((\d+)\s+tests?`)
@@ -145,23 +150,37 @@ var detectors = []frameworkDetector{
 		cmdRe: vitestCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				m := vitestResultRe.FindStringSubmatch(lines[i])
-				if m == nil {
-					continue
-				}
-				run := newRun(sp, "vitest")
-				run.Summary = strings.TrimSpace(lines[i])
-				p := atoi(m[1])
-				run.Passed = &p
-				if m[2] != "" {
-					f := atoi(m[2])
+				// Try fail-first (vitest v1+) before pass-first (v0.x).
+				if m := vitestFailFirstRe.FindStringSubmatch(lines[i]); m != nil {
+					// m[1]=failed  m[2]=passed  m[3]=total
+					run := newRun(sp, "vitest")
+					run.Summary = strings.TrimSpace(lines[i])
+					f := atoi(m[1])
+					p := atoi(m[2])
 					run.Failed = &f
+					run.Passed = &p
+					if m[3] != "" {
+						t := atoi(m[3])
+						run.Total = &t
+					}
+					return run
 				}
-				if m[3] != "" {
-					t := atoi(m[3])
-					run.Total = &t
+				if m := vitestPassFirstRe.FindStringSubmatch(lines[i]); m != nil {
+					// m[1]=passed  m[2]=failed (opt)  m[3]=total (opt)
+					run := newRun(sp, "vitest")
+					run.Summary = strings.TrimSpace(lines[i])
+					p := atoi(m[1])
+					run.Passed = &p
+					if m[2] != "" {
+						f := atoi(m[2])
+						run.Failed = &f
+					}
+					if m[3] != "" {
+						t := atoi(m[3])
+						run.Total = &t
+					}
+					return run
 				}
-				return run
 			}
 			return newRun(sp, "vitest")
 		},

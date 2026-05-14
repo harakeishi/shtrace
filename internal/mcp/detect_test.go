@@ -197,7 +197,8 @@ func TestDetectTestRuns_JestWithTodo(t *testing.T) {
 	}
 }
 
-func TestDetectTestRuns_Vitest(t *testing.T) {
+func TestDetectTestRuns_VitestPassFirst(t *testing.T) {
+	// vitest v0.x format: "Tests  N passed | N failed (N)"
 	det := findDetector(t, "vitest")
 
 	sp := storage.Span{
@@ -214,6 +215,32 @@ func TestDetectTestRuns_Vitest(t *testing.T) {
 	if run.Framework != "vitest" {
 		t.Errorf("framework: got %q", run.Framework)
 	}
+	if run.Passed == nil || *run.Passed != 4 {
+		t.Errorf("passed: got %v, want 4", run.Passed)
+	}
+	if run.Failed == nil || *run.Failed != 1 {
+		t.Errorf("failed: got %v, want 1", run.Failed)
+	}
+	if run.Total == nil || *run.Total != 5 {
+		t.Errorf("total: got %v, want 5", run.Total)
+	}
+}
+
+func TestDetectTestRuns_VitestFailFirst(t *testing.T) {
+	// vitest v1+ format: "Tests  N failed | N passed (N)"
+	det := findDetector(t, "vitest")
+
+	sp := storage.Span{
+		ID:        "span-vitest-v1",
+		SessionID: "sess1",
+		Command:   "vitest",
+		Argv:      []string{"vitest", "run"},
+	}
+	lines := []string{
+		"Tests  1 failed | 4 passed (5)",
+	}
+	run := det.extract(lines, sp)
+
 	if run.Passed == nil || *run.Passed != 4 {
 		t.Errorf("passed: got %v, want 4", run.Passed)
 	}

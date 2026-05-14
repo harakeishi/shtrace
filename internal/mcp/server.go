@@ -83,6 +83,11 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 			continue
 		}
 		if req.JSONRPC != "2.0" {
+			// JSON-RPC 2.0 §4: Notifications (no "id") must never receive a
+			// response, even when the jsonrpc version is invalid.
+			if len(req.ID) == 0 {
+				continue
+			}
 			if encErr := enc.Encode(rpcResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
