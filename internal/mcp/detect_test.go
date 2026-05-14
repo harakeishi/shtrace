@@ -8,8 +8,22 @@ import (
 
 func ptr(n int) *int { return &n }
 
+// findDetector returns the detector with the given framework name.
+// Fails the test immediately if not found, so callers don't need to guard
+// against a nil/zero value — the test index never silently shifts.
+func findDetector(t *testing.T, name string) frameworkDetector {
+	t.Helper()
+	for _, d := range detectors {
+		if d.name == name {
+			return d
+		}
+	}
+	t.Fatalf("detector %q not found in detectors slice", name)
+	return frameworkDetector{}
+}
+
 func TestDetectTestRuns_GoTest(t *testing.T) {
-	det := detectors[4] // go test detector
+	det := findDetector(t, "go test")
 
 	sp := storage.Span{
 		ID:        "span1",
@@ -40,7 +54,7 @@ func TestDetectTestRuns_GoTest(t *testing.T) {
 }
 
 func TestDetectTestRuns_GoTestNoTestArg(t *testing.T) {
-	det := detectors[4] // go test detector
+	det := findDetector(t, "go test")
 
 	sp := storage.Span{
 		ID:        "span1",
@@ -56,7 +70,7 @@ func TestDetectTestRuns_GoTestNoTestArg(t *testing.T) {
 }
 
 func TestDetectTestRuns_Pytest(t *testing.T) {
-	det := detectors[0] // pytest detector
+	det := findDetector(t, "pytest")
 
 	sp := storage.Span{
 		ID:        "span2",
@@ -84,11 +98,33 @@ func TestDetectTestRuns_Pytest(t *testing.T) {
 	}
 }
 
-func TestDetectTestRuns_Rspec(t *testing.T) {
-	det := detectors[5] // rspec detector
+func TestDetectTestRuns_PytestWithSkipped(t *testing.T) {
+	det := findDetector(t, "pytest")
 
 	sp := storage.Span{
 		ID:        "span3",
+		SessionID: "sess1",
+		Command:   "pytest",
+		Argv:      []string{"pytest", "tests/"},
+	}
+	lines := []string{
+		"5 passed, 2 skipped in 0.10s",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Passed == nil || *run.Passed != 5 {
+		t.Errorf("passed: got %v, want 5", run.Passed)
+	}
+	if run.Skipped == nil || *run.Skipped != 2 {
+		t.Errorf("skipped: got %v, want 2", run.Skipped)
+	}
+}
+
+func TestDetectTestRuns_Rspec(t *testing.T) {
+	det := findDetector(t, "rspec")
+
+	sp := storage.Span{
+		ID:        "span4",
 		SessionID: "sess1",
 		Command:   "rspec",
 		Argv:      []string{"rspec", "spec/"},
@@ -143,5 +179,41 @@ func TestChangeLabel(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("changeLabel(%q,%q) = %q, want %q", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+func TestNormaliseCommand(t *testing.T) {
+	cases := []struct {
+		framework, cmd, want string
+	}{
+		{"go test", "go test ./...", "go test"},
+		{"go test", "go test ./pkg/a", "go test"},
+		{"pytest", "pytest tests/", "pytest"},
+		{"rspec", "rspec spec/", "rspec"},
+		{"go test", "go", "go"},        // single token fallback
+		{"pytest", "", ""},             // empty command
+	}
+	for _, tc := range cases {
+		got := normaliseCommand(tc.framework, tc.cmd)
+		if got != tc.want {
+			t.Errorf("normaliseCommand(%q,%q) = %q, want %q", tc.framework, tc.cmd, got, tc.want)
+		}
+	}
+}
+
+func TestSafeOutputPath_TraversalRejected(t *testing.T) {
+	_, err := safeOutputPath("/data", "../../etc", "id")
+	if err == nil {
+		t.Error("expected error for path traversal, got nil")
+	}
+}
+
+func TestSafeOutputPath_ValidPath(t *testing.T) {
+	p, err := safeOutputPath("/data", "sess123", "span456")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if p == "" {
+		t.Error("expected non-empty path")
 	}
 }

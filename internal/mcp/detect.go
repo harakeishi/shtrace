@@ -3,7 +3,9 @@ package mcp
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -24,7 +26,31 @@ type TestRun struct {
 	Summary   string `json:"summary,omitempty"`
 }
 
-// framework detector bundles a recogniser for the command name and a function
+// Pre-compiled regexes for each framework's output-summary line.
+// Compiled once at package init to avoid repeated compilation per span.
+var (
+	pytestCmdRe    = regexp.MustCompile(`(?i)\bpytest\b`)
+	pytestResultRe = regexp.MustCompile(`(?i)(\d+)\s+passed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+skipped)?`)
+
+	jestCmdRe    = regexp.MustCompile(`(?i)\bjest\b`)
+	jestResultRe = regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
+
+	vitestCmdRe    = regexp.MustCompile(`(?i)\bvitest\b`)
+	vitestResultRe = regexp.MustCompile(`(?i)Tests\s+(\d+)\s+passed(?:\s+\|\s+(\d+)\s+failed)?(?:\s+\((\d+)\))?`)
+
+	phpunitCmdRe     = regexp.MustCompile(`(?i)\bphpunit\b`)
+	phpunitOKRe      = regexp.MustCompile(`(?i)OK\s+\((\d+)\s+tests?`)
+	phpunitFailRe    = regexp.MustCompile(`(?i)Tests:\s*(\d+).*?Failures:\s*(\d+)`)
+
+	goTestCmdRe  = regexp.MustCompile(`(?i)\bgo\b`)
+	goTestOKRe   = regexp.MustCompile(`^ok\s+`)
+	goTestFailRe = regexp.MustCompile(`^FAIL\s+`)
+
+	rspecCmdRe    = regexp.MustCompile(`(?i)\brspec\b`)
+	rspecResultRe = regexp.MustCompile(`(?i)(\d+)\s+examples?,\s*(\d+)\s+failures?`)
+)
+
+// frameworkDetector bundles a recogniser for the command name and a function
 // that extracts a TestRun from the last lines of recorded output.
 type frameworkDetector struct {
 	name    string
@@ -35,12 +61,10 @@ type frameworkDetector struct {
 var detectors = []frameworkDetector{
 	{
 		name:  "pytest",
-		cmdRe: regexp.MustCompile(`(?i)\bpytest\b`),
+		cmdRe: pytestCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// e.g. "5 passed, 1 failed, 2 warnings in 0.12s"
-			re := regexp.MustCompile(`(?i)(\d+)\s+passed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+(?:skipped|warning))?`)
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				m := re.FindStringSubmatch(lines[i])
+				m := pytestResultRe.FindStringSubmatch(lines[i])
 				if m == nil {
 					continue
 				}
@@ -52,6 +76,10 @@ var detectors = []frameworkDetector{
 					f := atoi(m[2])
 					run.Failed = &f
 				}
+				if m[3] != "" {
+					sk := atoi(m[3])
+					run.Skipped = &sk
+				}
 				return run
 			}
 			return newRun(sp, "pytest")
@@ -59,12 +87,10 @@ var detectors = []frameworkDetector{
 	},
 	{
 		name:  "jest",
-		cmdRe: regexp.MustCompile(`(?i)\bjest\b`),
+		cmdRe: jestCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// e.g. "Tests:       2 passed, 3 total"
-			re := regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				m := re.FindStringSubmatch(lines[i])
+				m := jestResultRe.FindStringSubmatch(lines[i])
 				if m == nil {
 					continue
 				}
@@ -91,12 +117,10 @@ var detectors = []frameworkDetector{
 	},
 	{
 		name:  "vitest",
-		cmdRe: regexp.MustCompile(`(?i)\bvitest\b`),
+		cmdRe: vitestCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// e.g. "Tests  2 passed | 1 failed (3)"
-			re := regexp.MustCompile(`(?i)Tests\s+(\d+)\s+passed(?:\s+\|\s+(\d+)\s+failed)?(?:\s+\((\d+)\))?`)
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				m := re.FindStringSubmatch(lines[i])
+				m := vitestResultRe.FindStringSubmatch(lines[i])
 				if m == nil {
 					continue
 				}
@@ -119,13 +143,10 @@ var detectors = []frameworkDetector{
 	},
 	{
 		name:  "phpunit",
-		cmdRe: regexp.MustCompile(`(?i)\bphpunit\b`),
+		cmdRe: phpunitCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// e.g. "OK (5 tests, 12 assertions)" or "Tests: 3, Assertions: 6, Failures: 1."
-			reOK := regexp.MustCompile(`(?i)OK\s+\((\d+)\s+tests?`)
-			reFail := regexp.MustCompile(`(?i)Tests:\s*(\d+).*?Failures:\s*(\d+)`)
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				if m := reOK.FindStringSubmatch(lines[i]); m != nil {
+				if m := phpunitOKRe.FindStringSubmatch(lines[i]); m != nil {
 					run := newRun(sp, "phpunit")
 					run.Summary = strings.TrimSpace(lines[i])
 					t := atoi(m[1])
@@ -133,7 +154,7 @@ var detectors = []frameworkDetector{
 					run.Passed = &t
 					return run
 				}
-				if m := reFail.FindStringSubmatch(lines[i]); m != nil {
+				if m := phpunitFailRe.FindStringSubmatch(lines[i]); m != nil {
 					run := newRun(sp, "phpunit")
 					run.Summary = strings.TrimSpace(lines[i])
 					t := atoi(m[1])
@@ -150,9 +171,8 @@ var detectors = []frameworkDetector{
 	},
 	{
 		name:  "go test",
-		cmdRe: regexp.MustCompile(`(?i)\bgo\b`),
+		cmdRe: goTestCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// Only match if argv contains "test"
 			hasTestArg := false
 			for _, a := range sp.Argv {
 				if a == "test" {
@@ -161,20 +181,17 @@ var detectors = []frameworkDetector{
 				}
 			}
 			if !hasTestArg {
-				return TestRun{} // signal no match
+				return TestRun{} // signal no match via empty SpanID
 			}
-			// Count "--- PASS" and "--- FAIL" lines
 			passed, failed := 0, 0
 			var summary string
-			reOK := regexp.MustCompile(`^ok\s+`)
-			reFail := regexp.MustCompile(`^FAIL\s+`)
 			for _, l := range lines {
 				switch {
 				case strings.HasPrefix(l, "--- PASS"):
 					passed++
 				case strings.HasPrefix(l, "--- FAIL"):
 					failed++
-				case reOK.MatchString(l) || reFail.MatchString(l):
+				case goTestOKRe.MatchString(l) || goTestFailRe.MatchString(l):
 					summary = strings.TrimSpace(l)
 				}
 			}
@@ -189,12 +206,10 @@ var detectors = []frameworkDetector{
 	},
 	{
 		name:  "rspec",
-		cmdRe: regexp.MustCompile(`(?i)\brspec\b`),
+		cmdRe: rspecCmdRe,
 		extract: func(lines []string, sp storage.Span) TestRun {
-			// e.g. "5 examples, 1 failure"
-			re := regexp.MustCompile(`(?i)(\d+)\s+examples?,\s*(\d+)\s+failures?`)
 			for i := len(lines) - 1; i >= 0 && i >= len(lines)-30; i-- {
-				m := re.FindStringSubmatch(lines[i])
+				m := rspecResultRe.FindStringSubmatch(lines[i])
 				if m == nil {
 					continue
 				}
@@ -246,15 +261,33 @@ func detectSpan(sp storage.Span, dataDir string) *TestRun {
 		if !det.cmdRe.MatchString(cmd) {
 			continue
 		}
-		lines := readOutputLines(storage.OutputPath(dataDir, sp.SessionID, sp.ID))
+		logPath, err := safeOutputPath(dataDir, sp.SessionID, sp.ID)
+		if err != nil {
+			continue
+		}
+		lines := readOutputLines(logPath)
 		run := det.extract(lines, sp)
 		if run.SpanID == "" {
-			// go test detector signals no match with empty SpanID
+			// go test detector signals no match via empty SpanID
 			continue
 		}
 		return &run
 	}
 	return nil
+}
+
+// safeOutputPath returns the log file path and verifies it stays within
+// dataDir to guard against path traversal via malicious DB values.
+func safeOutputPath(dataDir, sessionID, spanID string) (string, error) {
+	p := storage.OutputPath(dataDir, sessionID, spanID)
+	// filepath.Join already cleans the path; verify the result is still
+	// inside dataDir so that "../" components in sessionID/spanID cannot
+	// escape the data directory.
+	rel, err := filepath.Rel(dataDir, p)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("unsafe output path for session=%q span=%q", sessionID, spanID)
+	}
+	return p, nil
 }
 
 func readOutputLines(logPath string) []string {
@@ -266,7 +299,11 @@ func readOutputLines(logPath string) []string {
 
 	var lines []string
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 10<<20)
+	// Conservative buffer: 64 KB initial, 1 MB max per line.
+	// detect_test_runs only needs the last ~30 lines, so large output files
+	// are read sequentially but we never hold more than one line in memory
+	// at once beyond what the scanner buffers.
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
 		var c storage.Chunk
 		if json.Unmarshal(sc.Bytes(), &c) == nil {

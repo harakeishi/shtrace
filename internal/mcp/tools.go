@@ -71,8 +71,9 @@ func (s *Server) toolSearchCommands(ctx context.Context, raw json.RawMessage) (a
 		return nil, errors.New("search_commands: FTS index not available — run 'shtrace reindex' first")
 	}
 
+	const maxSearchLimit = 200
 	limit := args.Limit
-	if limit <= 0 {
+	if limit <= 0 || limit > maxSearchLimit {
 		limit = 20
 	}
 
@@ -238,23 +239,31 @@ func (s *Server) detectForSession(ctx context.Context, sessionID string) ([]Test
 func indexRuns(runs []TestRun) map[testKey]TestRun {
 	m := make(map[testKey]TestRun, len(runs))
 	for _, r := range runs {
-		// Normalise the command to just the base command so that minor argv
-		// differences (e.g. file paths) don't prevent matching across sessions.
 		k := testKey{
 			framework: r.Framework,
-			command:   normaliseCommand(r.Command),
+			command:   normaliseCommand(r.Framework, r.Command),
 		}
 		m[k] = r
 	}
 	return m
 }
 
-func normaliseCommand(cmd string) string {
-	// Keep only the first token (the binary name) so "go test ./..." and
-	// "go test ./pkg" both collapse to "go".
+// normaliseCommand returns a stable key for a test run that survives minor
+// argv differences (e.g. different file-path arguments) while still
+// distinguishing distinct sub-commands of the same binary.
+//
+// For "go test" the first two tokens ("go test") are kept so that
+// "go test ./pkg/a" and "go test ./pkg/b" both map to the same key and are
+// treated as the same logical runner across sessions. For all other frameworks
+// only the binary name is used.
+func normaliseCommand(framework, cmd string) string {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return cmd
+	}
+	// Keep "go test" as two tokens to distinguish it from other go sub-commands.
+	if framework == "go test" && len(parts) >= 2 {
+		return parts[0] + " " + parts[1]
 	}
 	return parts[0]
 }

@@ -22,11 +22,14 @@ type rpcRequest struct {
 }
 
 // rpcResponse is a JSON-RPC 2.0 response envelope.
+// skip is an internal flag: when true, Serve does not write this response to
+// the wire. Used for JSON-RPC 2.0 Notifications, which must not receive a reply.
 type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
 	Result  any             `json:"result,omitempty"`
 	Error   *rpcError       `json:"error,omitempty"`
+	skip    bool
 }
 
 type rpcError struct {
@@ -35,11 +38,11 @@ type rpcError struct {
 }
 
 const (
-	errCodeParse     = -32700
-	errCodeInvalid   = -32600
-	errCodeNotFound  = -32601
-	errCodeParams    = -32602
-	errCodeInternal  = -32603
+	errCodeParse    = -32700
+	errCodeInvalid  = -32600
+	errCodeNotFound = -32601
+	errCodeParams   = -32602
+	errCodeInternal = -32603
 )
 
 // Server holds the dependencies shared across all tool handlers.
@@ -69,22 +72,31 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 
 		var req rpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
-			_ = enc.Encode(rpcResponse{
+			if encErr := enc.Encode(rpcResponse{
 				JSONRPC: "2.0",
 				Error:   &rpcError{Code: errCodeParse, Message: "parse error: " + err.Error()},
-			})
+			}); encErr != nil {
+				return fmt.Errorf("mcp: encode error response: %w", encErr)
+			}
 			continue
 		}
 		if req.JSONRPC != "2.0" {
-			_ = enc.Encode(rpcResponse{
+			if encErr := enc.Encode(rpcResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
 				Error:   &rpcError{Code: errCodeInvalid, Message: "invalid request: jsonrpc must be \"2.0\""},
-			})
+			}); encErr != nil {
+				return fmt.Errorf("mcp: encode error response: %w", encErr)
+			}
 			continue
 		}
 
 		resp := s.dispatch(ctx, &req)
+		// JSON-RPC 2.0: Notifications (requests with no id) must not receive
+		// a response. dispatch signals this by setting resp.skip = true.
+		if resp.skip {
+			continue
+		}
 		resp.JSONRPC = "2.0"
 		resp.ID = req.ID
 		if err := enc.Encode(resp); err != nil {
@@ -106,9 +118,10 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 func (s *Server) dispatch(ctx context.Context, req *rpcRequest) rpcResponse {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(req)
+		return s.handleInitialize()
 	case "notifications/initialized":
-		return rpcResponse{} // no response needed for notifications
+		// JSON-RPC 2.0 Notification: no response must be sent.
+		return rpcResponse{skip: true}
 	case "tools/list":
 		return s.handleToolsList()
 	case "tools/call":
@@ -120,16 +133,7 @@ func (s *Server) dispatch(ctx context.Context, req *rpcRequest) rpcResponse {
 	}
 }
 
-// initParams mirrors the MCP initialize request params.
-type initParams struct {
-	ProtocolVersion string `json:"protocolVersion"`
-	ClientInfo      struct {
-		Name    string `json:"name"`
-		Version string `json:"version"`
-	} `json:"clientInfo"`
-}
-
-func (s *Server) handleInitialize(req *rpcRequest) rpcResponse {
+func (s *Server) handleInitialize() rpcResponse {
 	return rpcResponse{
 		Result: map[string]any{
 			"protocolVersion": "2024-11-05",
@@ -185,7 +189,15 @@ func (s *Server) handleToolsCall(ctx context.Context, req *rpcRequest) rpcRespon
 		}
 	}
 
-	text, _ := json.MarshalIndent(result, "", "  ")
+	text, marshalErr := json.MarshalIndent(result, "", "  ")
+	if marshalErr != nil {
+		return rpcResponse{
+			Result: map[string]any{
+				"content": []map[string]any{{"type": "text", "text": "internal error: marshal result: " + marshalErr.Error()}},
+				"isError": true,
+			},
+		}
+	}
 	return rpcResponse{
 		Result: map[string]any{
 			"content": []map[string]any{{"type": "text", "text": string(text)}},
@@ -223,7 +235,7 @@ func toolDefinitions() []map[string]any {
 					},
 					"limit": map[string]any{
 						"type":        "integer",
-						"description": "Maximum number of results to return (default 20).",
+						"description": "Maximum number of results to return (default 20, max 200).",
 					},
 				},
 			},

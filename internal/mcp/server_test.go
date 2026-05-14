@@ -120,22 +120,16 @@ func TestServe_MethodNotFound(t *testing.T) {
 
 func TestServe_NotificationNoResponse(t *testing.T) {
 	srv := newTestServer()
-	// notifications/initialized has no id → server must not emit a response line
+	// notifications/initialized is a JSON-RPC 2.0 Notification: the server
+	// MUST NOT emit any response line per the spec.
 	input := `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}` + "\n"
 
 	var buf bytes.Buffer
 	if err := srv.Serve(context.Background(), strings.NewReader(input), &buf); err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
-	// The notification response is an empty struct encoded as "{}".
-	// That is fine; what matters is there is exactly one line and it has no error.
-	line := bytes.TrimRight(buf.Bytes(), "\n")
-	var resp rpcResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Error != nil {
-		t.Errorf("unexpected error: %+v", resp.Error)
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for notification, got: %q", buf.String())
 	}
 }
 
