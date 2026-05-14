@@ -342,6 +342,14 @@ func readOutputLines(logPath string) []string {
 			lines = lines[len(lines)-maxOutputLines:]
 		}
 	}
+	// sc.Err() is non-nil when scanning stopped due to an I/O error or a line
+	// exceeding the 1 MB buffer limit. Return whatever lines were collected so
+	// far (best-effort): detectors may still find a summary if the error
+	// occurred near the end of a large log.
+	// Errors are intentionally not propagated — detection is advisory and a
+	// partial read is more useful than no result.
+	_ = sc.Err()
+
 	// Final trim to the exact tail the detectors need.
 	if len(lines) > maxOutputLines {
 		lines = lines[len(lines)-maxOutputLines:]
