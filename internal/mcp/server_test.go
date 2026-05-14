@@ -137,6 +137,21 @@ func TestServe_NotificationNoResponse(t *testing.T) {
 	}
 }
 
+func TestServe_UnknownNotificationNoResponse(t *testing.T) {
+	srv := newTestServer()
+	// Any request without "id" is a Notification — even unknown methods
+	// must not produce a response per JSON-RPC 2.0 §4.
+	input := `{"jsonrpc":"2.0","method":"unknown/notification"}` + "\n"
+
+	var buf bytes.Buffer
+	if err := srv.Serve(context.Background(), strings.NewReader(input), &buf); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected no output for unknown notification, got: %q", buf.String())
+	}
+}
+
 func TestServe_MultipleRequests(t *testing.T) {
 	srv := newTestServer()
 	input := strings.Join([]string{

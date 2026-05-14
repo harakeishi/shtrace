@@ -94,9 +94,11 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 		}
 
 		resp := s.dispatch(ctx, &req)
-		// JSON-RPC 2.0: Notifications (requests with no id) must not receive
-		// a response. dispatch signals this by setting resp.skip = true.
-		if resp.skip {
+		// JSON-RPC 2.0 §4: a Notification is a request with no "id" field.
+		// The server MUST NOT send a response for any Notification, regardless
+		// of whether the method was recognised. We check both the explicit
+		// skip flag (set by known notification methods) and req.ID being absent.
+		if resp.skip || len(req.ID) == 0 {
 			continue
 		}
 		resp.JSONRPC = "2.0"
