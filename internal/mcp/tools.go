@@ -1,0 +1,307 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/harakeishi/shtrace/internal/storage"
+)
+
+// --- get_session -------------------------------------------------------
+
+type getSessionArgs struct {
+	SessionID string `json:"session_id"`
+}
+
+type sessionResult struct {
+	Session storage.Session `json:"session"`
+	Spans   []storage.Span  `json:"spans"`
+}
+
+func (s *Server) toolGetSession(ctx context.Context, raw json.RawMessage) (any, error) {
+	var args getSessionArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, fmt.Errorf("get_session: invalid args: %w", err)
+	}
+	if args.SessionID == "" {
+		return nil, errors.New("get_session: session_id is required")
+	}
+
+	sess, err := s.store.GetSession(ctx, args.SessionID)
+	if err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			return nil, fmt.Errorf("session %q not found", args.SessionID)
+		}
+		return nil, fmt.Errorf("get_session: %w", err)
+	}
+
+	spans, err := s.store.SpansForSession(ctx, args.SessionID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get_session: spans: %w", err)
+	}
+
+	return sessionResult{Session: sess, Spans: spans}, nil
+}
+
+// --- search_commands ----------------------------------------------------
+
+type searchCommandsArgs struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+type searchCommandResult struct {
+	SpanID    string `json:"span_id"`
+	SessionID string `json:"session_id"`
+	Snippet   string `json:"snippet"`
+}
+
+func (s *Server) toolSearchCommands(ctx context.Context, raw json.RawMessage) (any, error) {
+	var args searchCommandsArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, fmt.Errorf("search_commands: invalid args: %w", err)
+	}
+	if args.Query == "" {
+		return nil, errors.New("search_commands: query is required")
+	}
+	if s.fts == nil {
+		return nil, errors.New("search_commands: FTS index not available — run 'shtrace reindex' first")
+	}
+
+	const maxSearchLimit = 200
+	limit := args.Limit
+	if limit <= 0 {
+		limit = 20
+	} else if limit > maxSearchLimit {
+		limit = maxSearchLimit
+	}
+
+	results, err := s.fts.Search(ctx, args.Query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search_commands: %w", err)
+	}
+
+	out := make([]searchCommandResult, 0, len(results))
+	for _, r := range results {
+		out = append(out, searchCommandResult{
+			SpanID:    r.SpanID,
+			SessionID: r.SessionID,
+			Snippet:   r.Snippet,
+		})
+	}
+	return out, nil
+}
+
+// --- detect_test_runs ---------------------------------------------------
+
+type detectTestRunsArgs struct {
+	SessionID string `json:"session_id"`
+}
+
+func (s *Server) toolDetectTestRuns(ctx context.Context, raw json.RawMessage) (any, error) {
+	var args detectTestRunsArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, fmt.Errorf("detect_test_runs: invalid args: %w", err)
+	}
+	if args.SessionID == "" {
+		return nil, errors.New("detect_test_runs: session_id is required")
+	}
+
+	if _, err := s.store.GetSession(ctx, args.SessionID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			return nil, fmt.Errorf("session %q not found", args.SessionID)
+		}
+		return nil, fmt.Errorf("detect_test_runs: %w", err)
+	}
+
+	spans, err := s.store.SpansForSession(ctx, args.SessionID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("detect_test_runs: spans: %w", err)
+	}
+
+	runs := DetectTestRuns(spans, s.dataDir)
+	if runs == nil {
+		runs = []TestRun{}
+	}
+	return runs, nil
+}
+
+// --- compare_runs -------------------------------------------------------
+
+type compareRunsArgs struct {
+	SessionA string `json:"session_a"`
+	SessionB string `json:"session_b"`
+}
+
+// testKey uniquely identifies a test run for comparison purposes.
+// We use "framework:command" as the key since there are no named test cases
+// at the span level — only aggregate pass/fail counts per command.
+type testKey struct{ framework, command string }
+
+type compareEntry struct {
+	Framework string `json:"framework"`
+	Command   string `json:"command"`
+	// Status of the run in each session. "pass", "fail", "unknown", or "absent".
+	StatusA string `json:"status_a"`
+	StatusB string `json:"status_b"`
+	Change  string `json:"change"` // "pass→fail", "fail→pass", "unchanged", "added", "removed"
+}
+
+type compareResult struct {
+	SessionA string         `json:"session_a"`
+	SessionB string         `json:"session_b"`
+	Entries  []compareEntry `json:"entries"`
+}
+
+func (s *Server) toolCompareRuns(ctx context.Context, raw json.RawMessage) (any, error) {
+	var args compareRunsArgs
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, fmt.Errorf("compare_runs: invalid args: %w", err)
+	}
+	if args.SessionA == "" || args.SessionB == "" {
+		return nil, errors.New("compare_runs: session_a and session_b are required")
+	}
+
+	runsA, err := s.detectForSession(ctx, args.SessionA)
+	if err != nil {
+		return nil, fmt.Errorf("compare_runs session_a: %w", err)
+	}
+	runsB, err := s.detectForSession(ctx, args.SessionB)
+	if err != nil {
+		return nil, fmt.Errorf("compare_runs session_b: %w", err)
+	}
+
+	mapA := indexRuns(runsA)
+	mapB := indexRuns(runsB)
+
+	seen := map[testKey]bool{}
+	var entries []compareEntry
+
+	for k, runA := range mapA {
+		seen[k] = true
+		statusA := runStatus(runA)
+		if runB, ok := mapB[k]; ok {
+			statusB := runStatus(runB)
+			entries = append(entries, compareEntry{
+				Framework: k.framework,
+				Command:   k.command,
+				StatusA:   statusA,
+				StatusB:   statusB,
+				Change:    changeLabel(statusA, statusB),
+			})
+		} else {
+			entries = append(entries, compareEntry{
+				Framework: k.framework,
+				Command:   k.command,
+				StatusA:   statusA,
+				StatusB:   "absent",
+				Change:    "removed",
+			})
+		}
+	}
+
+	for k, runB := range mapB {
+		if seen[k] {
+			continue
+		}
+		statusB := runStatus(runB)
+		entries = append(entries, compareEntry{
+			Framework: k.framework,
+			Command:   k.command,
+			StatusA:   "absent",
+			StatusB:   statusB,
+			Change:    "added",
+		})
+	}
+
+	if entries == nil {
+		entries = []compareEntry{}
+	}
+	return compareResult{
+		SessionA: args.SessionA,
+		SessionB: args.SessionB,
+		Entries:  entries,
+	}, nil
+}
+
+func (s *Server) detectForSession(ctx context.Context, sessionID string) ([]TestRun, error) {
+	if _, err := s.store.GetSession(ctx, sessionID); err != nil {
+		if errors.Is(err, storage.ErrSessionNotFound) {
+			return nil, fmt.Errorf("session %q not found", sessionID)
+		}
+		return nil, err
+	}
+	spans, err := s.store.SpansForSession(ctx, sessionID, nil)
+	if err != nil {
+		return nil, err
+	}
+	return DetectTestRuns(spans, s.dataDir), nil
+}
+
+// indexRuns builds a map from normalised (framework, command) key to TestRun.
+//
+// Known limitation (MVP): when a session contains multiple invocations of the
+// same framework (e.g. two separate `go test` calls), only the last one is
+// retained per key. This is acceptable for the Phase 2 MVP where sessions
+// typically have one test invocation per framework; a future iteration can
+// extend the key or store a list.
+func indexRuns(runs []TestRun) map[testKey]TestRun {
+	m := make(map[testKey]TestRun, len(runs))
+	for _, r := range runs {
+		k := testKey{
+			framework: r.Framework,
+			command:   normaliseCommand(r.Framework, r.Command),
+		}
+		m[k] = r
+	}
+	return m
+}
+
+// normaliseCommand returns a stable key for a test run that survives minor
+// argv differences (e.g. different file-path arguments) while still
+// distinguishing distinct sub-commands of the same binary.
+//
+// For "go test" the first two tokens ("go test") are kept so that
+// "go test ./pkg/a" and "go test ./pkg/b" both map to the same key and are
+// treated as the same logical runner across sessions. For all other frameworks
+// only the binary name is used.
+func normaliseCommand(framework, cmd string) string {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return cmd
+	}
+	// Keep "go test" as two tokens to distinguish it from other go sub-commands.
+	if framework == "go test" && len(parts) >= 2 {
+		return parts[0] + " " + parts[1]
+	}
+	return parts[0]
+}
+
+func runStatus(r TestRun) string {
+	if r.ExitCode != nil {
+		if *r.ExitCode == 0 {
+			return "pass"
+		}
+		return "fail"
+	}
+	if r.Failed != nil && *r.Failed > 0 {
+		return "fail"
+	}
+	// Treat any run where Failed or Passed was populated as passing.
+	// This covers the edge case where a framework sets Failed=&0 but leaves
+	// Passed nil (e.g. a future detector that only tracks failure counts).
+	if r.Failed != nil || r.Passed != nil {
+		return "pass"
+	}
+	return "unknown"
+}
+
+func changeLabel(a, b string) string {
+	if a == b {
+		return "unchanged"
+	}
+	return a + "→" + b
+}

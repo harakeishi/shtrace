@@ -16,6 +16,7 @@ import (
 
 	"github.com/mattn/go-isatty"
 
+	"github.com/harakeishi/shtrace/internal/mcp"
 	"github.com/harakeishi/shtrace/internal/report"
 	"github.com/harakeishi/shtrace/internal/runner"
 	"github.com/harakeishi/shtrace/internal/secret"
@@ -28,7 +29,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init")
 		return 2
 	}
 
@@ -42,11 +43,13 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init")
 		return 2
 	}
 
 	switch argv[1] {
+	case "mcp":
+		return runMCP(ctx, argv[2:], os.Stdin, stdout, stderr)
 	case "ls":
 		return runLs(ctx, argv[2:], stdout, stderr)
 	case "show":
@@ -903,6 +906,57 @@ func parseMode(argv []string) (mode string, rest []string, err error) {
 		mode = val
 	}
 	return mode, out, nil
+}
+
+// runMCP starts a stdio MCP server backed by the local shtrace data directory.
+// It reads JSON-RPC 2.0 requests from r (os.Stdin in production) and writes
+// responses to stdout until EOF.
+func runMCP(ctx context.Context, _ []string, r io.Reader, stdout, stderr io.Writer) int {
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: mkdir data dir: %v\n", err)
+		return 1
+	}
+
+	store, err := storage.Open(dataDir + "/sessions.db")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		return 1
+	}
+
+	// FTS index is optional: if absent, search_commands returns an error but
+	// the other three tools still work.
+	var fts *storage.FTSStore
+	ftsPath := storage.FTSPath(dataDir)
+	if _, statErr := os.Stat(ftsPath); statErr == nil {
+		fts, err = storage.OpenFTS(ftsPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search_commands disabled): %v\n", err)
+		} else {
+			defer func() { _ = fts.Close() }()
+			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
+				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search_commands disabled): %v\n", migrErr)
+				fts = nil
+			}
+		}
+	}
+
+	srv := mcp.NewServer(store, fts, dataDir)
+	if err := srv.Serve(ctx, r, stdout); err != nil && ctx.Err() == nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: mcp: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func splitLines(b []byte) [][]byte {
