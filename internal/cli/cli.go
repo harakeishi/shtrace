@@ -498,7 +498,8 @@ func runReindex(ctx context.Context, _ []string, stdout, stderr io.Writer) int {
 	}
 
 	_, _ = fmt.Fprintln(stdout, "reindexing...")
-	if err := storage.ReindexAll(ctx, fts, store, dataDir); err != nil {
+	warnReindex := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: %v\n", e) }
+	if err := storage.ReindexAll(ctx, fts, store, dataDir, warnReindex); err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: reindex: %v\n", err)
 		return 1
 	}
@@ -543,10 +544,12 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (index cleanup skipped): %v\n", err)
 		} else {
-			defer func() { _ = fts.Close() }()
 			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
 				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (index cleanup skipped): %v\n", migrErr)
+				_ = fts.Close()
 				fts = nil
+			} else {
+				defer func() { _ = fts.Close() }()
 			}
 		}
 	}
@@ -1177,10 +1180,12 @@ func runMCP(ctx context.Context, _ []string, r io.Reader, stdout, stderr io.Writ
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search_commands disabled): %v\n", err)
 		} else {
-			defer func() { _ = fts.Close() }()
 			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
 				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search_commands disabled): %v\n", migrErr)
+				_ = fts.Close()
 				fts = nil
+			} else {
+				defer func() { _ = fts.Close() }()
 			}
 		}
 	}
