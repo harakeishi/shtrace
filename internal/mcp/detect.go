@@ -180,7 +180,7 @@ var detectors = []frameworkDetector{
 					run.Summary = strings.TrimSpace(lines[i])
 					t := atoi(m[1])
 					f := atoi(m[2])
-					p := t - f
+					p := max0(t - f)
 					run.Total = &t
 					run.Failed = &f
 					run.Passed = &p
@@ -238,7 +238,7 @@ var detectors = []frameworkDetector{
 				run.Summary = strings.TrimSpace(lines[i])
 				t := atoi(m[1])
 				f := atoi(m[2])
-				p := t - f
+				p := max0(t - f)
 				run.Total = &t
 				run.Failed = &f
 				run.Passed = &p
@@ -347,6 +347,15 @@ func readOutputLines(logPath string) []string {
 		lines = lines[len(lines)-maxOutputLines:]
 	}
 	return lines
+}
+
+// max0 returns n if n >= 0, otherwise 0. Guards passed = total - failed when
+// a corrupt or malformed output line produces failed > total.
+func max0(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func atoi(s string) int {

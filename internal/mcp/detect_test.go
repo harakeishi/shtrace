@@ -143,6 +143,135 @@ func TestDetectTestRuns_PytestFailFirst(t *testing.T) {
 	}
 }
 
+func TestDetectTestRuns_Jest(t *testing.T) {
+	det := findDetector(t, "jest")
+
+	sp := storage.Span{
+		ID:        "span-jest",
+		SessionID: "sess1",
+		Command:   "jest",
+		Argv:      []string{"jest"},
+	}
+	lines := []string{
+		"Tests: 1 failed, 2 skipped, 5 passed, 8 total",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Framework != "jest" {
+		t.Errorf("framework: got %q", run.Framework)
+	}
+	if run.Passed == nil || *run.Passed != 5 {
+		t.Errorf("passed: got %v, want 5", run.Passed)
+	}
+	if run.Failed == nil || *run.Failed != 1 {
+		t.Errorf("failed: got %v, want 1", run.Failed)
+	}
+	if run.Skipped == nil || *run.Skipped != 2 {
+		t.Errorf("skipped: got %v, want 2", run.Skipped)
+	}
+	if run.Total == nil || *run.Total != 8 {
+		t.Errorf("total: got %v, want 8", run.Total)
+	}
+}
+
+func TestDetectTestRuns_Vitest(t *testing.T) {
+	det := findDetector(t, "vitest")
+
+	sp := storage.Span{
+		ID:        "span-vitest",
+		SessionID: "sess1",
+		Command:   "vitest",
+		Argv:      []string{"vitest", "run"},
+	}
+	lines := []string{
+		"Tests  4 passed | 1 failed (5)",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Framework != "vitest" {
+		t.Errorf("framework: got %q", run.Framework)
+	}
+	if run.Passed == nil || *run.Passed != 4 {
+		t.Errorf("passed: got %v, want 4", run.Passed)
+	}
+	if run.Failed == nil || *run.Failed != 1 {
+		t.Errorf("failed: got %v, want 1", run.Failed)
+	}
+	if run.Total == nil || *run.Total != 5 {
+		t.Errorf("total: got %v, want 5", run.Total)
+	}
+}
+
+func TestDetectTestRuns_PHPUnitOK(t *testing.T) {
+	det := findDetector(t, "phpunit")
+
+	sp := storage.Span{
+		ID:        "span-phpunit-ok",
+		SessionID: "sess1",
+		Command:   "phpunit",
+		Argv:      []string{"phpunit", "--testdox"},
+	}
+	lines := []string{
+		"OK (7 tests, 14 assertions)",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Framework != "phpunit" {
+		t.Errorf("framework: got %q", run.Framework)
+	}
+	if run.Total == nil || *run.Total != 7 {
+		t.Errorf("total: got %v, want 7", run.Total)
+	}
+	if run.Passed == nil || *run.Passed != 7 {
+		t.Errorf("passed: got %v, want 7", run.Passed)
+	}
+}
+
+func TestDetectTestRuns_PHPUnitFail(t *testing.T) {
+	det := findDetector(t, "phpunit")
+
+	sp := storage.Span{
+		ID:        "span-phpunit-fail",
+		SessionID: "sess1",
+		Command:   "phpunit",
+		Argv:      []string{"phpunit"},
+	}
+	lines := []string{
+		"Tests: 5, Assertions: 10, Failures: 2.",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Total == nil || *run.Total != 5 {
+		t.Errorf("total: got %v, want 5", run.Total)
+	}
+	if run.Failed == nil || *run.Failed != 2 {
+		t.Errorf("failed: got %v, want 2", run.Failed)
+	}
+	if run.Passed == nil || *run.Passed != 3 {
+		t.Errorf("passed: got %v, want 3", run.Passed)
+	}
+}
+
+func TestDetectTestRuns_NegativePassedClamped(t *testing.T) {
+	// Guard: passed = total - failed must not go negative on corrupt output.
+	det := findDetector(t, "rspec")
+
+	sp := storage.Span{
+		ID:        "span-rspec-corrupt",
+		SessionID: "sess1",
+		Command:   "rspec",
+		Argv:      []string{"rspec"},
+	}
+	lines := []string{
+		"0 examples, 5 failures", // corrupt: more failures than examples
+	}
+	run := det.extract(lines, sp)
+
+	if run.Passed != nil && *run.Passed < 0 {
+		t.Errorf("passed must not be negative, got %d", *run.Passed)
+	}
+}
+
 func TestDetectTestRuns_Rspec(t *testing.T) {
 	det := findDetector(t, "rspec")
 
