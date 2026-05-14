@@ -354,9 +354,7 @@ func readOutputLines(logPath string) []string {
 	for sc.Scan() {
 		var c storage.Chunk
 		if json.Unmarshal(sc.Bytes(), &c) == nil {
-			for _, l := range strings.Split(c.Data, "\n") {
-				lines = append(lines, l)
-			}
+			lines = append(lines, strings.Split(c.Data, "\n")...)
 		}
 		// Cap in-loop to bound peak memory for very large logs.
 		// We keep 2× maxOutputLines as a flush threshold so we don't
