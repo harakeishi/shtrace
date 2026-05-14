@@ -4,10 +4,9 @@ name: shtrace sample workflow
 # for PR verification. Copy this into your own repository and adapt as needed.
 #
 # What it does:
-#   1. Builds shtrace and records test execution via `shtrace -- go test ./...`
-#   2. Generates a self-contained HTML report
-#   3. Exports the session as a tar.gz artifact
-#   4. Posts a summary comment on the PR with test results and download instructions
+#   1. Builds shtrace from source and records test execution
+#   2. Exports the session as a tar.gz artifact (with HTML report)
+#   3. Posts a summary comment on the PR with test results and download instructions
 
 on:
   pull_request:
@@ -26,16 +25,15 @@ jobs:
         with:
           go-version: stable
 
-      - name: Install shtrace
-        run: go install github.com/harakeishi/shtrace/cmd/shtrace@latest
+      - name: Build shtrace from source
+        run: go build -o "$(go env GOPATH)/bin/shtrace" ./cmd/shtrace
 
       - name: Run tests with shtrace
         run: shtrace -- go test ./...
-        # Propagate SHTRACE_SESSION_ID so nested shtrace calls join the same session.
         # GitHub Actions automatically sets GITHUB_ACTIONS=true and
         # GITHUB_WORKSPACE, so shtrace stores data under $GITHUB_WORKSPACE/.shtrace.
 
-      - name: Generate HTML report
+      - name: Export session as artifact
         if: always()
         run: shtrace export --latest --with-report --output shtrace-report.tar.gz
 
