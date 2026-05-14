@@ -72,8 +72,10 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 
 		var req rpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
+			// JSON-RPC 2.0 §5: when the request cannot be parsed, id MUST be null.
 			if encErr := enc.Encode(rpcResponse{
 				JSONRPC: "2.0",
+				ID:      json.RawMessage("null"),
 				Error:   &rpcError{Code: errCodeParse, Message: "parse error: " + err.Error()},
 			}); encErr != nil {
 				return fmt.Errorf("mcp: encode error response: %w", encErr)

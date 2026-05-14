@@ -335,10 +335,14 @@ func readOutputLines(logPath string) []string {
 				lines = append(lines, l)
 			}
 		}
+		// Cap in-loop to bound peak memory for very large logs.
+		// We keep 2× maxOutputLines as a flush threshold so we don't
+		// slice on every iteration; the final trim below enforces the exact cap.
+		if len(lines) > maxOutputLines*2 {
+			lines = lines[len(lines)-maxOutputLines:]
+		}
 	}
-	// Trim to the tail so that callers examining the last N lines of output
-	// see the summary section even for very long logs, and we don't hold
-	// the entire file in memory.
+	// Final trim to the exact tail the detectors need.
 	if len(lines) > maxOutputLines {
 		lines = lines[len(lines)-maxOutputLines:]
 	}

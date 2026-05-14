@@ -95,6 +95,10 @@ func TestServe_ParseError(t *testing.T) {
 	if resp.Error.Code != errCodeParse {
 		t.Errorf("expected parse error code %d, got %d", errCodeParse, resp.Error.Code)
 	}
+	// JSON-RPC 2.0 §5: parse error response MUST contain "id": null.
+	if string(resp.ID) != "null" {
+		t.Errorf("expected id=null for parse error, got %s", resp.ID)
+	}
 }
 
 func TestServe_MethodNotFound(t *testing.T) {
