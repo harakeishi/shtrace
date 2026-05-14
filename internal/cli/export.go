@@ -200,22 +200,8 @@ func writeExportTarGz(
 
 	for _, sp := range spans {
 		logPath := storage.OutputPath(dataDir, sess.ID, sp.ID)
-		logData, err := os.ReadFile(logPath)
-		if err != nil {
-			warn(fmt.Errorf("read log %s: %v (skipping)", logPath, err))
-			continue
-		}
-		hdr := &tar.Header{
-			Name:    "shtrace-export/outputs/" + sp.ID + ".log",
-			Mode:    0o644,
-			Size:    int64(len(logData)),
-			ModTime: time.Now().UTC(),
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar header for %s: %w", sp.ID, err)
-		}
-		if _, err := tw.Write(logData); err != nil {
-			return fmt.Errorf("tar write for %s: %w", sp.ID, err)
+		if err := addLogToTar(tw, logPath, sp.ID, warn); err != nil {
+			return err
 		}
 	}
 
@@ -253,6 +239,36 @@ func writeExportTarGz(
 		return fmt.Errorf("close file: %w", err)
 	}
 	ok = true
+	return nil
+}
+
+// addLogToTar streams a span log file into tw without loading the whole file
+// into memory. The tar header is populated from os.Stat so the size is exact.
+func addLogToTar(tw *tar.Writer, logPath, spanID string, warn func(error)) error {
+	fi, err := os.Stat(logPath)
+	if err != nil {
+		warn(fmt.Errorf("stat log %s: %v (skipping)", logPath, err))
+		return nil
+	}
+	f, err := os.Open(logPath)
+	if err != nil {
+		warn(fmt.Errorf("open log %s: %v (skipping)", logPath, err))
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+
+	hdr := &tar.Header{
+		Name:    "shtrace-export/outputs/" + spanID + ".log",
+		Mode:    0o644,
+		Size:    fi.Size(),
+		ModTime: fi.ModTime().UTC(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("tar header for %s: %w", spanID, err)
+	}
+	if _, err := io.Copy(tw, f); err != nil {
+		return fmt.Errorf("tar write for %s: %w", spanID, err)
+	}
 	return nil
 }
 
@@ -358,6 +374,9 @@ func importTarGz(ctx context.Context, path string, store *storage.Store, dataDir
 	tr := tar.NewReader(gr)
 
 	files := map[string][]byte{}
+	// 32 MB per-entry cap: protects against zip-bomb style tarballs.
+	// Legitimate shtrace archives are bounded by session output sizes.
+	const maxEntrySize = 32 << 20
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -369,7 +388,10 @@ func importTarGz(ctx context.Context, path string, store *storage.Store, dataDir
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		b, err := io.ReadAll(tr)
+		if hdr.Size > maxEntrySize {
+			return importResult{}, fmt.Errorf("archive entry %s too large (%d bytes, max %d)", hdr.Name, hdr.Size, maxEntrySize)
+		}
+		b, err := io.ReadAll(io.LimitReader(tr, maxEntrySize))
 		if err != nil {
 			return importResult{}, fmt.Errorf("read %s: %w", hdr.Name, err)
 		}
@@ -479,6 +501,12 @@ func importTarGz(ctx context.Context, path string, store *storage.Store, dataDir
 			continue
 		}
 		outPath := storage.OutputPath(dataDir, targetID, spanID)
+		// Guard against path traversal: the resolved path must stay within dataDir.
+		cleanData := filepath.Clean(dataDir) + string(filepath.Separator)
+		if !strings.HasPrefix(filepath.Clean(outPath), cleanData) {
+			warn(fmt.Errorf("span %s: output path escapes data dir, skipping", es.ID))
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 			warn(fmt.Errorf("span %s: mkdir: %v", spanID, err))
 			continue

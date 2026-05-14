@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 	"runtime"
 	"strconv"
 	"strings"
@@ -77,10 +78,18 @@ func runPRComment(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 
 	// Detect test results from span output logs.
+	// Cap each log read at 4 MB — sufficient to find any test summary line.
+	const maxLogRead = 4 << 20
 	var allFrameworks []testFramework
 	for _, sp := range spans {
 		logPath := storage.OutputPath(dataDir, sess.ID, sp.ID)
-		data, err := os.ReadFile(logPath)
+		f, err := os.Open(logPath)
+		if err != nil {
+			warn(fmt.Errorf("read log %s: %v", logPath, err))
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(f, maxLogRead))
+		_ = f.Close()
 		if err != nil {
 			warn(fmt.Errorf("read log %s: %v", logPath, err))
 			continue
@@ -172,7 +181,8 @@ func postGitHubComment(ctx context.Context, url, token, body string) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http: %w", err)
 	}
@@ -365,7 +375,7 @@ func detectPHPUnit(s string) (testFramework, bool) {
 			if n, err := strconv.Atoi(extractBefore(extractAfter(line, "Failures: "), ",")); err == nil {
 				fw.Failed = n
 			}
-			fw.Passed = fw.Total - fw.Failed
+			fw.Passed = max(0, fw.Total-fw.Failed)
 			if fw.Total > 0 {
 				return fw, true
 			}
@@ -388,7 +398,7 @@ func detectRSpec(s string) (testFramework, bool) {
 		if n, err := strconv.Atoi(extractBefore(line, " failures")); err == nil {
 			fw.Failed = n
 		}
-		fw.Passed = fw.Total - fw.Failed
+		fw.Passed = max(0, fw.Total-fw.Failed)
 		if fw.Total > 0 {
 			return fw, true
 		}
@@ -399,7 +409,7 @@ func detectRSpec(s string) (testFramework, bool) {
 func extractBefore(s, sep string) string {
 	idx := strings.LastIndex(s, sep)
 	if idx < 0 {
-		return s
+		return ""
 	}
 	// walk back past spaces to find the number
 	i := idx - 1
