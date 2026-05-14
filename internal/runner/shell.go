@@ -271,6 +271,8 @@ func shellInvocation(shell, tmpDir string, env []string) (argv, childEnv []strin
 
 // bashRC is sourced as --rcfile when starting a bash shell. It loads the
 // user's own .bashrc first, then installs OSC 133 hooks for span detection.
+// Any DEBUG trap already set by the user's .bashrc is chained so it continues
+// to fire (bash has no add-trap-hook equivalent, so we read and replay it).
 const bashRC = `# shtrace: source user rc
 [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
 
@@ -278,10 +280,21 @@ const bashRC = `# shtrace: source user rc
 # __shtrace_cmd_fired prevents duplicate B markers for compound commands.
 __shtrace_cmd_fired=0
 
+# Preserve any DEBUG trap the user's rc installed so we can chain it.
+# trap -p prints: trap -- 'BODY' DEBUG  — extract the body with sed.
+# This works for most real-world trap bodies; it may misparse bodies that
+# contain literal escaped single-quotes (rare in practice).
+__shtrace_prev_debug=''
+if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out" ]; then
+    __shtrace_prev_debug=$(printf '%s' "$__shtrace_trap_out" | \
+        sed "s/^trap -- '//;s/' DEBUG\$//")
+fi
+
 __shtrace_debug_hook() {
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
     printf '\033]133;B\007'
+    [ -n "$__shtrace_prev_debug" ] && eval "$__shtrace_prev_debug"
 }
 trap '__shtrace_debug_hook' DEBUG
 

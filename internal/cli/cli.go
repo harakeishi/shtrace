@@ -953,13 +953,14 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 	// Open FTS once for the whole session to avoid per-span open/migrate/close.
 	var fts *storage.FTSStore
-	if ftsStore, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr == nil {
-		if migrErr := ftsStore.MigrateFTS(ctx); migrErr == nil {
-			fts = ftsStore
-			defer func() { _ = fts.Close() }()
-		} else {
-			_ = ftsStore.Close()
-		}
+	if ftsStore, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search index disabled for session): %v\n", ftsErr)
+	} else if migrErr := ftsStore.MigrateFTS(ctx); migrErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search index disabled for session): %v\n", migrErr)
+		_ = ftsStore.Close()
+	} else {
+		fts = ftsStore
+		defer func() { _ = fts.Close() }()
 	}
 
 	// Per-span state; mutated by the Begin/End callbacks below.
@@ -979,15 +980,21 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if idErr != nil {
 			return nil, fmt.Errorf("generate span id: %w", idErr)
 		}
+		// Set span state optimistically; clear it on any error so the
+		// post-RunShell cleanup guard does not see a phantom curSpanID.
 		curSpanID = spanID
 		curStartedAt = time.Now().UTC()
 
 		logPath := storage.OutputPath(dataDir, sessCtx.SessionID, spanID)
 		if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
+			curSpanID = ""
+			curStartedAt = time.Time{}
 			return nil, fmt.Errorf("mkdir outputs: %w", err)
 		}
 		f, err := os.Create(logPath)
 		if err != nil {
+			curSpanID = ""
+			curStartedAt = time.Time{}
 			return nil, fmt.Errorf("open log: %w", err)
 		}
 		curLogFile = f
