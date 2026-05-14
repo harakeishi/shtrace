@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/harakeishi/shtrace/internal/storage"
@@ -99,6 +100,11 @@ func runPRComment(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		serverURL = "https://github.com"
 	}
 
+	if _, err := strconv.Atoi(prNumber); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: invalid PR number %q: must be numeric\n", prNumber)
+		return 2
+	}
+
 	body := buildPRCommentBody(sess, spans, allFrameworks, runID, repo, serverURL)
 	_, _ = fmt.Fprint(stdout, body)
 	_, _ = fmt.Fprintln(stdout)
@@ -172,8 +178,12 @@ func postGitHubComment(ctx context.Context, url, token, body string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := strings.TrimSpace(string(b))
+		if readErr != nil {
+			msg = "(error reading response: " + readErr.Error() + ")"
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, msg)
 	}
 	return nil
 }
@@ -266,9 +276,13 @@ func detectPytest(s string) (testFramework, bool) {
 			continue
 		}
 		fw := testFramework{Name: "pytest"}
-		fmt.Sscanf(extractBefore(line, " passed"), "%d", &fw.Passed)
+		if n, err := strconv.Atoi(extractBefore(line, " passed")); err == nil {
+			fw.Passed = n
+		}
 		if strings.Contains(line, "failed") {
-			fmt.Sscanf(extractBefore(line, " failed"), "%d", &fw.Failed)
+			if n, err := strconv.Atoi(extractBefore(line, " failed")); err == nil {
+				fw.Failed = n
+			}
 		}
 		fw.Total = fw.Passed + fw.Failed
 		if fw.Total > 0 {
@@ -307,13 +321,19 @@ func detectJest(s string) (testFramework, bool) {
 		}
 		fw := testFramework{Name: "jest/vitest"}
 		if strings.Contains(line, "passed") {
-			fmt.Sscanf(extractBefore(line, " passed"), "%d", &fw.Passed)
+			if n, err := strconv.Atoi(extractBefore(line, " passed")); err == nil {
+				fw.Passed = n
+			}
 		}
 		if strings.Contains(line, "failed") {
-			fmt.Sscanf(extractBefore(line, " failed"), "%d", &fw.Failed)
+			if n, err := strconv.Atoi(extractBefore(line, " failed")); err == nil {
+				fw.Failed = n
+			}
 		}
 		if strings.Contains(line, "total") {
-			fmt.Sscanf(extractBefore(line, " total"), "%d", &fw.Total)
+			if n, err := strconv.Atoi(extractBefore(line, " total")); err == nil {
+				fw.Total = n
+			}
 		}
 		if fw.Total > 0 || fw.Passed > 0 || fw.Failed > 0 {
 			return fw, true
@@ -328,7 +348,10 @@ func detectPHPUnit(s string) (testFramework, bool) {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "OK (") && strings.Contains(line, "tests") {
 			fw := testFramework{Name: "phpunit"}
-			fmt.Sscanf(strings.TrimPrefix(line, "OK ("), "%d tests", &fw.Total)
+			// "OK (5 tests, ..." — extract number after "OK ("
+			if n, err := strconv.Atoi(extractBefore(strings.TrimPrefix(line, "OK ("), " tests")); err == nil {
+				fw.Total = n
+			}
 			fw.Passed = fw.Total
 			if fw.Total > 0 {
 				return fw, true
@@ -336,8 +359,12 @@ func detectPHPUnit(s string) (testFramework, bool) {
 		}
 		if strings.Contains(line, "FAILURES!") || strings.Contains(line, "Tests:") && strings.Contains(line, "Failures:") {
 			fw := testFramework{Name: "phpunit"}
-			fmt.Sscanf(extractBefore(line, ", Assertions"), "Tests: %d", &fw.Total)
-			fmt.Sscanf(extractAfter(line, "Failures: "), "%d", &fw.Failed)
+			if n, err := strconv.Atoi(extractBefore(extractAfter(line, "Tests: "), ",")); err == nil {
+				fw.Total = n
+			}
+			if n, err := strconv.Atoi(extractBefore(extractAfter(line, "Failures: "), ",")); err == nil {
+				fw.Failed = n
+			}
 			fw.Passed = fw.Total - fw.Failed
 			if fw.Total > 0 {
 				return fw, true
@@ -355,8 +382,12 @@ func detectRSpec(s string) (testFramework, bool) {
 			continue
 		}
 		fw := testFramework{Name: "rspec"}
-		fmt.Sscanf(line, "%d examples", &fw.Total)
-		fmt.Sscanf(extractBefore(line, " failures"), "%d", &fw.Failed)
+		if n, err := strconv.Atoi(extractBefore(line, " examples")); err == nil {
+			fw.Total = n
+		}
+		if n, err := strconv.Atoi(extractBefore(line, " failures")); err == nil {
+			fw.Failed = n
+		}
 		fw.Passed = fw.Total - fw.Failed
 		if fw.Total > 0 {
 			return fw, true

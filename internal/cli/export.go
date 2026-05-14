@@ -452,11 +452,8 @@ func importTarGz(ctx context.Context, path string, store *storage.Store, dataDir
 			continue
 		}
 
-		// When renaming a session, rewrite the session_id in each span.
+		// Span IDs are independent UUIDs; only session_id is rewritten.
 		spanID := es.ID
-		if rename && originalID != "" {
-			spanID = strings.ReplaceAll(spanID, originalID, targetID)
-		}
 
 		if err := store.InsertSpan(ctx, storage.Span{
 			ID:           spanID,
