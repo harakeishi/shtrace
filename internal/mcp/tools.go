@@ -290,7 +290,10 @@ func runStatus(r TestRun) string {
 	if r.Failed != nil && *r.Failed > 0 {
 		return "fail"
 	}
-	if r.Passed != nil {
+	// Treat any run where Failed or Passed was populated as passing.
+	// This covers the edge case where a framework sets Failed=&0 but leaves
+	// Passed nil (e.g. a future detector that only tracks failure counts).
+	if r.Failed != nil || r.Passed != nil {
 		return "pass"
 	}
 	return "unknown"

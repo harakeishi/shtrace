@@ -174,6 +174,29 @@ func TestDetectTestRuns_Jest(t *testing.T) {
 	}
 }
 
+func TestDetectTestRuns_JestWithTodo(t *testing.T) {
+	// Jest v29+ includes a "todo" count in the summary line.
+	det := findDetector(t, "jest")
+
+	sp := storage.Span{
+		ID:        "span-jest-todo",
+		SessionID: "sess1",
+		Command:   "jest",
+		Argv:      []string{"jest"},
+	}
+	lines := []string{
+		"Tests: 3 todo, 5 passed, 8 total",
+	}
+	run := det.extract(lines, sp)
+
+	if run.Passed == nil || *run.Passed != 5 {
+		t.Errorf("passed: got %v, want 5", run.Passed)
+	}
+	if run.Total == nil || *run.Total != 8 {
+		t.Errorf("total: got %v, want 8", run.Total)
+	}
+}
+
 func TestDetectTestRuns_Vitest(t *testing.T) {
 	det := findDetector(t, "vitest")
 
@@ -310,6 +333,7 @@ func TestRunStatus(t *testing.T) {
 		{TestRun{ExitCode: ptr(1)}, "fail"},
 		{TestRun{Failed: ptr(0), Passed: ptr(5)}, "pass"},
 		{TestRun{Failed: ptr(2)}, "fail"},
+		{TestRun{Failed: ptr(0)}, "pass"}, // Failed=0, Passed=nil → still "pass"
 		{TestRun{}, "unknown"},
 	}
 	for _, tc := range cases {

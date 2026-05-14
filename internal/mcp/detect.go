@@ -42,7 +42,11 @@ var (
 		`(?i)(?:(\d+)\s+failed,\s*(\d+)\s+passed|(\d+)\s+passed(?:,\s*(\d+)\s+failed)?)(?:,\s*(\d+)\s+skipped)?`)
 
 	jestCmdRe    = regexp.MustCompile(`(?i)\bjest\b`)
-	jestResultRe = regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
+	// jestResultRe matches Jest's "Tests:" summary line.
+	// Jest v29+ may include a "todo" count before "passed"; it is matched but
+	// not captured (non-capturing group) so the capture group indices are stable:
+	//   m[1]=failed  m[2]=skipped  m[3]=passed  m[4]=total
+	jestResultRe = regexp.MustCompile(`(?i)Tests:\s+(?:(\d+)\s+failed,\s*)?(?:(\d+)\s+skipped,\s*)?(?:\d+\s+todo,\s*)?(\d+)\s+passed(?:,\s*(\d+)\s+total)?`)
 
 	vitestCmdRe    = regexp.MustCompile(`(?i)\bvitest\b`)
 	vitestResultRe = regexp.MustCompile(`(?i)Tests\s+(\d+)\s+passed(?:\s+\|\s+(\d+)\s+failed)?(?:\s+\((\d+)\))?`)
