@@ -5,6 +5,12 @@
   <img src="docs/shtrace-logo.svg" alt="shtrace" width="440">
 </picture>
 
+[![CI](https://github.com/harakeishi/shtrace/actions/workflows/ci.yml/badge.svg)](https://github.com/harakeishi/shtrace/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/harakeishi/shtrace.svg)](https://pkg.go.dev/github.com/harakeishi/shtrace)
+[![Go Report Card](https://goreportcard.com/badge/github.com/harakeishi/shtrace)](https://goreportcard.com/report/github.com/harakeishi/shtrace)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![Go 1.25+](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.25)
+
 > Shell-execution observability for AI-era engineering. Wrap a command, get a
 > searchable, replayable record of what actually happened.
 
