@@ -446,7 +446,8 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 				p.state = oscStateNormal
 			} else {
 				// Not ST — treat the ESC as a literal inside the OSC payload.
-				if len(p.oscBuf) < maxOSCBuf {
+				// Guard requires room for two bytes (ESC + b).
+				if len(p.oscBuf)+1 < maxOSCBuf {
 					p.oscBuf = append(p.oscBuf, '\033', b)
 				} else {
 					p.oscOverflow = true
