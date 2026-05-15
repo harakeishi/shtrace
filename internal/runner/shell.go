@@ -145,7 +145,6 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 	// then resets the buffer.
 	flushPending := func() {
 		if writer == nil || len(pending) == 0 {
-			pending = pending[:0]
 			return
 		}
 		masked, _ := opt.Masker.MaskString(string(pending))
@@ -216,7 +215,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 							endSpan(-1, true)
 						}
 						if opt.Span.Begin != nil {
-							w, berr := opt.Span.Begin(arg)
+							w, berr := opt.Span.Begin(stripOSCUnsafe(arg))
 							if berr != nil {
 								if opt.Stderr != nil {
 									_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
@@ -295,7 +294,11 @@ fi
 __shtrace_debug_hook() {
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
-    printf '\033]133;B;%s\007' "$BASH_COMMAND"
+    # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
+    # the OSC sequence in the PTY stream.
+    local __cmd="${BASH_COMMAND//$'\a'/}"
+    __cmd="${__cmd//$'\e'/}"
+    printf '\033]133;B;%s\007' "$__cmd"
     [ -n "$__shtrace_prev_debug" ] && eval "$__shtrace_prev_debug"
 }
 trap '__shtrace_debug_hook' DEBUG
@@ -324,7 +327,13 @@ const zshRC = `# shtrace: source user rc (skip if ZDOTDIR was already our dir)
 # preexec/precmd hooks (e.g. from powerlevel10k, zsh-syntax-highlighting)
 # are not overwritten.
 autoload -Uz add-zsh-hook
-__shtrace_preexec() { printf '\033]133;B;%s\007' "$1" }
+__shtrace_preexec() {
+    # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
+    # the OSC sequence in the PTY stream.
+    local __cmd="${1//$'\a'/}"
+    __cmd="${__cmd//$'\e'/}"
+    printf '\033]133;B;%s\007' "$__cmd"
+}
 __shtrace_precmd()  { printf '\033]133;D;%d\007' "$?" }
 add-zsh-hook preexec __shtrace_preexec
 add-zsh-hook precmd  __shtrace_precmd
@@ -454,6 +463,19 @@ func parseOSC133(payload string) (kind, arg string, ok bool) {
 		kind = rest
 	}
 	return kind, arg, true
+}
+
+// stripOSCUnsafe removes bytes that would corrupt an OSC payload: BEL (0x07)
+// terminates the sequence and ESC (0x1b) may start the ST terminator (ESC \).
+// This is a defence-in-depth measure; the shell hooks strip these chars too.
+func stripOSCUnsafe(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\007' && s[i] != '\033' {
+			out = append(out, s[i])
+		}
+	}
+	return string(out)
 }
 
 func isExitError(err error, out **exec.ExitError) bool {

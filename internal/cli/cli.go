@@ -1028,7 +1028,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		curCommand = ""
 
 		// Parse the command text into argv; fall back to shell name if empty.
-		cmdArgv := strings.Fields(cmdText)
+		cmdArgv := masker.MaskArgv(strings.Fields(cmdText))
 		cmdName := shell
 		if len(cmdArgv) > 0 {
 			cmdName = cmdArgv[0]
@@ -1046,7 +1046,9 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			SessionID: sessCtx.SessionID,
 			Command:   cmdName,
 			Argv:      cmdArgv,
-			Cwd:       "",
+			// Cwd is intentionally empty: the user may cd freely during an
+			// interactive shell session, so the initial cwd would be wrong.
+			Cwd: "",
 			Mode:      "pty",
 			StartedAt: startedAt,
 			EndedAt:   endedAt,

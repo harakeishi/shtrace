@@ -1,7 +1,7 @@
 package runner
 
 import (
-	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/harakeishi/shtrace/internal/secret"
@@ -241,18 +241,17 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 	// Simulate a PTY stream: prompt, B marker with command, output, D marker.
 	stream := []byte("$ \033]133;B;echo hello\007hello\n\033]133;D;0\007$ ")
 
-	var gotCommand string
-	var gotExitCode int
-	var spans []struct{ cmd string; exit int }
+	type spanRecord struct{ cmd string; exit int }
+	var spans []spanRecord
+	var lastCmd string
 
 	span := ShellSpan{
 		Begin: func(command string) (ChunkWriter, error) {
-			gotCommand = command
+			lastCmd = command
 			return &discardWriter{}, nil
 		},
 		End: func(exitCode int) error {
-			gotExitCode = exitCode
-			spans = append(spans, struct{ cmd string; exit int }{gotCommand, exitCode})
+			spans = append(spans, spanRecord{lastCmd, exitCode})
 			return nil
 		},
 	}
@@ -269,7 +268,6 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 	if spans[0].exit != 0 {
 		t.Errorf("span exit = %d, want 0", spans[0].exit)
 	}
-	_ = gotExitCode
 }
 
 // newTestMasker returns a no-op Masker suitable for tests.
@@ -327,10 +325,8 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 				}
 			case "D":
 				if spanEnd != nil {
-					code := 0
-					if n, err2 := fmt.Sscanf(arg, "%d", &code); n != 1 || err2 != nil {
-						code = -1
-					}
+					// Match production: strconv.Atoi returns 0 on parse failure.
+					code, _ := strconv.Atoi(arg)
 					endSpan(code)
 				}
 			}
