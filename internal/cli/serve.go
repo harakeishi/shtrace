@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -63,7 +63,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 
-	store, err := storage.Open(dataDir + "/sessions.db")
+	store, err := storage.Open(filepath.Join(dataDir, "sessions.db"))
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
 		return 1
@@ -106,16 +106,22 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	mux.HandleFunc("/", makeUIHandler())
 
 	srv := &http.Server{
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	_, _ = fmt.Fprintf(stdout, "shtrace serve: listening on http://%s  (Ctrl-C to stop)\n", addr)
 
 	go func() {
 		<-ctx.Done()
-		_ = srv.Close()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: serve shutdown: %v\n", err)
+		}
 	}()
 
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -168,7 +174,7 @@ func makeSessionsHandler(ctx context.Context, store *storage.Store) http.Handler
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		sessions, err := store.ListSessions(ctx, math.MaxInt32, nil)
+		sessions, err := store.ListSessions(ctx, 500, nil)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -198,8 +204,11 @@ func makeSpansHandler(ctx context.Context, store *storage.Store) http.HandlerFun
 		}
 		// path: /api/sessions/{id}/spans
 		path := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-		path = strings.TrimSuffix(path, "/spans")
-		sessionID := path
+		if !strings.HasSuffix(path, "/spans") {
+			http.NotFound(w, r)
+			return
+		}
+		sessionID := strings.TrimSuffix(path, "/spans")
 		if sessionID == "" || strings.Contains(sessionID, "/") {
 			http.Error(w, "invalid session id", http.StatusBadRequest)
 			return
@@ -273,17 +282,22 @@ func makeOutputHandler(_ context.Context, store *storage.Store, dataDir string) 
 
 		// Decode JSON Lines and return plain text.
 		var sb strings.Builder
+		corrupt := 0
 		for _, line := range splitLines(b) {
 			if len(line) == 0 {
 				continue
 			}
 			var c storage.Chunk
 			if err := json.Unmarshal(line, &c); err != nil {
+				corrupt++
 				continue
 			}
 			sb.WriteString(c.Data)
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if corrupt > 0 {
+			w.Header().Set("X-Shtrace-Corrupt-Lines", strconv.Itoa(corrupt))
+		}
 		_, _ = io.WriteString(w, sb.String())
 	}
 }
@@ -305,7 +319,7 @@ func makeSearchHandler(ctx context.Context, fts *storage.FTSStore) http.HandlerF
 		}
 		results, err := fts.Search(ctx, q, 50)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("search error: %v", err), http.StatusInternalServerError)
+			http.Error(w, "search error", http.StatusInternalServerError)
 			return
 		}
 		out := make([]apiSearchResult, 0, len(results))

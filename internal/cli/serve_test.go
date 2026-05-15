@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +15,11 @@ import (
 	"github.com/harakeishi/shtrace/internal/storage"
 )
 
-// openTestStore sets up an in-memory-like store in a temp dir and migrates it.
+// openTestStore sets up a store in a temp dir and migrates it.
 func openTestStore(t *testing.T) (*storage.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	store, err := storage.Open(dir + "/sessions.db")
+	store, err := storage.Open(filepath.Join(dir, "sessions.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -29,16 +30,51 @@ func openTestStore(t *testing.T) (*storage.Store, string) {
 	return store, dir
 }
 
+// insertTestSession inserts a session and fails the test on error.
+func insertTestSession(t *testing.T, store *storage.Store, id string) {
+	t.Helper()
+	if err := store.InsertSession(context.Background(), storage.Session{
+		ID:        id,
+		StartedAt: time.Now().UTC(),
+		Tags:      map[string]string{},
+	}); err != nil {
+		t.Fatalf("insert session %q: %v", id, err)
+	}
+}
+
+// insertTestSpan inserts a span and fails the test on error.
+func insertTestSpan(t *testing.T, store *storage.Store, sessID, spanID, cmd string) {
+	t.Helper()
+	exitCode := 0
+	if err := store.InsertSpan(context.Background(), storage.Span{
+		ID:        spanID,
+		SessionID: sessID,
+		Command:   cmd,
+		Argv:      []string{cmd},
+		Mode:      "pipe",
+		StartedAt: time.Now().UTC(),
+		EndedAt:   time.Now().UTC().Add(time.Second),
+		ExitCode:  &exitCode,
+	}); err != nil {
+		t.Fatalf("insert span %q: %v", spanID, err)
+	}
+}
+
+// ---- parseServeArgs ----
+
 func TestParseServeArgs(t *testing.T) {
 	cases := []struct {
-		args    []string
+		args     []string
 		wantPort int
 		wantErr  bool
 	}{
 		{nil, defaultServePort, false},
 		{[]string{"--port", "8080"}, 8080, false},
 		{[]string{"--port=9090"}, 9090, false},
+		{[]string{"--port", "1"}, 1, false},
+		{[]string{"--port", "65535"}, 65535, false},
 		{[]string{"--port", "0"}, 0, true},
+		{[]string{"--port", "65536"}, 0, true},
 		{[]string{"--port", "99999"}, 0, true},
 		{[]string{"--port"}, 0, true},
 		{[]string{"--unknown"}, 0, true},
@@ -61,14 +97,15 @@ func TestParseServeArgs(t *testing.T) {
 	}
 }
 
-func TestSessionsHandler(t *testing.T) {
+// ---- /api/sessions ----
+
+func TestSessionsHandler_OK(t *testing.T) {
 	ctx := context.Background()
 	store, _ := openTestStore(t)
 
-	now := time.Now().UTC()
 	if err := store.InsertSession(ctx, storage.Session{
 		ID:        "sess-abc",
-		StartedAt: now,
+		StartedAt: time.Now().UTC(),
 		Tags:      map[string]string{"pr": "42"},
 	}); err != nil {
 		t.Fatalf("insert session: %v", err)
@@ -96,23 +133,37 @@ func TestSessionsHandler(t *testing.T) {
 	}
 }
 
-func TestSpansHandler(t *testing.T) {
+func TestSessionsHandler_MethodNotAllowed(t *testing.T) {
+	h := makeSessionsHandler(context.Background(), nil)
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(method, "/api/sessions", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("method %s: status %d, want 405", method, rec.Code)
+		}
+	}
+}
+
+// ---- /api/sessions/{id}/spans ----
+
+func TestSpansHandler_OK(t *testing.T) {
 	ctx := context.Background()
 	store, _ := openTestStore(t)
 
-	now := time.Now().UTC()
-	_ = store.InsertSession(ctx, storage.Session{ID: "sess-1", StartedAt: now, Tags: map[string]string{}})
+	insertTestSession(t, store, "sess-1")
 	exitCode := 0
-	_ = store.InsertSpan(ctx, storage.Span{
+	if err := store.InsertSpan(ctx, storage.Span{
 		ID:        "span-1",
 		SessionID: "sess-1",
 		Command:   "echo",
 		Argv:      []string{"echo", "hi"},
 		Mode:      "pipe",
-		StartedAt: now,
-		EndedAt:   now.Add(time.Second),
+		StartedAt: time.Now().UTC(),
+		EndedAt:   time.Now().UTC().Add(time.Second),
 		ExitCode:  &exitCode,
-	})
+	}); err != nil {
+		t.Fatalf("insert span: %v", err)
+	}
 
 	h := makeSpansHandler(ctx, store)
 	rec := httptest.NewRecorder()
@@ -141,17 +192,36 @@ func TestSpansHandler_BadPath(t *testing.T) {
 	store, _ := openTestStore(t)
 	h := makeSpansHandler(ctx, store)
 
-	for _, path := range []string{"/api/sessions//spans", "/api/sessions/a/b/spans"} {
+	cases := []struct {
+		path     string
+		wantCode int
+	}{
+		{"/api/sessions//spans", http.StatusBadRequest},
+		{"/api/sessions/a/b/spans", http.StatusBadRequest},
+		{"/api/sessions/foo", http.StatusNotFound},         // missing /spans suffix
+		{"/api/sessions/foo/spans/extra", http.StatusNotFound}, // extra segment
+	}
+	for _, tc := range cases {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		h(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("path %q: status %d, want 400", path, rec.Code)
+		h(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != tc.wantCode {
+			t.Errorf("path %q: status %d, want %d", tc.path, rec.Code, tc.wantCode)
 		}
 	}
 }
 
-func TestSearchHandler_NoFTS(t *testing.T) {
+func TestSpansHandler_MethodNotAllowed(t *testing.T) {
+	h := makeSpansHandler(context.Background(), nil)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/api/sessions/x/spans", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status %d, want 405", rec.Code)
+	}
+}
+
+// ---- /api/search ----
+
+func TestSearchHandler_NoFTS_WithQuery(t *testing.T) {
 	h := makeSearchHandler(context.Background(), nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=hello", nil))
@@ -160,26 +230,28 @@ func TestSearchHandler_NoFTS(t *testing.T) {
 	}
 }
 
-func TestSearchHandler_EmptyQuery(t *testing.T) {
-	h := makeSearchHandler(context.Background(), nil) // fts nil but q empty returns [] before checking fts
-	// With nil fts and empty q the handler returns [] early.
+func TestSearchHandler_NoFTS_EmptyQuery(t *testing.T) {
+	// fts==nil check runs before q check, so empty query also returns 503.
+	h := makeSearchHandler(context.Background(), nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/search", nil))
-	// empty q with nil fts: returns 503 because fts==nil check happens before q check
-	// Actually in the implementation: fts nil -> 503, so let's check 503
 	if rec.Code != http.StatusServiceUnavailable {
-		// This is fine — empty query skips search, returns [].
-		// Accept both 200 with [] and 503.
-		if rec.Code == http.StatusOK {
-			body := strings.TrimSpace(rec.Body.String())
-			if body != "[]" {
-				t.Errorf("body=%q, want []", body)
-			}
-		}
+		t.Fatalf("status %d, want 503 (fts nil takes precedence over empty query)", rec.Code)
 	}
 }
 
-func TestUIHandler(t *testing.T) {
+func TestSearchHandler_MethodNotAllowed(t *testing.T) {
+	h := makeSearchHandler(context.Background(), nil)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/api/search", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status %d, want 405", rec.Code)
+	}
+}
+
+// ---- / (UI) ----
+
+func TestUIHandler_OK(t *testing.T) {
 	h := makeUIHandler()
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -208,11 +280,12 @@ func TestUIHandler_NotFound(t *testing.T) {
 	}
 }
 
+// ---- /api/output/{sessID}/{spanID} ----
+
 func TestOutputHandler_SpanNotFound(t *testing.T) {
 	ctx := context.Background()
 	store, dataDir := openTestStore(t)
-	now := time.Now().UTC()
-	_ = store.InsertSession(ctx, storage.Session{ID: "s1", StartedAt: now, Tags: map[string]string{}})
+	insertTestSession(t, store, "s1")
 
 	h := makeOutputHandler(ctx, store, dataDir)
 	rec := httptest.NewRecorder()
@@ -240,27 +313,15 @@ func TestOutputHandler_ReadsLog(t *testing.T) {
 	ctx := context.Background()
 	store, dataDir := openTestStore(t)
 
-	now := time.Now().UTC()
-	_ = store.InsertSession(ctx, storage.Session{ID: "sess-out", StartedAt: now, Tags: map[string]string{}})
-	exitCode := 0
-	_ = store.InsertSpan(ctx, storage.Span{
-		ID:        "span-out",
-		SessionID: "sess-out",
-		Command:   "echo",
-		Argv:      []string{"echo"},
-		Mode:      "pipe",
-		StartedAt: now,
-		EndedAt:   now.Add(time.Second),
-		ExitCode:  &exitCode,
-	})
+	insertTestSession(t, store, "sess-out")
+	insertTestSpan(t, store, "sess-out", "span-out", "echo")
 
-	// Write a minimal JSONL log file.
 	logPath := storage.OutputPath(dataDir, "sess-out", "span-out")
-	if err := mkdirForPath(logPath); err != nil {
+	if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	chunk := `{"stream":"stdout","data":"hello world\n"}` + "\n"
-	if err := writeFile(logPath, chunk); err != nil {
+	if err := os.WriteFile(logPath, []byte(chunk), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
 
@@ -276,11 +337,62 @@ func TestOutputHandler_ReadsLog(t *testing.T) {
 	}
 }
 
-// mkdirForPath creates parent directories for the given file path.
-func mkdirForPath(path string) error {
-	return os.MkdirAll(parentDir(path), 0o755)
+func TestOutputHandler_CorruptLines(t *testing.T) {
+	ctx := context.Background()
+	store, dataDir := openTestStore(t)
+
+	insertTestSession(t, store, "sess-c")
+	insertTestSpan(t, store, "sess-c", "span-c", "echo")
+
+	logPath := storage.OutputPath(dataDir, "sess-c", "span-c")
+	if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// One valid line, one corrupt line.
+	content := `{"stream":"stdout","data":"ok\n"}` + "\n" + `not json` + "\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	h := makeOutputHandler(ctx, store, dataDir)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-c/span-c", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("X-Shtrace-Corrupt-Lines") != "1" {
+		t.Errorf("X-Shtrace-Corrupt-Lines=%q, want 1", rec.Header().Get("X-Shtrace-Corrupt-Lines"))
+	}
 }
 
-func writeFile(path, content string) error {
-	return os.WriteFile(path, []byte(content), 0o644)
+func TestOutputHandler_MethodNotAllowed(t *testing.T) {
+	ctx := context.Background()
+	store, dataDir := openTestStore(t)
+	h := makeOutputHandler(ctx, store, dataDir)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodPost, "/api/output/s/sp", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status %d, want 405", rec.Code)
+	}
+}
+
+func TestOutputHandler_PathTraversal(t *testing.T) {
+	ctx := context.Background()
+	store, dataDir := openTestStore(t)
+	insertTestSession(t, store, "sess-t")
+
+	h := makeOutputHandler(ctx, store, dataDir)
+
+	// IDs containing path traversal sequences must not be served — they will
+	// fail the span-exists check in the DB and return 404.
+	for _, path := range []string{
+		"/api/output/sess-t/../etc/passwd",
+		"/api/output/../sess-t/span-id",
+	} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("path %q: got 200, expected non-200 (path traversal must be rejected)", path)
+		}
+	}
 }
