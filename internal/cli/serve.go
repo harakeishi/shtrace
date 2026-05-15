@@ -458,7 +458,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"  document.getElementById('searchbox').value='';\n" +
 	"  var content=document.getElementById('content');\n" +
 	"  content.innerHTML='<div id=\"loading\">Loading...</div>';\n" +
-	"  fetch('/api/sessions/'+id+'/spans').then(function(r){return r.json();}).then(function(spans){\n" +
+	"  fetch('/api/sessions/'+encodeURIComponent(id)+'/spans').then(function(r){return r.json();}).then(function(spans){\n" +
 	"    if(!spans.length){content.innerHTML='<div id=\"empty\">No spans in this session.</div>';return;}\n" +
 	"    content.innerHTML='<h3>Spans ('+spans.length+')</h3>';\n" +
 	"    spans.forEach(function(sp){\n" +
@@ -482,7 +482,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"          if(outEl.classList.contains('open')&&!loaded){\n" +
 	"            loaded=true;\n" +
 	"            outEl.textContent='Loading...';\n" +
-	"            fetch('/api/output/'+sessID+'/'+spanID)\n" +
+	"            fetch('/api/output/'+encodeURIComponent(sessID)+'/'+encodeURIComponent(spanID))\n" +
 	"              .then(function(res){return res.text();})\n" +
 	"              .then(function(txt){outEl.textContent=txt;})\n" +
 	"              .catch(function(e){outEl.textContent='Error: '+e;});\n" +
