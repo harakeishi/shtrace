@@ -157,6 +157,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 	// ended without a D marker (abnormal path).
 	endSpan := func(code int, implicit bool) {
 		flushPending()
+		pending = nil // release backing array so it is not held for the session lifetime
 		if spanEnd != nil {
 			label := "shtrace: span end"
 			if implicit {
@@ -283,8 +284,10 @@ __shtrace_cmd_fired=0
 
 # Preserve any DEBUG trap the user's rc installed so we can chain it.
 # trap -p prints: trap -- 'BODY' DEBUG  — extract the body with sed.
-# This works for most real-world trap bodies; it may misparse bodies that
-# contain literal escaped single-quotes (rare in practice).
+# This works for most real-world single-line trap bodies. Known limitations:
+# bodies with literal escaped single-quotes or embedded newlines (multi-line
+# trap bodies) are not handled — sed is line-by-line so the extracted body
+# will be garbled and the chained trap silently skipped on eval.
 __shtrace_prev_debug=''
 if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out" ]; then
     __shtrace_prev_debug=$(printf '%s' "$__shtrace_trap_out" | \
@@ -309,6 +312,8 @@ __shtrace_precmd() {
         __shtrace_cmd_fired=0
         printf '\033]133;D;%d\007' "$rc"
     fi
+    # Restore $? so subsequent PROMPT_COMMAND entries see the real exit code.
+    return "$rc"
 }
 if [ -n "$PROMPT_COMMAND" ]; then
     PROMPT_COMMAND="__shtrace_precmd; $PROMPT_COMMAND"

@@ -194,6 +194,33 @@ func TestOSCParser_OscBufOverflow(t *testing.T) {
 	}
 }
 
+// TestStripOSCUnsafe verifies that BEL and ESC are removed and all other bytes
+// (including valid UTF-8 multibyte sequences) are preserved unchanged.
+func TestStripOSCUnsafe(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"normal", "normal"},
+		{"\007", ""},
+		{"\033", ""},
+		{"before\007after", "beforeafter"},
+		{"before\033after", "beforeafter"},
+		{"a\007\033b", "ab"},
+		{"\007\033", ""},
+		// multibyte UTF-8 must pass through unmodified (BEL/ESC are < 0x80)
+		{"こんにちは", "こんにちは"},
+		{"cmd\007arg", "cmdarg"},
+	}
+	for _, c := range cases {
+		got := stripOSCUnsafe(c.in)
+		if got != c.want {
+			t.Errorf("stripOSCUnsafe(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestParseOSC133_B verifies B marker parsing without command text.
 func TestParseOSC133_B(t *testing.T) {
 	kind, arg, ok := parseOSC133("133;B")
@@ -243,15 +270,20 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 
 	type spanRecord struct{ cmd string; exit int }
 	var spans []spanRecord
-	var lastCmd string
+	// pendingCmd holds the command from the most recent Begin call. It is safe
+	// to share because shell commands are strictly sequential: End is always
+	// called (implicitly via B or explicitly via D) before the next Begin fires.
+	var pendingCmd string
 
 	span := ShellSpan{
 		Begin: func(command string) (ChunkWriter, error) {
-			lastCmd = command
+			pendingCmd = command
 			return &discardWriter{}, nil
 		},
 		End: func(exitCode int) error {
-			spans = append(spans, spanRecord{lastCmd, exitCode})
+			cmd := pendingCmd // consume once per span
+			pendingCmd = ""
+			spans = append(spans, spanRecord{cmd, exitCode})
 			return nil
 		},
 	}
@@ -317,7 +349,7 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 					endSpan(-1)
 				}
 				if span.Begin != nil {
-					w, err := span.Begin(arg)
+					w, err := span.Begin(stripOSCUnsafe(arg))
 					if err == nil {
 						writer = w
 						spanEnd = span.End
