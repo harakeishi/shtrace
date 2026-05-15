@@ -194,6 +194,36 @@ func TestOSCParser_OscBufOverflow(t *testing.T) {
 	}
 }
 
+// TestOSCParser_OscBufOverflowWithPrecedingBytes verifies that bytes appearing
+// before an overflowed OSC sequence are emitted in stream order (not merged
+// with bytes that come after the sequence).
+func TestOSCParser_OscBufOverflowWithPrecedingBytes(t *testing.T) {
+	p := &oscParser{}
+	big := make([]byte, maxOSCBuf+10)
+	for i := range big {
+		big[i] = 'x'
+	}
+	// "before" bytes, then an oversized OSC, then "after" bytes.
+	input := []byte("before")
+	input = append(input, '\033', ']')
+	input = append(input, big...)
+	input = append(input, '\007')
+	input = append(input, []byte("after")...)
+
+	events := p.Feed(input)
+	// Expect: Bytes("before"), [overflow discarded], Bytes("after")
+	// "before" must appear as its own event, not merged with "after".
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2; events = %v", len(events), events)
+	}
+	if string(events[0].Bytes) != "before" {
+		t.Errorf("events[0].Bytes = %q, want %q", events[0].Bytes, "before")
+	}
+	if string(events[1].Bytes) != "after" {
+		t.Errorf("events[1].Bytes = %q, want %q", events[1].Bytes, "after")
+	}
+}
+
 // TestStripOSCUnsafe verifies that BEL and ESC are removed and all other bytes
 // (including valid UTF-8 multibyte sequences) are preserved unchanged.
 func TestStripOSCUnsafe(t *testing.T) {

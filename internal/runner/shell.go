@@ -430,8 +430,10 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 	}
 
 	emitSeq := func() {
+		// Always flush preceding clean bytes so they appear in stream order
+		// before (or instead of) the OSC event, even on overflow.
+		flushCur()
 		if !p.oscOverflow {
-			flushCur()
 			events = append(events, parserEvent{Seq: string(p.oscBuf)})
 		}
 		p.oscBuf = p.oscBuf[:0]
