@@ -233,7 +233,7 @@ func makeSpansHandler(store *storage.Store) http.HandlerFunc {
 			return
 		}
 		sessionID := strings.TrimSuffix(path, "/spans")
-		if sessionID == "" || strings.Contains(sessionID, "/") {
+		if sessionID == "" || strings.Contains(sessionID, "/") || strings.Contains(sessionID, "..") {
 			http.Error(w, "invalid session id", http.StatusBadRequest)
 			return
 		}
@@ -354,6 +354,7 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 			sb.WriteString(c.Data)
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if corrupt > 0 {
 			w.Header().Set("X-Shtrace-Corrupt-Lines", strconv.Itoa(corrupt))
 		}
@@ -398,6 +399,10 @@ func makeSearchHandler(fts *storage.FTSStore) http.HandlerFunc {
 
 func makeUIHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return

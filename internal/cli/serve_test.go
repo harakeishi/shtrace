@@ -240,6 +240,16 @@ func TestSpansHandler_BadPath(t *testing.T) {
 	}
 }
 
+func TestSpansHandler_DotDotSessionID(t *testing.T) {
+	store, _ := openTestStore(t)
+	h := makeSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions/../spans", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status %d, want 400 for .. in session ID", rec.Code)
+	}
+}
+
 func TestSpansHandler_SessionNotFound(t *testing.T) {
 	store, _ := openTestStore(t)
 	h := makeSpansHandler(store)
@@ -309,9 +319,9 @@ func TestUIHandler_OK(t *testing.T) {
 	if !strings.Contains(body, "loadSessions") {
 		t.Error("response does not contain JS entry point")
 	}
-	csp := rec.Header().Get("Content-Security-Policy")
-	if csp == "" {
-		t.Error("Content-Security-Policy header missing from UI response")
+	const wantCSP = "default-src 'self'; script-src 'unsafe-inline'"
+	if got := rec.Header().Get("Content-Security-Policy"); got != wantCSP {
+		t.Errorf("Content-Security-Policy=%q, want %q", got, wantCSP)
 	}
 }
 
@@ -321,6 +331,17 @@ func TestUIHandler_NotFound(t *testing.T) {
 	h(rec, httptest.NewRequest(http.MethodGet, "/unknown", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status %d, want 404", rec.Code)
+	}
+}
+
+func TestUIHandler_MethodNotAllowed(t *testing.T) {
+	h := makeUIHandler()
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(method, "/", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("method %s: status %d, want 405", method, rec.Code)
+		}
 	}
 }
 
