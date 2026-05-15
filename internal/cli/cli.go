@@ -29,7 +29,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell, diff")
 		return 2
 	}
 
@@ -43,7 +43,7 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell, diff")
 		return 2
 	}
 
@@ -72,6 +72,8 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runExport(ctx, argv[2:], stdout, stderr)
 	case "import":
 		return runImport(ctx, argv[2:], stdout, stderr)
+	case "diff":
+		return runDiff(ctx, argv[2:], stdout, stderr)
 	case "pr-comment":
 		return runPRComment(ctx, argv[2:], stdout, stderr)
 	case "--":
