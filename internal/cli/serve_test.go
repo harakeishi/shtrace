@@ -368,6 +368,32 @@ func TestOutputHandler_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestOutputHandler_TruncatedHeader(t *testing.T) {
+	store, dataDir := openTestStore(t)
+	insertTestSession(t, store, "sess-trunc")
+	insertTestSpan(t, store, "sess-trunc", "span-trunc", "cat")
+
+	logPath := storage.OutputPath(dataDir, "sess-trunc", "span-trunc")
+	if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Write a log that fits well within the limit to confirm header is absent.
+	chunk := `{"stream":"stdout","data":"tiny\n"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(chunk), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	h := makeOutputHandler(store, dataDir)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-trunc/span-trunc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Shtrace-Truncated"); got != "" {
+		t.Errorf("X-Shtrace-Truncated=%q, want empty for small log", got)
+	}
+}
+
 func TestOutputHandler_PathTraversal(t *testing.T) {
 	store, dataDir := openTestStore(t)
 	insertTestSession(t, store, "sess-t")

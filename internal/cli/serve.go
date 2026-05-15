@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -251,20 +252,15 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 		}
 		sessionID, spanID := parts[0], parts[1]
 
-		// Validate the span exists to prevent path traversal via constructed IDs.
-		spans, err := store.SpansForSession(r.Context(), sessionID, nil)
+		// Validate the span belongs to the session before serving the file.
+		// Uses an indexed single-row lookup to prevent path traversal via
+		// crafted IDs without loading all spans into memory.
+		ok, err := store.SpanExists(r.Context(), sessionID, spanID)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
 		}
-		found := false
-		for _, sp := range spans {
-			if sp.ID == spanID {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !ok {
 			http.Error(w, "span not found", http.StatusNotFound)
 			return
 		}
@@ -289,7 +285,14 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 		}
 		truncated := len(b) > maxLogBytes
 		if truncated {
-			b = b[:maxLogBytes]
+			// Trim to the last complete newline so we never feed a
+			// half-written JSON line to the decoder, which would
+			// incorrectly increment the corrupt counter.
+			if nl := bytes.LastIndexByte(b[:maxLogBytes], '\n'); nl >= 0 {
+				b = b[:nl+1]
+			} else {
+				b = b[:maxLogBytes]
+			}
 		}
 
 		// Decode JSON Lines and return plain text.
@@ -504,7 +507,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"    results.forEach(function(res){\n" +
 	"      var d=document.createElement('div');\n" +
 	"      d.className='search-result';\n" +
-	"      var snippet=esc(res.snippet).replace(/\\[/g,'<span style=\"color:#f0c040;font-weight:bold\">').replace(/\\]/g,'</span>');\n" +
+	"      var snippet=esc(res.snippet).replace(/\\[([^\\]]*?)\\]/g,'<span style=\"color:#f0c040;font-weight:bold\">$1</span>');\n" +
 	"      d.innerHTML='<div class=\"sr-ids\">session '+esc(res.session_id)+' / span '+esc(res.span_id)+'</div><div class=\"sr-snippet\">'+snippet+'</div>';\n" +
 	"      d.style.cursor='pointer';\n" +
 	"      d.onclick=(function(sessID){\n" +
