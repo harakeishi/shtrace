@@ -287,7 +287,10 @@ const bashRC = `# shtrace: source user rc
 
 # shtrace span boundary detection via OSC 133 markers.
 # __shtrace_cmd_fired prevents duplicate B markers for compound commands.
+# __shtrace_in_prompt blocks the DEBUG trap from firing B markers for commands
+# that run as part of PROMPT_COMMAND (e.g. the user's existing prompt hooks).
 __shtrace_cmd_fired=0
+__shtrace_in_prompt=0
 
 # Preserve any DEBUG trap the user's rc installed so we can chain it.
 # trap -p prints: trap -- 'BODY' DEBUG  — extract the body with sed.
@@ -302,6 +305,11 @@ if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out"
 fi
 
 __shtrace_debug_hook() {
+    # The first DEBUG trigger after PROMPT_COMMAND is the user's next real
+    # command: clear the in_prompt sentinel and fall through to emit B.
+    if [ "$__shtrace_in_prompt" = "1" ]; then
+        __shtrace_in_prompt=0
+    fi
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
     # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
@@ -315,6 +323,9 @@ trap '__shtrace_debug_hook' DEBUG
 
 __shtrace_precmd() {
     local rc=$?
+    # Set in_prompt before emitting D so the DEBUG trap does not fire a
+    # spurious B marker for any subsequent commands in PROMPT_COMMAND.
+    __shtrace_in_prompt=1
     if [ "$__shtrace_cmd_fired" = "1" ]; then
         __shtrace_cmd_fired=0
         printf '\033]133;D;%d\007' "$rc"
@@ -335,9 +346,10 @@ const zshRC = `# shtrace: source user rc (skip if ZDOTDIR was already our dir)
 [ -f "$HOME/.zshrc" ] && [ "$HOME/.zshrc" != "$ZDOTDIR/.zshrc" ] && . "$HOME/.zshrc"
 
 # shtrace span boundary detection via OSC 133 markers.
-# add-zsh-hook is used instead of direct assignment so existing
-# preexec/precmd hooks (e.g. from powerlevel10k, zsh-syntax-highlighting)
-# are not overwritten.
+# preexec is appended (add-zsh-hook) — it only needs to run once before the
+# command starts, so order relative to other hooks does not matter.
+# precmd is PREPENDED so it captures $? before any other precmd hook can
+# clobber it (other hooks, e.g. powerlevel10k, reset $? to their own exit).
 autoload -Uz add-zsh-hook
 __shtrace_preexec() {
     # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
@@ -346,9 +358,10 @@ __shtrace_preexec() {
     __cmd="${__cmd//$'\e'/}"
     printf '\033]133;B;%s\007' "$__cmd"
 }
-__shtrace_precmd()  { local rc=$?; printf '\033]133;D;%d\007' "$rc" }
+__shtrace_precmd() { local rc=$?; printf '\033]133;D;%d\007' "$rc" }
 add-zsh-hook preexec __shtrace_preexec
-add-zsh-hook precmd  __shtrace_precmd
+# Prepend to precmd_functions so we read $? before other hooks run.
+precmd_functions=(__shtrace_precmd "${precmd_functions[@]}")
 `
 
 // maxOSCBuf is the upper bound on the number of bytes accumulated in oscBuf.

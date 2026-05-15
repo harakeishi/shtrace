@@ -390,4 +390,9 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 		}
 		writeCleaned(ev.Bytes)
 	}
+	// If the input ended with an open span (B but no D), close it implicitly
+	// so End is always called — mirroring the post-RunShell cleanup in cli.go.
+	if spanEnd != nil {
+		endSpan(-1)
+	}
 }
