@@ -14,12 +14,14 @@
 > Shell-execution observability for AI-era engineering. Wrap a command, get a
 > searchable, replayable record of what actually happened.
 
-`shtrace` is a single Go binary that wraps any shell command and records its
-stdout/stderr, exit code, working directory, and timing into a local on-disk
-store. It is built so that humans (and AI agents) can later answer questions
-like "did this test actually run?", "what did `pytest` print on that failed
-CI job?", or "what changed between these two runs?" — without sending data to
-a SaaS.
+`shtrace` is a single Go binary. Run `shtrace shell` to launch a recording
+bash/zsh — every command you type becomes a searchable span. Or wrap an
+individual command with `shtrace -- <cmd>` for one-off / CI use. Either way,
+stdout/stderr, exit code, working directory, and timing are persisted to a
+local on-disk store. It is built so that humans (and AI agents) can later
+answer questions like "did this test actually run?", "what did `pytest`
+print on that failed CI job?", or "what changed between these two runs?" —
+without sending data to a SaaS.
 
 ## Status
 
@@ -68,7 +70,34 @@ The result is a single static binary with no CGo dependency (uses
 
 ## Quickstart
 
-Wrap any command:
+Start a recording shell. Every command you run inside it is recorded as its
+own span, all under one session — no need to prefix each command with
+anything:
+
+```sh
+shtrace shell           # defaults to bash
+shtrace shell bash
+shtrace shell zsh
+```
+
+```text
+shtrace: recording session 019e1cb2-… (type 'exit' to stop)
+$ go test ./...
+$ pytest tests/
+$ sh -c 'echo hello; echo oops >&2; exit 3'
+$ exit
+shtrace: session 019e1cb2-… ended
+```
+
+Each command's stdout, stderr, and exit code pass through unchanged;
+everything is also recorded. Internally `shtrace shell` runs your bash/zsh in
+a PTY with a small rc snippet that injects OSC 133 markers so command
+boundaries can be detected reliably.
+
+### Wrapping a single command (optional)
+
+For one-off recording or CI scripts — where launching an interactive shell
+is not appropriate — wrap an individual command directly:
 
 ```sh
 shtrace -- go test ./...
@@ -77,7 +106,12 @@ shtrace -- sh -c 'echo hello; echo oops >&2; exit 3'
 ```
 
 The wrapped command's stdout, stderr, and exit code pass through unchanged.
-Everything is also recorded.
+Each wrap creates a new session by default; see
+[Automatic session grouping](#automatic-session-grouping-shell-init) below
+if you want consecutive `shtrace --` calls in the same terminal to share one
+session.
+
+### Listing and inspecting sessions
 
 List recent sessions:
 
@@ -206,9 +240,13 @@ shtrace pr-comment --session <id> --pr 42
 
 ## Automatic session grouping (shell-init)
 
-By default each `shtrace` invocation starts a fresh session. To group every
-command you run in a terminal window into **one session** automatically, add
-this line to your `~/.bashrc` or `~/.zshrc`:
+`shell-init` is an alternative for users who prefer to keep using their
+existing shell instead of `shtrace shell`, but still want consecutive
+`shtrace --` invocations in the same terminal to share one session.
+
+By default each `shtrace --` invocation starts a fresh session. To group
+every `shtrace --` call you run in a terminal window into **one session**
+automatically, add this line to your `~/.bashrc` or `~/.zshrc`:
 
 ```sh
 # ~/.bashrc  (or ~/.zshrc)
@@ -306,7 +344,7 @@ design — CI integration should be a single env var, not a checked-in file).
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1. Collector MVP | `shtrace <cmd>`, `ls`, `show`, mode A (PTY) + mode B (pipe), `search` (FTS5), `gc`, secret masking (patterns + entropy), session propagation, SQLite + JSON Lines, `shell-init` | done |
+| 1. Collector MVP | `shtrace <cmd>`, `shtrace shell`, `ls`, `show`, mode A (PTY) + mode B (pipe), `search` (FTS5), `gc`, secret masking (patterns + entropy), session propagation, SQLite + JSON Lines, `shell-init` | done |
 | 2. MCP server | `shtrace mcp` stdio server with `get_session`, `search_commands`, `detect_test_runs`, `compare_runs` | done |
 | 3. PR verification + HTML report | `shtrace report`, `shtrace export/import`, GitHub Actions workflow, `shtrace pr-comment` | done |
 | 4. Web UI | `shtrace serve` with session list, span viewer, full-text search | done |
