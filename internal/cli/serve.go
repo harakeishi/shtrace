@@ -492,7 +492,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"      card.className='span-card';\n" +
 	"      var exitHtml=sp.exit_code==null?'<span class=\"exit-unk\">?</span>':\n" +
 	"        sp.exit_code===0?'<span class=\"exit-ok\">OK</span>':\n" +
-	"        '<span class=\"exit-fail\">exit:'+sp.exit_code+'</span>';\n" +
+	"        '<span class=\"exit-fail\">exit:'+esc(String(sp.exit_code))+'</span>';\n" +
 	"      var dur=durationStr(sp.started_at,sp.ended_at);\n" +
 	"      var hdrHtml='<div class=\"span-header\">';\n" +
 	"      hdrHtml+='<span class=\"span-cmd\">'+esc(sp.argv.join(' '))+'</span>';\n" +

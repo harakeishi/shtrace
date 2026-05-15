@@ -10,8 +10,11 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	code := cli.Run(ctx, os.Args, os.Stdout, os.Stderr)
-	stop()
-	os.Exit(code)
+	defer stop()
+	return cli.Run(ctx, os.Args, os.Stdout, os.Stderr)
 }
