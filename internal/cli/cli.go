@@ -1069,9 +1069,11 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		tty = f
 	}
 
+	// cwd is best-effort: on failure RunShell treats empty Cwd as "inherit"
+	// so the shell starts in the process's current directory.
 	cwd, cwdErr := os.Getwd()
 	if cwdErr != nil {
-		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory (shell will inherit process cwd): %v\n", cwdErr)
 	}
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
 
@@ -1090,15 +1092,15 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		},
 	})
 
-	// Close any span still open (e.g. shell killed mid-command) and insert
-	// the partial span into the DB so it is visible to shtrace show/ls.
-	if curLogFile != nil {
+	// Close any span still open (e.g. shell killed mid-command). spanEnd
+	// handles both the log file and the DB write, so only fall through to
+	// the bare file close when there is no active span ID.
+	if curSpanID != "" {
+		_ = spanEnd(-1)
+	} else if curLogFile != nil {
 		_ = curLogFile.Sync()
 		_ = curLogFile.Close()
 		curLogFile = nil
-	}
-	if curSpanID != "" {
-		_ = spanEnd(-1)
 	}
 
 	// Stamp session end time.

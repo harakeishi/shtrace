@@ -283,7 +283,7 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 		End: func(exitCode int) error {
 			cmd := pendingCmd // consume once per span
 			pendingCmd = ""
-			spans = append(spans, spanRecord{cmd, exitCode})
+			spans = append(spans, spanRecord{cmd: cmd, exit: exitCode})
 			return nil
 		},
 	}
@@ -321,15 +321,17 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 	var pending []byte
 
 	flushPending := func() {
-		if writer != nil && len(pending) > 0 {
-			masked, _ := masker.MaskString(string(pending))
-			_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
+		if writer == nil || len(pending) == 0 {
+			return
 		}
+		masked, _ := masker.MaskString(string(pending))
+		_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
 		pending = pending[:0]
 	}
 
 	endSpan := func(code int) {
 		flushPending()
+		pending = nil // match production: release backing array between spans
 		if spanEnd != nil {
 			_ = spanEnd(code)
 		}
@@ -350,7 +352,7 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 				}
 				if span.Begin != nil {
 					w, err := span.Begin(stripOSCUnsafe(arg))
-					if err == nil {
+					if err == nil && w != nil {
 						writer = w
 						spanEnd = span.End
 					}

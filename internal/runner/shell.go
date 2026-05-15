@@ -221,14 +221,19 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 								if opt.Stderr != nil {
 									_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
 								}
-							} else {
+							} else if w != nil {
+								// Only record a span when Begin returns a real writer.
+								// A nil writer signals the caller wants to suppress this command.
 								writer = w
 								spanEnd = opt.Span.End
 							}
 						}
 					case "D": // command done
 						if spanEnd != nil {
-							code, _ := strconv.Atoi(arg)
+							code, atoiErr := strconv.Atoi(arg)
+							if atoiErr != nil && opt.Stderr != nil {
+								_, _ = fmt.Fprintf(opt.Stderr, "shtrace: malformed D marker arg %q, treating as exit code 0\n", arg)
+							}
 							endSpan(code, false)
 						}
 					}
