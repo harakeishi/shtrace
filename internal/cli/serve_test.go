@@ -400,8 +400,8 @@ func TestOutputHandler_PathTraversal(t *testing.T) {
 
 	h := makeOutputHandler(store, dataDir)
 
-	// IDs containing path traversal sequences must not be served — they will
-	// fail the span-exists check in the DB and return 404.
+	// IDs containing path traversal sequences must not be served.
+	// Paths with "/" in sessionID/spanID segments return 400; others 404.
 	for _, path := range []string{
 		"/api/output/sess-t/../etc/passwd",
 		"/api/output/../sess-t/span-id",
@@ -411,5 +411,34 @@ func TestOutputHandler_PathTraversal(t *testing.T) {
 		if rec.Code == http.StatusOK {
 			t.Errorf("path %q: got 200, expected non-200 (path traversal must be rejected)", path)
 		}
+	}
+}
+
+func TestOutputHandler_SpanIDWithSlash(t *testing.T) {
+	store, dataDir := openTestStore(t)
+	insertTestSession(t, store, "sess-sl")
+
+	h := makeOutputHandler(store, dataDir)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-sl/span-a/extra", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status %d, want 400 for spanID containing slash", rec.Code)
+	}
+}
+
+func TestOutputHandler_CrossSessionSpan(t *testing.T) {
+	store, dataDir := openTestStore(t)
+
+	// span-x belongs to sess-A, not sess-B.
+	insertTestSession(t, store, "sess-A")
+	insertTestSession(t, store, "sess-B")
+	insertTestSpan(t, store, "sess-A", "span-x", "echo")
+
+	h := makeOutputHandler(store, dataDir)
+	rec := httptest.NewRecorder()
+	// Requesting sess-B / span-x must return 404, not serve sess-A's output.
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-B/span-x", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status %d, want 404 for span belonging to a different session", rec.Code)
 	}
 }

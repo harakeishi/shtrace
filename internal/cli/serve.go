@@ -251,6 +251,10 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 			return
 		}
 		sessionID, spanID := parts[0], parts[1]
+		if strings.Contains(sessionID, "/") || strings.Contains(spanID, "/") {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
 
 		// Validate the span belongs to the session before serving the file.
 		// Uses an indexed single-row lookup to prevent path traversal via
