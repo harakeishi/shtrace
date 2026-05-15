@@ -543,3 +543,22 @@ func TestOutputHandler_CrossSessionSpan(t *testing.T) {
 		t.Errorf("status %d, want 404 for span belonging to a different session", rec.Code)
 	}
 }
+
+func TestStripANSI(t *testing.T) {
+	cases := []struct {
+		input, want string
+	}{
+		{"hello world", "hello world"},
+		{"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m", "%"},
+		{"\x1b[0;32mgreen\x1b[0m", "green"},
+		{"\x1b[2J", ""},
+		{"before\x1b[31mred\x1b[0mafter", "beforeredafter"},
+		{"\x1b]0;title\x07text", "text"},
+	}
+	for _, c := range cases {
+		got := stripANSI(c.input)
+		if got != c.want {
+			t.Errorf("stripANSI(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}

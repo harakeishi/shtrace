@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -342,7 +343,7 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 			}
 		}
 
-		// Decode JSON Lines and return plain text.
+		// Decode JSON Lines and return plain text with ANSI escape sequences stripped.
 		var sb strings.Builder
 		corrupt := 0
 		for _, line := range splitLines(b) {
@@ -354,7 +355,7 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 				corrupt++
 				continue
 			}
-			sb.WriteString(c.Data)
+			sb.WriteString(stripANSI(c.Data))
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -399,6 +400,16 @@ func makeSearchHandler(fts *storage.FTSStore) http.HandlerFunc {
 		}
 		writeJSON(w, out)
 	}
+}
+
+// ansiEscapeRe matches ANSI/VT100 escape sequences.
+// Order matters: OSC and CSI must be tried before the single-char fallback
+// so that \x1b] and \x1b[ aren't consumed by the shorter alternative first.
+var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
+
+// stripANSI removes ANSI escape sequences from s.
+func stripANSI(s string) string {
+	return ansiEscapeRe.ReplaceAllString(s, "")
 }
 
 func makeUIHandler() http.HandlerFunc {
