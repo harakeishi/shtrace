@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/harakeishi/shtrace/internal/mcp"
@@ -73,7 +74,7 @@ func runDiff(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	pairs, unmatchedA, unmatchedB := matchSpans(spansA, spansB)
 
 	if jsonOut {
-		return emitDiffJSON(stdout, sessionA, sessionB, runsA, runsB, pairs, unmatchedA, unmatchedB, dataDir)
+		return emitDiffJSON(stdout, stderr, sessionA, sessionB, runsA, runsB, pairs, unmatchedA, unmatchedB, dataDir)
 	}
 	return emitDiffText(stdout, sessionA, sessionB, runsA, runsB, pairs, unmatchedA, unmatchedB, dataDir)
 }
@@ -115,13 +116,18 @@ func matchSpans(spansA, spansB []storage.Span) (pairs []spanPair, unmatchedA, un
 	return
 }
 
-// diffSpanKey returns the first token of argv (the binary name) as the
-// matching key, falling back to Command when argv is empty.
+// diffSpanKey returns the first two argv tokens as the matching key so that
+// "go test" and "go build" are not conflated. Falls back to one token or
+// Command when argv is short or empty.
 func diffSpanKey(sp storage.Span) string {
-	if len(sp.Argv) > 0 {
+	switch len(sp.Argv) {
+	case 0:
+		return sp.Command
+	case 1:
 		return sp.Argv[0]
+	default:
+		return sp.Argv[0] + " " + sp.Argv[1]
 	}
-	return sp.Command
 }
 
 // --- text output ---------------------------------------------------------
@@ -147,13 +153,13 @@ func emitDiffText(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 
 	// Span-level output diff
 	_, _ = fmt.Fprintln(w, "=== span output diff ===")
-	any := false
+	hasDiff := false
 	for _, p := range pairs {
 		diff := spanDiffText(dataDir, p)
 		if diff == "" {
 			continue
 		}
-		any = true
+		hasDiff = true
 		argv := strings.Join(p.a.Argv, " ")
 		if argv == "" {
 			argv = p.a.Command
@@ -169,7 +175,7 @@ func emitDiffText(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 		if argv == "" {
 			argv = sp.Command
 		}
-		any = true
+		hasDiff = true
 		_, _ = fmt.Fprintf(w, "removed: %s  exit=%s\n", argv, exitCodeStr(sp.ExitCode))
 	}
 	for _, sp := range unmatchedB {
@@ -177,11 +183,11 @@ func emitDiffText(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 		if argv == "" {
 			argv = sp.Command
 		}
-		any = true
+		hasDiff = true
 		_, _ = fmt.Fprintf(w, "added:   %s  exit=%s\n", argv, exitCodeStr(sp.ExitCode))
 	}
 
-	if !any {
+	if !hasDiff {
 		_, _ = fmt.Fprintln(w, "no differences")
 	}
 	return 0
@@ -212,7 +218,7 @@ type spanOutputDiff struct {
 	OnlyIn   string `json:"only_in,omitempty"` // "a" or "b" for unmatched spans
 }
 
-func emitDiffJSON(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.TestRun, pairs []spanPair, unmatchedA, unmatchedB []storage.Span, dataDir string) int {
+func emitDiffJSON(w, stderr io.Writer, sessionA, sessionB string, runsA, runsB []mcp.TestRun, pairs []spanPair, unmatchedA, unmatchedB []storage.Span, dataDir string) int {
 	out := diffJSONOutput{
 		SessionA: sessionA,
 		SessionB: sessionB,
@@ -261,7 +267,11 @@ func emitDiffJSON(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 		out.SpanOutputs = []spanOutputDiff{}
 	}
 
-	b, _ := json.MarshalIndent(out, "", "  ")
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: marshal json: %v\n", err)
+		return 1
+	}
 	_, _ = fmt.Fprintln(w, string(b))
 	return 0
 }
@@ -302,6 +312,12 @@ func compareTestRuns(runsA, runsB []mcp.TestRun) []testRunEntry {
 		sb := testStatus(rB)
 		out = append(out, testRunEntry{k.framework, k.command, "absent", sb, "added"})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].framework != out[j].framework {
+			return out[i].framework < out[j].framework
+		}
+		return out[i].command < out[j].command
+	})
 	return out
 }
 
@@ -359,6 +375,10 @@ func readSpanText(dataDir, sessionID, spanID string) string {
 			sb.WriteString(c.Data)
 		}
 	}
+	// sc.Err() is non-nil when a line exceeds the 1 MiB buffer limit or an I/O
+	// error occurs. Return whatever was collected (best-effort); the diff output
+	// will be partial but still useful, and the caller has no warn hook available.
+	_ = sc.Err()
 	return sb.String()
 }
 

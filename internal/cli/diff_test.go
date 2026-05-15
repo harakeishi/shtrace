@@ -1,8 +1,13 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/harakeishi/shtrace/internal/storage"
 )
 
 func TestComputeEdits_NoChange(t *testing.T) {
@@ -96,17 +101,23 @@ func TestSplitToLines_CapsAtMax(t *testing.T) {
 }
 
 func TestMatchSpans_BasicPairing(t *testing.T) {
-	_, _, exit, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "echo a")
-	if exit != 0 {
-		t.Fatal("session A failed")
+	a := makeSpan("s1", "sp1", []string{"go", "test", "./..."})
+	b := makeSpan("s2", "sp2", []string{"go", "test", "./..."})
+	c := makeSpan("s2", "sp3", []string{"go", "build", "./..."})
+
+	pairs, unmatchedA, unmatchedB := matchSpans([]storage.Span{a}, []storage.Span{b, c})
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair, got %d", len(pairs))
 	}
-	_, _, exitB, dataDirB := runHarness(t, "shtrace", "--", "sh", "-c", "echo b")
-	if exitB != 0 {
-		t.Fatal("session B failed")
+	if pairs[0].a.ID != "sp1" || pairs[0].b.ID != "sp2" {
+		t.Fatalf("unexpected pair: a=%s b=%s", pairs[0].a.ID, pairs[0].b.ID)
 	}
-	_ = dataDir
-	_ = dataDirB
-	// matchSpans is tested indirectly via runDiff below
+	if len(unmatchedA) != 0 {
+		t.Fatalf("expected 0 unmatchedA, got %d", len(unmatchedA))
+	}
+	if len(unmatchedB) != 1 || unmatchedB[0].ID != "sp3" {
+		t.Fatalf("expected sp3 in unmatchedB, got %v", unmatchedB)
+	}
 }
 
 func TestRunDiff_MissingArgs(t *testing.T) {
@@ -120,36 +131,75 @@ func TestRunDiff_MissingArgs(t *testing.T) {
 }
 
 func TestRunDiff_TwoSessions(t *testing.T) {
-	_, _, _, dataDir := runHarness(t, "shtrace", "--", "sh", "-c", "echo hello")
+	// Both sessions must share the same data dir. runHarness creates a fresh
+	// temp dir on each call, so we drive Run directly here.
+	dataDir := t.TempDir()
 	t.Setenv("SHTRACE_DATA_DIR", dataDir)
+	t.Setenv("SHTRACE_SESSION_ID", "")
+	t.Setenv("SHTRACE_PARENT_SPAN_ID", "")
+	t.Setenv("SHTRACE_TAGS", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("GITHUB_WORKSPACE", "")
 
-	// Get session IDs from ls
-	stdout, _, exit, _ := runHarness(t, "shtrace", "ls", "--json")
+	run := func(args ...string) (string, string, int) {
+		var so, se bytes.Buffer
+		exit := Run(context.Background(), args, &so, &se)
+		return so.String(), se.String(), exit
+	}
+
+	if _, _, exit := run("shtrace", "--", "sh", "-c", "printf hello"); exit != 0 {
+		t.Fatalf("session A exit=%d", exit)
+	}
+	if _, _, exit := run("shtrace", "--", "sh", "-c", "printf world"); exit != 0 {
+		t.Fatalf("session B exit=%d", exit)
+	}
+
+	lsOut, _, exit := run("shtrace", "ls", "--json")
 	if exit != 0 {
 		t.Fatalf("ls exit=%d", exit)
 	}
-
-	type entry struct {
+	type lsEntry struct {
 		ID string `json:"id"`
 	}
-	// ls may not have enough sessions from this harness; run a second command in same dir
-	runHarness(t, "shtrace", "--", "sh", "-c", "echo world")
+	var sessions []lsEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(lsOut)), &sessions); err != nil || len(sessions) < 2 {
+		t.Fatalf("expected ≥2 sessions, got %q err=%v", lsOut, err)
+	}
+	idA := sessions[len(sessions)-2].ID
+	idB := sessions[len(sessions)-1].ID
 
-	stdout, _, exit, _ = runHarness(t, "shtrace", "ls", "--json")
+	// Text diff: exit 0 and shows the span diff section
+	diffOut, _, exit := run("shtrace", "diff", idA, idB)
 	if exit != 0 {
-		t.Fatalf("ls exit=%d", exit)
+		t.Fatalf("diff exit=%d", exit)
+	}
+	if !strings.Contains(diffOut, "=== span output diff ===") {
+		t.Fatalf("expected span diff section, got:\n%s", diffOut)
 	}
 
-	var sessions []entry
-	_ = sessions
-	_ = stdout
+	// JSON diff: exit 0 and produces valid JSON with correct session IDs
+	jsonOut, _, exit := run("shtrace", "diff", "--json", idA, idB)
+	if exit != 0 {
+		t.Fatalf("diff --json exit=%d", exit)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(jsonOut)), &parsed); err != nil {
+		t.Fatalf("diff --json not valid JSON: %v\n%s", err, jsonOut)
+	}
+	if parsed["session_a"] != idA || parsed["session_b"] != idB {
+		t.Fatalf("session IDs mismatch: %v", parsed)
+	}
+}
 
-	// Just verify that diff with two made-up session IDs returns a non-zero exit
-	// (because the sessions don't exist in DB), not a panic.
-	_, se, ex, _ := runHarness(t, "shtrace", "diff", "fake-a", "fake-b")
-	// Should fail (session not found or spans empty) but not crash
-	_ = se
-	_ = ex
+func makeSpan(sessionID, spanID string, argv []string) storage.Span {
+	return storage.Span{
+		ID:        spanID,
+		SessionID: sessionID,
+		Command:   argv[0],
+		Argv:      argv,
+	}
 }
 
 func TestCompareTestRuns_Unchanged(t *testing.T) {
