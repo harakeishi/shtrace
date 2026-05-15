@@ -78,17 +78,15 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	var fts *storage.FTSStore
 	ftsPath := storage.FTSPath(dataDir)
 	if _, statErr := os.Stat(ftsPath); statErr == nil {
-		fts, err = storage.OpenFTS(ftsPath)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search disabled): %v\n", err)
+		ftsStore, ftsErr := storage.OpenFTS(ftsPath)
+		if ftsErr != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search disabled): %v\n", ftsErr)
+		} else if migrErr := ftsStore.MigrateFTS(ctx); migrErr != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search disabled): %v\n", migrErr)
+			_ = ftsStore.Close()
 		} else {
-			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
-				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search disabled): %v\n", migrErr)
-				_ = fts.Close()
-				fts = nil
-			} else {
-				defer func() { _ = fts.Close() }()
-			}
+			fts = ftsStore
+			defer func() { _ = fts.Close() }()
 		}
 	}
 
