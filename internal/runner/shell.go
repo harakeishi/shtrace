@@ -344,10 +344,15 @@ if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ 'declare -a' ]]; then
     PROMPT_COMMAND=("__shtrace_precmd" "${PROMPT_COMMAND[@]}" "__shtrace_in_prompt=0")
 elif [ -n "$PROMPT_COMMAND" ]; then
     # Scalar form: strip all trailing semicolons and whitespace (handles
-    # "cmd;", "cmd; ", "cmd ;", etc.) before concatenating, to avoid
-    # generating ";;" which is a bash syntax error.
+    # "cmd;", "cmd; ", "cmd ;", etc.) before concatenating. Also guard on
+    # the stripped result being non-empty: a PROMPT_COMMAND of only ";;;"
+    # would reduce to "" and produce "; ; …" (bash syntax error).
     __shtrace_pc="$(printf '%s' "$PROMPT_COMMAND" | sed 's/[[:space:];]*$//')"
-    PROMPT_COMMAND="__shtrace_precmd; ${__shtrace_pc}; __shtrace_in_prompt=0"
+    if [ -n "$__shtrace_pc" ]; then
+        PROMPT_COMMAND="__shtrace_precmd; ${__shtrace_pc}; __shtrace_in_prompt=0"
+    else
+        PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
+    fi
     unset __shtrace_pc
 else
     PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
