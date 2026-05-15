@@ -972,9 +972,11 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		curLogPath   string
 		curLogFile   *os.File
 		curStartedAt time.Time
+		curCommand   string
 	)
 
-	spanBegin := func() (runner.ChunkWriter, error) {
+	spanBegin := func(command string) (runner.ChunkWriter, error) {
+		curCommand = command
 		if curLogFile != nil {
 			_ = curLogFile.Close()
 			curLogFile = nil
@@ -983,8 +985,12 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if idErr != nil {
 			return nil, fmt.Errorf("generate span id: %w", idErr)
 		}
-		// Set span state optimistically; clear it on any error so the
-		// post-RunShell cleanup guard does not see a phantom curSpanID.
+		// Set curSpanID optimistically before MkdirAll/Create. Between this
+		// line and curLogFile being set below there is a window where
+		// curSpanID != "" but curLogFile == nil. The post-RunShell cleanup
+		// (spanEnd) handles this correctly: it guards on curLogFile != nil
+		// before syncing/closing. Clear curSpanID on any error so the cleanup
+		// guard does not see a phantom span.
 		curSpanID = spanID
 		curStartedAt = time.Now().UTC()
 
@@ -1019,25 +1025,38 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		spanID := curSpanID
 		logPath := curLogPath
 		startedAt := curStartedAt
+		cmdText := curCommand
 		curSpanID = ""
 		curLogPath = ""
 		curStartedAt = time.Time{}
+		curCommand = ""
+
+		// Parse the command text into argv; fall back to shell name if empty.
+		cmdArgv := masker.MaskArgv(strings.Fields(cmdText))
+		cmdName := shell
+		if len(cmdArgv) > 0 {
+			cmdName = cmdArgv[0]
+		} else {
+			cmdArgv = []string{shell}
+		}
 
 		endedAt := time.Now().UTC()
-		code := exitCode
-		if code < 0 {
-			code = -1
+		var exitPtr *int
+		if exitCode >= 0 {
+			exitPtr = &exitCode
 		}
 		if err := store.InsertSpan(ctx, storage.Span{
 			ID:        spanID,
 			SessionID: sessCtx.SessionID,
-			Command:   shell,
-			Argv:      []string{shell},
+			Command:   cmdName,
+			Argv:      cmdArgv,
+			// Cwd is intentionally empty: the user may cd freely during an
+			// interactive shell session, so the initial cwd would be wrong.
 			Cwd:       "",
 			Mode:      "pty",
 			StartedAt: startedAt,
 			EndedAt:   endedAt,
-			ExitCode:  &code,
+			ExitCode:  exitPtr,
 		}); err != nil {
 			return fmt.Errorf("insert span: %w", err)
 		}
@@ -1054,9 +1073,11 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		tty = f
 	}
 
+	// cwd is best-effort: on failure RunShell treats empty Cwd as "inherit"
+	// so the shell starts in the process's current directory.
 	cwd, cwdErr := os.Getwd()
 	if cwdErr != nil {
-		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory (shell will inherit process cwd): %v\n", cwdErr)
 	}
 	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
 
@@ -1075,25 +1096,31 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		},
 	})
 
-	// Close any span still open (e.g. shell killed mid-command) and insert
-	// the partial span into the DB so it is visible to shtrace show/ls.
-	if curLogFile != nil {
+	// Close any span still open (e.g. shell killed mid-command). spanEnd
+	// handles both the log file and the DB write, so only fall through to
+	// the bare file close when there is no active span ID.
+	if curSpanID != "" {
+		_ = spanEnd(-1)
+	} else if curLogFile != nil {
 		_ = curLogFile.Sync()
 		_ = curLogFile.Close()
 		curLogFile = nil
 	}
-	if curSpanID != "" {
-		_ = spanEnd(-1)
-	}
 
-	// Stamp session end time.
-	ended := time.Now().UTC()
-	_ = store.InsertSession(ctx, storage.Session{
-		ID:        sessCtx.SessionID,
-		StartedAt: sessionStartedAt,
-		EndedAt:   &ended,
-		Tags:      sessCtx.Tags,
-	})
+	// Stamp session end time only when we own the session (IsRoot). A child
+	// shell shares its parent's session ID; stamping ended_at here would
+	// prematurely close the still-running parent session in the database.
+	if sessCtx.IsRoot {
+		ended := time.Now().UTC()
+		if err := store.InsertSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			EndedAt:   &ended,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
+		}
+	}
 
 	_, _ = fmt.Fprintf(stderr, "\r\nshtrace: session %s ended\r\n", sessCtx.SessionID)
 
@@ -1106,7 +1133,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 // shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
 // shell snippet even when s contains spaces or other special characters.
-// Single-quote characters within s are handled via the '\''-idiom.
+// Single-quote characters within s are handled via the '\”-idiom.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

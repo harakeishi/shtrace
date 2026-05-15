@@ -1,7 +1,11 @@
 package runner
 
 import (
+	"bytes"
 	"testing"
+
+	"github.com/harakeishi/shtrace/internal/secret"
+	"github.com/harakeishi/shtrace/internal/storage"
 )
 
 // feedExtract is a helper that converts the ordered event slice from Feed into
@@ -190,19 +194,84 @@ func TestOSCParser_OscBufOverflow(t *testing.T) {
 	}
 }
 
-// TestParseOSC133_B verifies B marker parsing.
-func TestParseOSC133_B(t *testing.T) {
-	kind, code, ok := parseOSC133("133;B")
-	if !ok || kind != "B" || code != 0 {
-		t.Errorf("parseOSC133(133;B) = (%q, %d, %v), want (B, 0, true)", kind, code, ok)
+// TestOSCParser_OscBufOverflowWithPrecedingBytes verifies that bytes appearing
+// before an overflowed OSC sequence are emitted in stream order (not merged
+// with bytes that come after the sequence).
+func TestOSCParser_OscBufOverflowWithPrecedingBytes(t *testing.T) {
+	p := &oscParser{}
+	big := make([]byte, maxOSCBuf+10)
+	for i := range big {
+		big[i] = 'x'
+	}
+	// "before" bytes, then an oversized OSC, then "after" bytes.
+	input := []byte("before")
+	input = append(input, '\033', ']')
+	input = append(input, big...)
+	input = append(input, '\007')
+	input = append(input, []byte("after")...)
+
+	events := p.Feed(input)
+	// Expect: Bytes("before"), [overflow discarded], Bytes("after")
+	// "before" must appear as its own event, not merged with "after".
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2; events = %v", len(events), events)
+	}
+	if string(events[0].Bytes) != "before" {
+		t.Errorf("events[0].Bytes = %q, want %q", events[0].Bytes, "before")
+	}
+	if string(events[1].Bytes) != "after" {
+		t.Errorf("events[1].Bytes = %q, want %q", events[1].Bytes, "after")
 	}
 }
 
-// TestParseOSC133_D verifies D marker parsing with exit code.
+// TestStripOSCUnsafe verifies that BEL and ESC are removed and all other bytes
+// (including valid UTF-8 multibyte sequences) are preserved unchanged.
+func TestStripOSCUnsafe(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"normal", "normal"},
+		{"\007", ""},
+		{"\033", ""},
+		{"before\007after", "beforeafter"},
+		{"before\033after", "beforeafter"},
+		{"a\007\033b", "ab"},
+		{"\007\033", ""},
+		// multibyte UTF-8 must pass through unmodified (BEL/ESC are < 0x80)
+		{"こんにちは", "こんにちは"},
+		{"cmd\007arg", "cmdarg"},
+	}
+	for _, c := range cases {
+		got := stripOSCUnsafe(c.in)
+		if got != c.want {
+			t.Errorf("stripOSCUnsafe(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestParseOSC133_B verifies B marker parsing without command text.
+func TestParseOSC133_B(t *testing.T) {
+	kind, arg, ok := parseOSC133("133;B")
+	if !ok || kind != "B" || arg != "" {
+		t.Errorf("parseOSC133(133;B) = (%q, %q, %v), want (B, \"\", true)", kind, arg, ok)
+	}
+}
+
+// TestParseOSC133_BWithCommand verifies B marker carries the command string.
+func TestParseOSC133_BWithCommand(t *testing.T) {
+	kind, arg, ok := parseOSC133("133;B;ls -la /tmp")
+	if !ok || kind != "B" || arg != "ls -la /tmp" {
+		t.Errorf("parseOSC133(133;B;ls -la /tmp) = (%q, %q, %v), want (B, \"ls -la /tmp\", true)", kind, arg, ok)
+	}
+}
+
+// TestParseOSC133_D verifies D marker carries the exit code as a string.
 func TestParseOSC133_D(t *testing.T) {
-	kind, code, ok := parseOSC133("133;D;127")
-	if !ok || kind != "D" || code != 127 {
-		t.Errorf("parseOSC133(133;D;127) = (%q, %d, %v), want (D, 127, true)", kind, code, ok)
+	kind, arg, ok := parseOSC133("133;D;127")
+	if !ok || kind != "D" || arg != "127" {
+		t.Errorf("parseOSC133(133;D;127) = (%q, %q, %v), want (D, \"127\", true)", kind, arg, ok)
 	}
 }
 
@@ -216,8 +285,67 @@ func TestParseOSC133_NonShtrace(t *testing.T) {
 
 // TestParseOSC133_Zero verifies exit code 0 is handled.
 func TestParseOSC133_Zero(t *testing.T) {
-	kind, code, ok := parseOSC133("133;D;0")
-	if !ok || kind != "D" || code != 0 {
-		t.Errorf("parseOSC133(133;D;0) = (%q, %d, %v), want (D, 0, true)", kind, code, ok)
+	kind, arg, ok := parseOSC133("133;D;0")
+	if !ok || kind != "D" || arg != "0" {
+		t.Errorf("parseOSC133(133;D;0) = (%q, %q, %v), want (D, \"0\", true)", kind, arg, ok)
 	}
 }
+
+// TestShellOutputLoop_CommandPassedToBegin verifies that the command text from
+// an OSC 133 B marker is passed to ShellSpan.Begin, so the CLI can record the
+// actual command rather than just the shell name.
+func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
+	// Simulate a PTY stream: prompt, B marker with command, output, D marker.
+	stream := []byte("$ \033]133;B;echo hello\007hello\n\033]133;D;0\007$ ")
+
+	type spanRecord struct {
+		cmd  string
+		exit int
+	}
+	var spans []spanRecord
+	// pendingCmd holds the command from the most recent Begin call. It is safe
+	// to share because shell commands are strictly sequential: End is always
+	// called (implicitly via B or explicitly via D) before the next Begin fires.
+	var pendingCmd string
+
+	span := ShellSpan{
+		Begin: func(command string) (ChunkWriter, error) {
+			pendingCmd = command
+			return &discardWriter{}, nil
+		},
+		End: func(exitCode int) error {
+			cmd := pendingCmd // consume once per span
+			pendingCmd = ""
+			spans = append(spans, spanRecord{cmd: cmd, exit: exitCode})
+			return nil
+		},
+	}
+
+	masker, _ := newTestMasker()
+	// Drive the real shellEventLoop (not a test-helper copy) so any future
+	// change to the production event loop is automatically exercised here.
+	shellEventLoop(bytes.NewReader(stream), ShellOptions{
+		Masker: masker,
+		Span:   span,
+	})
+
+	if len(spans) != 1 {
+		t.Fatalf("len(spans) = %d, want 1", len(spans))
+	}
+	if spans[0].cmd != "echo hello" {
+		t.Errorf("span command = %q, want %q", spans[0].cmd, "echo hello")
+	}
+	if spans[0].exit != 0 {
+		t.Errorf("span exit = %d, want 0", spans[0].exit)
+	}
+}
+
+// newTestMasker returns a no-op Masker suitable for tests.
+func newTestMasker() (*secret.Masker, error) {
+	return secret.NewMaskerWithLiterals(nil, nil)
+}
+
+// discardWriter is a ChunkWriter that discards all output.
+type discardWriter struct{}
+
+func (d *discardWriter) WriteChunk(_ storage.Stream, _ []byte) error { return nil }
