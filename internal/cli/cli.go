@@ -985,8 +985,12 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if idErr != nil {
 			return nil, fmt.Errorf("generate span id: %w", idErr)
 		}
-		// Set span state optimistically; clear it on any error so the
-		// post-RunShell cleanup guard does not see a phantom curSpanID.
+		// Set curSpanID optimistically before MkdirAll/Create. Between this
+		// line and curLogFile being set below there is a window where
+		// curSpanID != "" but curLogFile == nil. The post-RunShell cleanup
+		// (spanEnd) handles this correctly: it guards on curLogFile != nil
+		// before syncing/closing. Clear curSpanID on any error so the cleanup
+		// guard does not see a phantom span.
 		curSpanID = spanID
 		curStartedAt = time.Now().UTC()
 
@@ -1048,7 +1052,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			Argv:      cmdArgv,
 			// Cwd is intentionally empty: the user may cd freely during an
 			// interactive shell session, so the initial cwd would be wrong.
-			Cwd: "",
+			Cwd:       "",
 			Mode:      "pty",
 			StartedAt: startedAt,
 			EndedAt:   endedAt,
@@ -1123,7 +1127,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 // shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
 // shell snippet even when s contains spaces or other special characters.
-// Single-quote characters within s are handled via the '\''-idiom.
+// Single-quote characters within s are handled via the '\”-idiom.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

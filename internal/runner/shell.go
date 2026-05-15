@@ -40,11 +40,11 @@ type ShellSpan struct {
 
 // ShellOptions configures RunShell.
 type ShellOptions struct {
-	Shell  string       // "bash" or "zsh"
-	Env    []string     // child environment; nil inherits os.Environ
-	Cwd    string       // working directory; empty inherits current
-	Tty    *os.File     // terminal for PTY forwarding (typically os.Stdout)
-	Stderr io.Writer    // diagnostic messages
+	Shell  string    // "bash" or "zsh"
+	Env    []string  // child environment; nil inherits os.Environ
+	Cwd    string    // working directory; empty inherits current
+	Tty    *os.File  // terminal for PTY forwarding (typically os.Stdout)
+	Stderr io.Writer // diagnostic messages
 	Masker *secret.Masker
 	Span   ShellSpan
 }
@@ -230,8 +230,10 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 						}
 					case "D": // command done
 						if spanEnd != nil {
+							// Empty arg is a valid D marker (some shells omit the
+							// exit code); Atoi returns 0 for both "" and parse errors.
 							code, atoiErr := strconv.Atoi(arg)
-							if atoiErr != nil && opt.Stderr != nil {
+							if atoiErr != nil && arg != "" && opt.Stderr != nil {
 								_, _ = fmt.Fprintf(opt.Stderr, "shtrace: malformed D marker arg %q, treating as exit code 0\n", arg)
 							}
 							endSpan(code, false)
@@ -344,7 +346,7 @@ __shtrace_preexec() {
     __cmd="${__cmd//$'\e'/}"
     printf '\033]133;B;%s\007' "$__cmd"
 }
-__shtrace_precmd()  { printf '\033]133;D;%d\007' "$?" }
+__shtrace_precmd()  { local rc=$?; printf '\033]133;D;%d\007' "$rc" }
 add-zsh-hook preexec __shtrace_preexec
 add-zsh-hook precmd  __shtrace_precmd
 `

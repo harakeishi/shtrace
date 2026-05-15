@@ -268,7 +268,10 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 	// Simulate a PTY stream: prompt, B marker with command, output, D marker.
 	stream := []byte("$ \033]133;B;echo hello\007hello\n\033]133;D;0\007$ ")
 
-	type spanRecord struct{ cmd string; exit int }
+	type spanRecord struct {
+		cmd  string
+		exit int
+	}
 	var spans []spanRecord
 	// pendingCmd holds the command from the most recent Begin call. It is safe
 	// to share because shell commands are strictly sequential: End is always
@@ -331,12 +334,32 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 
 	endSpan := func(code int) {
 		flushPending()
-		pending = nil // match production: release backing array between spans
+		pending = nil // release backing array between spans
 		if spanEnd != nil {
 			_ = spanEnd(code)
 		}
 		writer = nil
 		spanEnd = nil
+	}
+
+	// writeCleaned mirrors the safety-tail masking in production shellOutputLoop:
+	// bytes are buffered in pending and flushed in safetyTail-sized chunks so
+	// that secrets straddling chunk boundaries are caught by the masker.
+	writeCleaned := func(b []byte) {
+		if writer == nil || len(b) == 0 {
+			return
+		}
+		pending = append(pending, b...)
+		if len(pending) > safetyTail {
+			masked, _ := masker.MaskString(string(pending))
+			if len(masked) > safetyTail {
+				cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
+				_ = writer.WriteChunk(storage.StreamPTY, []byte(masked[:cutoff]))
+				pending = []byte(masked[cutoff:])
+			} else {
+				pending = []byte(masked)
+			}
+		}
 	}
 
 	for _, ev := range parser.Feed(input) {
@@ -359,15 +382,12 @@ func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
 				}
 			case "D":
 				if spanEnd != nil {
-					// Match production: strconv.Atoi returns 0 on parse failure.
 					code, _ := strconv.Atoi(arg)
 					endSpan(code)
 				}
 			}
 			continue
 		}
-		if writer != nil && len(ev.Bytes) > 0 {
-			pending = append(pending, ev.Bytes...)
-		}
+		writeCleaned(ev.Bytes)
 	}
 }
