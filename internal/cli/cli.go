@@ -1041,9 +1041,9 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}
 
 		endedAt := time.Now().UTC()
-		code := exitCode
-		if code < 0 {
-			code = -1
+		var exitPtr *int
+		if exitCode >= 0 {
+			exitPtr = &exitCode
 		}
 		if err := store.InsertSpan(ctx, storage.Span{
 			ID:        spanID,
@@ -1056,7 +1056,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			Mode:      "pty",
 			StartedAt: startedAt,
 			EndedAt:   endedAt,
-			ExitCode:  &code,
+			ExitCode:  exitPtr,
 		}); err != nil {
 			return fmt.Errorf("insert span: %w", err)
 		}
@@ -1133,7 +1133,7 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 // shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
 // shell snippet even when s contains spaces or other special characters.
-// Single-quote characters within s are handled via the '\''-idiom.
+// Single-quote characters within s are handled via the '\”-idiom.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
