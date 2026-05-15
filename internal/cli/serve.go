@@ -99,10 +99,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sessions", makeSessionsHandler(ctx, store))
-	mux.HandleFunc("/api/sessions/", makeSpansHandler(ctx, store))
-	mux.HandleFunc("/api/output/", makeOutputHandler(ctx, store, dataDir))
-	mux.HandleFunc("/api/search", makeSearchHandler(ctx, fts))
+	mux.HandleFunc("/api/sessions", makeSessionsHandler(store))
+	mux.HandleFunc("/api/sessions/", makeSpansHandler(store))
+	mux.HandleFunc("/api/output/", makeOutputHandler(store, dataDir))
+	mux.HandleFunc("/api/search", makeSearchHandler(fts))
 	mux.HandleFunc("/", makeUIHandler())
 
 	srv := &http.Server{
@@ -168,13 +168,13 @@ type apiSearchResult struct {
 	Snippet   string `json:"snippet"`
 }
 
-func makeSessionsHandler(ctx context.Context, store *storage.Store) http.HandlerFunc {
+func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		sessions, err := store.ListSessions(ctx, 500, nil)
+		sessions, err := store.ListSessions(r.Context(), 500, nil)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -196,7 +196,7 @@ func makeSessionsHandler(ctx context.Context, store *storage.Store) http.Handler
 	}
 }
 
-func makeSpansHandler(ctx context.Context, store *storage.Store) http.HandlerFunc {
+func makeSpansHandler(store *storage.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -214,7 +214,7 @@ func makeSpansHandler(ctx context.Context, store *storage.Store) http.HandlerFun
 			return
 		}
 
-		spans, err := store.SpansForSession(ctx, sessionID, nil)
+		spans, err := store.SpansForSession(r.Context(), sessionID, nil)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
@@ -237,7 +237,7 @@ func makeSpansHandler(ctx context.Context, store *storage.Store) http.HandlerFun
 	}
 }
 
-func makeOutputHandler(_ context.Context, store *storage.Store, dataDir string) http.HandlerFunc {
+func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -270,7 +270,7 @@ func makeOutputHandler(_ context.Context, store *storage.Store, dataDir string) 
 		}
 
 		logPath := storage.OutputPath(dataDir, sessionID, spanID)
-		b, err := os.ReadFile(logPath)
+		f, err := os.Open(logPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				http.Error(w, "output file not found", http.StatusNotFound)
@@ -278,6 +278,18 @@ func makeOutputHandler(_ context.Context, store *storage.Store, dataDir string) 
 			}
 			http.Error(w, "read error", http.StatusInternalServerError)
 			return
+		}
+		defer func() { _ = f.Close() }()
+
+		const maxLogBytes = 10 << 20 // 10 MiB
+		b, err := io.ReadAll(io.LimitReader(f, maxLogBytes+1))
+		if err != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
+		truncated := len(b) > maxLogBytes
+		if truncated {
+			b = b[:maxLogBytes]
 		}
 
 		// Decode JSON Lines and return plain text.
@@ -298,11 +310,14 @@ func makeOutputHandler(_ context.Context, store *storage.Store, dataDir string) 
 		if corrupt > 0 {
 			w.Header().Set("X-Shtrace-Corrupt-Lines", strconv.Itoa(corrupt))
 		}
+		if truncated {
+			w.Header().Set("X-Shtrace-Truncated", "true")
+		}
 		_, _ = io.WriteString(w, sb.String())
 	}
 }
 
-func makeSearchHandler(ctx context.Context, fts *storage.FTSStore) http.HandlerFunc {
+func makeSearchHandler(fts *storage.FTSStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -317,7 +332,7 @@ func makeSearchHandler(ctx context.Context, fts *storage.FTSStore) http.HandlerF
 			writeJSON(w, []apiSearchResult{})
 			return
 		}
-		results, err := fts.Search(ctx, q, 50)
+		results, err := fts.Search(r.Context(), q, 50)
 		if err != nil {
 			http.Error(w, "search error", http.StatusInternalServerError)
 			return

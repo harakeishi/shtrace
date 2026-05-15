@@ -100,10 +100,9 @@ func TestParseServeArgs(t *testing.T) {
 // ---- /api/sessions ----
 
 func TestSessionsHandler_OK(t *testing.T) {
-	ctx := context.Background()
 	store, _ := openTestStore(t)
 
-	if err := store.InsertSession(ctx, storage.Session{
+	if err := store.InsertSession(context.Background(), storage.Session{
 		ID:        "sess-abc",
 		StartedAt: time.Now().UTC(),
 		Tags:      map[string]string{"pr": "42"},
@@ -111,7 +110,7 @@ func TestSessionsHandler_OK(t *testing.T) {
 		t.Fatalf("insert session: %v", err)
 	}
 
-	h := makeSessionsHandler(ctx, store)
+	h := makeSessionsHandler(store)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
 
@@ -134,7 +133,7 @@ func TestSessionsHandler_OK(t *testing.T) {
 }
 
 func TestSessionsHandler_MethodNotAllowed(t *testing.T) {
-	h := makeSessionsHandler(context.Background(), nil)
+	h := makeSessionsHandler(nil)
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
 		rec := httptest.NewRecorder()
 		h(rec, httptest.NewRequest(method, "/api/sessions", nil))
@@ -147,12 +146,11 @@ func TestSessionsHandler_MethodNotAllowed(t *testing.T) {
 // ---- /api/sessions/{id}/spans ----
 
 func TestSpansHandler_OK(t *testing.T) {
-	ctx := context.Background()
 	store, _ := openTestStore(t)
 
 	insertTestSession(t, store, "sess-1")
 	exitCode := 0
-	if err := store.InsertSpan(ctx, storage.Span{
+	if err := store.InsertSpan(context.Background(), storage.Span{
 		ID:        "span-1",
 		SessionID: "sess-1",
 		Command:   "echo",
@@ -165,7 +163,7 @@ func TestSpansHandler_OK(t *testing.T) {
 		t.Fatalf("insert span: %v", err)
 	}
 
-	h := makeSpansHandler(ctx, store)
+	h := makeSpansHandler(store)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions/sess-1/spans", nil))
 
@@ -188,9 +186,8 @@ func TestSpansHandler_OK(t *testing.T) {
 }
 
 func TestSpansHandler_BadPath(t *testing.T) {
-	ctx := context.Background()
 	store, _ := openTestStore(t)
-	h := makeSpansHandler(ctx, store)
+	h := makeSpansHandler(store)
 
 	cases := []struct {
 		path     string
@@ -211,7 +208,7 @@ func TestSpansHandler_BadPath(t *testing.T) {
 }
 
 func TestSpansHandler_MethodNotAllowed(t *testing.T) {
-	h := makeSpansHandler(context.Background(), nil)
+	h := makeSpansHandler(nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodPost, "/api/sessions/x/spans", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -222,7 +219,7 @@ func TestSpansHandler_MethodNotAllowed(t *testing.T) {
 // ---- /api/search ----
 
 func TestSearchHandler_NoFTS_WithQuery(t *testing.T) {
-	h := makeSearchHandler(context.Background(), nil)
+	h := makeSearchHandler(nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/search?q=hello", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -232,7 +229,7 @@ func TestSearchHandler_NoFTS_WithQuery(t *testing.T) {
 
 func TestSearchHandler_NoFTS_EmptyQuery(t *testing.T) {
 	// fts==nil check runs before q check, so empty query also returns 503.
-	h := makeSearchHandler(context.Background(), nil)
+	h := makeSearchHandler(nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/search", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -241,7 +238,7 @@ func TestSearchHandler_NoFTS_EmptyQuery(t *testing.T) {
 }
 
 func TestSearchHandler_MethodNotAllowed(t *testing.T) {
-	h := makeSearchHandler(context.Background(), nil)
+	h := makeSearchHandler(nil)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodPost, "/api/search", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -283,11 +280,10 @@ func TestUIHandler_NotFound(t *testing.T) {
 // ---- /api/output/{sessID}/{spanID} ----
 
 func TestOutputHandler_SpanNotFound(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
 	insertTestSession(t, store, "s1")
 
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/s1/nonexistent-span", nil))
 	if rec.Code != http.StatusNotFound {
@@ -296,9 +292,8 @@ func TestOutputHandler_SpanNotFound(t *testing.T) {
 }
 
 func TestOutputHandler_BadPath(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 
 	for _, path := range []string{"/api/output/", "/api/output/onlyone"} {
 		rec := httptest.NewRecorder()
@@ -310,7 +305,6 @@ func TestOutputHandler_BadPath(t *testing.T) {
 }
 
 func TestOutputHandler_ReadsLog(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
 
 	insertTestSession(t, store, "sess-out")
@@ -325,7 +319,7 @@ func TestOutputHandler_ReadsLog(t *testing.T) {
 		t.Fatalf("write log: %v", err)
 	}
 
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-out/span-out", nil))
 	if rec.Code != http.StatusOK {
@@ -338,7 +332,6 @@ func TestOutputHandler_ReadsLog(t *testing.T) {
 }
 
 func TestOutputHandler_CorruptLines(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
 
 	insertTestSession(t, store, "sess-c")
@@ -354,7 +347,7 @@ func TestOutputHandler_CorruptLines(t *testing.T) {
 		t.Fatalf("write log: %v", err)
 	}
 
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-c/span-c", nil))
 	if rec.Code != http.StatusOK {
@@ -366,9 +359,8 @@ func TestOutputHandler_CorruptLines(t *testing.T) {
 }
 
 func TestOutputHandler_MethodNotAllowed(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 	rec := httptest.NewRecorder()
 	h(rec, httptest.NewRequest(http.MethodPost, "/api/output/s/sp", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
@@ -377,11 +369,10 @@ func TestOutputHandler_MethodNotAllowed(t *testing.T) {
 }
 
 func TestOutputHandler_PathTraversal(t *testing.T) {
-	ctx := context.Background()
 	store, dataDir := openTestStore(t)
 	insertTestSession(t, store, "sess-t")
 
-	h := makeOutputHandler(ctx, store, dataDir)
+	h := makeOutputHandler(store, dataDir)
 
 	// IDs containing path traversal sequences must not be served — they will
 	// fail the span-exists check in the DB and return 404.
