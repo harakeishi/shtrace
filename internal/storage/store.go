@@ -346,17 +346,17 @@ func (s *Store) DeleteSession(ctx context.Context, sessionID string) error {
 }
 
 // SpanExists reports whether a span with the given spanID belongs to sessionID.
-// It performs a single-row indexed lookup, avoiding a full table scan.
+// Uses EXISTS so SQLite stops at the first matching row.
 func (s *Store) SpanExists(ctx context.Context, sessionID, spanID string) (bool, error) {
-	var n int
+	var exists bool
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM spans WHERE id = ? AND session_id = ?`,
+		`SELECT EXISTS(SELECT 1 FROM spans WHERE id = ? AND session_id = ?)`,
 		spanID, sessionID,
-	).Scan(&n)
+	).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("span exists: %w", err)
 	}
-	return n > 0, nil
+	return exists, nil
 }
 
 func reportWarn(warn func(error), err error) {

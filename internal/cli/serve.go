@@ -118,8 +118,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			_, _ = fmt.Fprintf(stderr, "shtrace: serve shutdown: %v\n", err)
+		if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: serve shutdown: %v\n", shutErr)
 		}
 	}()
 
@@ -343,11 +343,11 @@ func makeSearchHandler(fts *storage.FTSStore) http.HandlerFunc {
 			return
 		}
 		out := make([]apiSearchResult, 0, len(results))
-		for _, r := range results {
+		for _, res := range results {
 			out = append(out, apiSearchResult{
-				SpanID:    r.SpanID,
-				SessionID: r.SessionID,
-				Snippet:   r.Snippet,
+				SpanID:    res.SpanID,
+				SessionID: res.SessionID,
+				Snippet:   res.Snippet,
 			})
 		}
 		writeJSON(w, out)
