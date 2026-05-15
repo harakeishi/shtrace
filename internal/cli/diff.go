@@ -156,7 +156,8 @@ func emitDiffText(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 	hasDiff := false
 	for _, p := range pairs {
 		diff := spanDiffText(dataDir, p)
-		if diff == "" {
+		exitChanged := exitCodeStr(p.a.ExitCode) != exitCodeStr(p.b.ExitCode)
+		if diff == "" && !exitChanged {
 			continue
 		}
 		hasDiff = true
@@ -166,7 +167,9 @@ func emitDiffText(w io.Writer, sessionA, sessionB string, runsA, runsB []mcp.Tes
 		}
 		_, _ = fmt.Fprintf(w, "--- a/%s  exit=%s\n", argv, exitCodeStr(p.a.ExitCode))
 		_, _ = fmt.Fprintf(w, "+++ b/%s  exit=%s\n", argv, exitCodeStr(p.b.ExitCode))
-		_, _ = fmt.Fprint(w, diff)
+		if diff != "" {
+			_, _ = fmt.Fprint(w, diff)
+		}
 		_, _ = fmt.Fprintln(w)
 	}
 
@@ -211,11 +214,12 @@ type testRunDiff struct {
 }
 
 type spanOutputDiff struct {
-	Command  string `json:"command"`
-	ExitA    *int   `json:"exit_a"`
-	ExitB    *int   `json:"exit_b"`
-	Diff     string `json:"diff"`
-	OnlyIn   string `json:"only_in,omitempty"` // "a" or "b" for unmatched spans
+	Command     string `json:"command"`
+	ExitA       *int   `json:"exit_a"`
+	ExitB       *int   `json:"exit_b"`
+	ExitChanged bool   `json:"exit_changed"`
+	Diff        string `json:"diff"`
+	OnlyIn      string `json:"only_in,omitempty"` // "a" or "b" for unmatched spans
 }
 
 func emitDiffJSON(w, stderr io.Writer, sessionA, sessionB string, runsA, runsB []mcp.TestRun, pairs []spanPair, unmatchedA, unmatchedB []storage.Span, dataDir string) int {
@@ -238,15 +242,21 @@ func emitDiffJSON(w, stderr io.Writer, sessionA, sessionB string, runsA, runsB [
 	}
 
 	for _, p := range pairs {
+		diff := spanDiffText(dataDir, p)
+		exitChanged := exitCodeStr(p.a.ExitCode) != exitCodeStr(p.b.ExitCode)
+		if diff == "" && !exitChanged {
+			continue // identical span: skip to keep output concise
+		}
 		argv := strings.Join(p.a.Argv, " ")
 		if argv == "" {
 			argv = p.a.Command
 		}
 		out.SpanOutputs = append(out.SpanOutputs, spanOutputDiff{
-			Command: argv,
-			ExitA:   p.a.ExitCode,
-			ExitB:   p.b.ExitCode,
-			Diff:    spanDiffText(dataDir, p),
+			Command:     argv,
+			ExitA:       p.a.ExitCode,
+			ExitB:       p.b.ExitCode,
+			ExitChanged: exitChanged,
+			Diff:        diff,
 		})
 	}
 	for _, sp := range unmatchedA {
