@@ -3,10 +3,18 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/harakeishi/shtrace/internal/cli"
 )
 
 func main() {
-	os.Exit(cli.Run(context.Background(), os.Args, os.Stdout, os.Stderr))
+	os.Exit(run())
+}
+
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return cli.Run(ctx, os.Args, os.Stdout, os.Stderr)
 }

@@ -29,7 +29,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell, diff")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell, diff")
 		return 2
 	}
 
@@ -43,11 +43,13 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell, diff")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell, diff")
 		return 2
 	}
 
 	switch argv[1] {
+	case "serve":
+		return runServe(ctx, argv[2:], stdout, stderr)
 	case "mcp":
 		return runMCP(ctx, argv[2:], os.Stdin, stdout, stderr)
 	case "ls":
