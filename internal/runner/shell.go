@@ -380,6 +380,8 @@ __shtrace_preexec() {
 __shtrace_precmd() { local rc=$?; printf '\033]133;D;%d\007' "$rc"; return $rc; }
 add-zsh-hook preexec __shtrace_preexec
 # Prepend to precmd_functions so we read $? before other hooks run.
+# typeset -ga ensures the array exists (safe under setopt nounset / set -u).
+typeset -ga precmd_functions
 precmd_functions=(__shtrace_precmd "${precmd_functions[@]}")
 `
 
