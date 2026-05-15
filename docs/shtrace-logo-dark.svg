@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 130" width="440" height="130" role="img" aria-label="shtrace — shell-execution observability">
+  <title>shtrace</title>
+  <desc>shtrace logo (dark) — icon mark plus wordmark with tagline</desc>
+  <!-- icon mark (inverted) -->
+  <rect x="0" y="0" width="120" height="120" rx="16" fill="#ffffff"/>
+  <polyline points="32,40 56,60 32,80" fill="none" stroke="#0d1117" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="68" y1="60" x2="96" y2="60" stroke="#0d1117" stroke-width="6" stroke-linecap="round"/>
+  <rect x="68" y="78" width="28" height="6" fill="#0d1117" rx="1"/>
+  <!-- wordmark -->
+  <text x="148" y="68" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="54" font-weight="500" fill="#ffffff" letter-spacing="-2">shtrace</text>
+  <!-- tagline -->
+  <text x="150" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="400" fill="#9ba1a8" letter-spacing="0.5">shell-execution observability</text>
+  <!-- timeline accent -->
+  <line x1="150" y1="110" x2="280" y2="110" stroke="#ffffff" stroke-width="2"/>
+  <circle cx="158" cy="110" r="2.5" fill="#ffffff"/>
+  <circle cx="195" cy="110" r="2.5" fill="#ffffff"/>
+  <circle cx="232" cy="110" r="2.5" fill="#ffffff"/>
+  <circle cx="269" cy="110" r="2.5" fill="#ffffff"/>
+</svg>

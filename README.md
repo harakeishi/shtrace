@@ -1,5 +1,10 @@
 # shtrace
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/shtrace-logo-dark.svg">
+  <img src="docs/shtrace-logo.svg" alt="shtrace" width="440">
+</picture>
+
 > Shell-execution observability for AI-era engineering. Wrap a command, get a
 > searchable, replayable record of what actually happened.
 

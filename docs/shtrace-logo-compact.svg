@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" width="320" height="80" role="img" aria-label="shtrace">
+  <title>shtrace</title>
+  <desc>shtrace logo, compact (no tagline)</desc>
+  <rect x="0" y="0" width="80" height="80" rx="12" fill="#0f1115"/>
+  <polyline points="22,28 38,40 22,52" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="46" y1="40" x2="62" y2="40" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+  <rect x="46" y="52" width="16" height="4" fill="#ffffff" rx="1"/>
+  <text x="100" y="55" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace" font-size="44" font-weight="500" fill="#0f1115" letter-spacing="-2">shtrace</text>
+</svg>
