@@ -336,8 +336,15 @@ __shtrace_precmd() {
     # Restore $? so subsequent PROMPT_COMMAND entries see the real exit code.
     return "$rc"
 }
-if [ -n "$PROMPT_COMMAND" ]; then
-    PROMPT_COMMAND="__shtrace_precmd; $PROMPT_COMMAND; __shtrace_in_prompt=0"
+# bash 5.1+ allows PROMPT_COMMAND to be an array; handle both forms.
+# For the scalar form, strip any trailing semicolons before interpolating
+# to avoid generating ";;" which is a bash syntax error.
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ 'declare -a' ]]; then
+    # Array form: prepend our hook and append the sentinel.
+    PROMPT_COMMAND=("__shtrace_precmd" "${PROMPT_COMMAND[@]}" "__shtrace_in_prompt=0")
+elif [ -n "$PROMPT_COMMAND" ]; then
+    # Scalar form: strip trailing semicolons/whitespace before concatenating.
+    PROMPT_COMMAND="__shtrace_precmd; ${PROMPT_COMMAND%;}; __shtrace_in_prompt=0"
 else
     PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
 fi
