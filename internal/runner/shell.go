@@ -8,6 +8,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,21 +30,22 @@ import (
 // ShellSpan holds the span lifecycle callbacks that RunShell calls for each
 // interactive command the user runs.
 type ShellSpan struct {
-	// Begin is called when an interactive command starts. It returns a
-	// ChunkWriter for the command's output. Returning a nil writer suppresses
-	// recording for that command.
-	Begin func() (ChunkWriter, error)
+	// Begin is called when an interactive command starts. command is the raw
+	// command string from the OSC 133 B marker (e.g. "ls -la /tmp"). It
+	// returns a ChunkWriter for the command's output. Returning a nil writer
+	// suppresses recording for that command.
+	Begin func(command string) (ChunkWriter, error)
 	// End is called when the command finishes with the given exit code.
 	End func(exitCode int) error
 }
 
 // ShellOptions configures RunShell.
 type ShellOptions struct {
-	Shell  string       // "bash" or "zsh"
-	Env    []string     // child environment; nil inherits os.Environ
-	Cwd    string       // working directory; empty inherits current
-	Tty    *os.File     // terminal for PTY forwarding (typically os.Stdout)
-	Stderr io.Writer    // diagnostic messages
+	Shell  string    // "bash" or "zsh"
+	Env    []string  // child environment; nil inherits os.Environ
+	Cwd    string    // working directory; empty inherits current
+	Tty    *os.File  // terminal for PTY forwarding (typically os.Stdout)
+	Stderr io.Writer // diagnostic messages
 	Masker *secret.Masker
 	Span   ShellSpan
 }
@@ -120,19 +122,22 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 		// A non-zero exit from the shell is expected (e.g. the user ran a
 		// failing command last, or typed exit N). Surface it only when it is
 		// not an ExitError so the caller can propagate the exit code naturally.
-		var exitErr *exec.ExitError
-		if !isExitError(err, &exitErr) {
+		if !errors.As(err, new(*exec.ExitError)) {
 			return err
 		}
 	}
 	return nil
 }
 
-// shellOutputLoop reads from the PTY master, forwards all bytes to the user
-// terminal, and drives span recording by reacting to OSC 133 markers.
-// Events from the parser are processed in stream order so that command output
-// appearing between a B and D marker is correctly attributed to its span.
+// shellOutputLoop reads from the PTY master, forwards bytes to the terminal,
+// and drives span recording. It delegates to shellEventLoop.
 func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
+	shellEventLoop(ptmx, opt)
+}
+
+// shellEventLoop is the testable core of shellOutputLoop. It accepts any
+// io.Reader so unit tests can feed synthetic PTY bytes without a real PTY.
+func shellEventLoop(r io.Reader, opt ShellOptions) {
 	var (
 		parser  oscParser
 		writer  ChunkWriter
@@ -144,7 +149,6 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 	// then resets the buffer.
 	flushPending := func() {
 		if writer == nil || len(pending) == 0 {
-			pending = pending[:0]
 			return
 		}
 		masked, _ := opt.Masker.MaskString(string(pending))
@@ -157,6 +161,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 	// ended without a D marker (abnormal path).
 	endSpan := func(code int, implicit bool) {
 		flushPending()
+		pending = nil // release backing array so it is not held for the session lifetime
 		if spanEnd != nil {
 			label := "shtrace: span end"
 			if implicit {
@@ -191,7 +196,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := ptmx.Read(buf)
+		n, err := r.Read(buf)
 		if n > 0 {
 			raw := buf[:n]
 
@@ -205,7 +210,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 			// are handled relative to each other (not bytes-then-markers).
 			for _, ev := range parser.Feed(raw) {
 				if ev.Seq != "" {
-					kind, code, ok := parseOSC133(ev.Seq)
+					kind, arg, ok := parseOSC133(ev.Seq)
 					if !ok {
 						continue
 					}
@@ -215,18 +220,26 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 							endSpan(-1, true)
 						}
 						if opt.Span.Begin != nil {
-							w, berr := opt.Span.Begin()
+							w, berr := opt.Span.Begin(stripOSCUnsafe(arg))
 							if berr != nil {
 								if opt.Stderr != nil {
 									_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
 								}
-							} else {
+							} else if w != nil {
+								// Only record a span when Begin returns a real writer.
+								// A nil writer signals the caller wants to suppress this command.
 								writer = w
 								spanEnd = opt.Span.End
 							}
 						}
 					case "D": // command done
 						if spanEnd != nil {
+							// Empty arg is a valid D marker (some shells omit the
+							// exit code); Atoi returns 0 for both "" and parse errors.
+							code, atoiErr := strconv.Atoi(arg)
+							if atoiErr != nil && arg != "" && opt.Stderr != nil {
+								_, _ = fmt.Fprintf(opt.Stderr, "shtrace: malformed D marker arg %q, treating as exit code 0\n", arg)
+							}
 							endSpan(code, false)
 						}
 					}
@@ -278,12 +291,17 @@ const bashRC = `# shtrace: source user rc
 
 # shtrace span boundary detection via OSC 133 markers.
 # __shtrace_cmd_fired prevents duplicate B markers for compound commands.
+# __shtrace_in_prompt blocks the DEBUG trap from firing B markers for commands
+# that run as part of PROMPT_COMMAND (e.g. the user's existing prompt hooks).
 __shtrace_cmd_fired=0
+__shtrace_in_prompt=0
 
 # Preserve any DEBUG trap the user's rc installed so we can chain it.
 # trap -p prints: trap -- 'BODY' DEBUG  — extract the body with sed.
-# This works for most real-world trap bodies; it may misparse bodies that
-# contain literal escaped single-quotes (rare in practice).
+# This works for most real-world single-line trap bodies. Known limitations:
+# bodies with literal escaped single-quotes or embedded newlines (multi-line
+# trap bodies) are not handled — sed is line-by-line so the extracted body
+# will be garbled and the chained trap silently skipped on eval.
 __shtrace_prev_debug=''
 if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out" ]; then
     __shtrace_prev_debug=$(printf '%s' "$__shtrace_trap_out" | \
@@ -291,24 +309,53 @@ if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out"
 fi
 
 __shtrace_debug_hook() {
+    # Suppress B markers for commands that run inside PROMPT_COMMAND (e.g.
+    # the user's existing prompt hooks). The sentinel is cleared at the end
+    # of PROMPT_COMMAND (see below) so real user commands pass through.
+    [ "$__shtrace_in_prompt" = "1" ] && return
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
-    printf '\033]133;B\007'
+    # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
+    # the OSC sequence in the PTY stream.
+    local __cmd="${BASH_COMMAND//$'\a'/}"
+    __cmd="${__cmd//$'\e'/}"
+    printf '\033]133;B;%s\007' "$__cmd"
     [ -n "$__shtrace_prev_debug" ] && eval "$__shtrace_prev_debug"
 }
 trap '__shtrace_debug_hook' DEBUG
 
 __shtrace_precmd() {
     local rc=$?
+    # Set in_prompt before emitting D so the DEBUG trap does not fire a
+    # spurious B marker for any subsequent commands in PROMPT_COMMAND.
+    __shtrace_in_prompt=1
     if [ "$__shtrace_cmd_fired" = "1" ]; then
         __shtrace_cmd_fired=0
         printf '\033]133;D;%d\007' "$rc"
     fi
+    # Restore $? so subsequent PROMPT_COMMAND entries see the real exit code.
+    return "$rc"
 }
-if [ -n "$PROMPT_COMMAND" ]; then
-    PROMPT_COMMAND="__shtrace_precmd; $PROMPT_COMMAND"
+# bash 5.1+ allows PROMPT_COMMAND to be an array; handle both forms.
+# For the scalar form, strip any trailing semicolons before interpolating
+# to avoid generating ";;" which is a bash syntax error.
+if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ 'declare -a' ]]; then
+    # Array form: prepend our hook and append the sentinel.
+    PROMPT_COMMAND=("__shtrace_precmd" "${PROMPT_COMMAND[@]}" "__shtrace_in_prompt=0")
+elif [ -n "$PROMPT_COMMAND" ]; then
+    # Scalar form: strip all trailing semicolons and whitespace (handles
+    # "cmd;", "cmd; ", "cmd ;", etc.) before concatenating. Also guard on
+    # the stripped result being non-empty: a PROMPT_COMMAND of only ";;;"
+    # would reduce to "" and produce "; ; …" (bash syntax error).
+    __shtrace_pc="$(printf '%s' "$PROMPT_COMMAND" | sed 's/[[:space:];]*$//')"
+    if [ -n "$__shtrace_pc" ]; then
+        PROMPT_COMMAND="__shtrace_precmd; ${__shtrace_pc}; __shtrace_in_prompt=0"
+    else
+        PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
+    fi
+    unset __shtrace_pc
 else
-    PROMPT_COMMAND="__shtrace_precmd"
+    PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
 fi
 `
 
@@ -318,14 +365,24 @@ const zshRC = `# shtrace: source user rc (skip if ZDOTDIR was already our dir)
 [ -f "$HOME/.zshrc" ] && [ "$HOME/.zshrc" != "$ZDOTDIR/.zshrc" ] && . "$HOME/.zshrc"
 
 # shtrace span boundary detection via OSC 133 markers.
-# add-zsh-hook is used instead of direct assignment so existing
-# preexec/precmd hooks (e.g. from powerlevel10k, zsh-syntax-highlighting)
-# are not overwritten.
+# preexec is appended (add-zsh-hook) — it only needs to run once before the
+# command starts, so order relative to other hooks does not matter.
+# precmd is PREPENDED so it captures $? before any other precmd hook can
+# clobber it (other hooks, e.g. powerlevel10k, reset $? to their own exit).
 autoload -Uz add-zsh-hook
-__shtrace_preexec() { printf '\033]133;B\007' }
-__shtrace_precmd()  { printf '\033]133;D;%d\007' "$?" }
+__shtrace_preexec() {
+    # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
+    # the OSC sequence in the PTY stream.
+    local __cmd="${1//$'\a'/}"
+    __cmd="${__cmd//$'\e'/}"
+    printf '\033]133;B;%s\007' "$__cmd"
+}
+__shtrace_precmd() { local rc=$?; printf '\033]133;D;%d\007' "$rc"; return $rc; }
 add-zsh-hook preexec __shtrace_preexec
-add-zsh-hook precmd  __shtrace_precmd
+# Prepend to precmd_functions so we read $? before other hooks run.
+# typeset -ga ensures the array exists (safe under setopt nounset / set -u).
+typeset -ga precmd_functions
+precmd_functions=(__shtrace_precmd "${precmd_functions[@]}")
 `
 
 // maxOSCBuf is the upper bound on the number of bytes accumulated in oscBuf.
@@ -375,8 +432,10 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 	}
 
 	emitSeq := func() {
+		// Always flush preceding clean bytes so they appear in stream order
+		// before (or instead of) the OSC event, even on overflow.
+		flushCur()
 		if !p.oscOverflow {
-			flushCur()
 			events = append(events, parserEvent{Seq: string(p.oscBuf)})
 		}
 		p.oscBuf = p.oscBuf[:0]
@@ -423,7 +482,8 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 				p.state = oscStateNormal
 			} else {
 				// Not ST — treat the ESC as a literal inside the OSC payload.
-				if len(p.oscBuf) < maxOSCBuf {
+				// Guard requires room for two bytes (ESC + b).
+				if len(p.oscBuf)+1 < maxOSCBuf {
 					p.oscBuf = append(p.oscBuf, '\033', b)
 				} else {
 					p.oscOverflow = true
@@ -438,27 +498,31 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 }
 
 // parseOSC133 parses an OSC payload and returns the marker kind (A/B/C/D),
-// the exit code (for D markers), and whether it was an OSC 133 sequence.
-func parseOSC133(payload string) (kind string, exitCode int, ok bool) {
+// the raw argument string (command text for B, exit-code string for D), and
+// whether it was an OSC 133 sequence.
+func parseOSC133(payload string) (kind, arg string, ok bool) {
 	if !strings.HasPrefix(payload, "133;") {
-		return "", 0, false
+		return "", "", false
 	}
 	rest := payload[4:]
 	if idx := strings.IndexByte(rest, ';'); idx >= 0 {
 		kind = rest[:idx]
-		exitCode, _ = strconv.Atoi(rest[idx+1:])
+		arg = rest[idx+1:]
 	} else {
 		kind = rest
 	}
-	return kind, exitCode, true
+	return kind, arg, true
 }
 
-func isExitError(err error, out **exec.ExitError) bool {
-	if e, ok := err.(*exec.ExitError); ok {
-		if out != nil {
-			*out = e
+// stripOSCUnsafe removes bytes that would corrupt an OSC payload: BEL (0x07)
+// terminates the sequence and ESC (0x1b) may start the ST terminator (ESC \).
+// This is a defence-in-depth measure; the shell hooks strip these chars too.
+func stripOSCUnsafe(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\007' && s[i] != '\033' {
+			out = append(out, s[i])
 		}
-		return true
 	}
-	return false
+	return string(out)
 }
