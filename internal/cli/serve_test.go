@@ -240,6 +240,16 @@ func TestSpansHandler_BadPath(t *testing.T) {
 	}
 }
 
+func TestSpansHandler_SessionNotFound(t *testing.T) {
+	store, _ := openTestStore(t)
+	h := makeSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions/nonexistent-session/spans", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status %d, want 404 for unknown session ID", rec.Code)
+	}
+}
+
 func TestSpansHandler_MethodNotAllowed(t *testing.T) {
 	h := makeSpansHandler(nil)
 	rec := httptest.NewRecorder()
@@ -298,6 +308,10 @@ func TestUIHandler_OK(t *testing.T) {
 	}
 	if !strings.Contains(body, "loadSessions") {
 		t.Error("response does not contain JS entry point")
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if csp == "" {
+		t.Error("Content-Security-Policy header missing from UI response")
 	}
 }
 
@@ -456,6 +470,24 @@ func TestOutputHandler_SpanIDWithSlash(t *testing.T) {
 	h(rec, httptest.NewRequest(http.MethodGet, "/api/output/sess-sl/span-a/extra", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status %d, want 400 for spanID containing slash", rec.Code)
+	}
+}
+
+func TestOutputHandler_DotDotInIDs(t *testing.T) {
+	store, dataDir := openTestStore(t)
+	h := makeOutputHandler(store, dataDir)
+
+	// ".." in sessionID or spanID must be rejected before any DB lookup.
+	for _, path := range []string{
+		"/api/output/../evil/span-id",
+		"/api/output/sess-id/..evil",
+		"/api/output/sess..id/span-id",
+	} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("path %q: got 200, want non-200 (.. should be rejected)", path)
+		}
 	}
 }
 

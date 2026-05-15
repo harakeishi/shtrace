@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -114,17 +115,23 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 	_, _ = fmt.Fprintf(stdout, "shtrace serve: listening on http://%s  (Ctrl-C to stop)\n", addr)
 
+	serveDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
-			_, _ = fmt.Fprintf(stderr, "shtrace: serve shutdown: %v\n", shutErr)
+		select {
+		case <-ctx.Done():
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
+				_, _ = fmt.Fprintf(stderr, "shtrace: serve shutdown: %v\n", shutErr)
+			}
+		case <-serveDone:
 		}
 	}()
 
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		_, _ = fmt.Fprintf(stderr, "shtrace: serve: %v\n", err)
+	serveErr := srv.Serve(ln)
+	close(serveDone)
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		_, _ = fmt.Fprintf(stderr, "shtrace: serve: %v\n", serveErr)
 		return 1
 	}
 	return 0
@@ -231,6 +238,15 @@ func makeSpansHandler(store *storage.Store) http.HandlerFunc {
 			return
 		}
 
+		if _, err := store.GetSession(r.Context(), sessionID); err != nil {
+			if errors.Is(err, storage.ErrSessionNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+
 		spans, err := store.SpansForSession(r.Context(), sessionID, nil)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
@@ -270,6 +286,12 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 		// SplitN(…, 2) guarantees parts[0] (sessionID) never contains "/".
 		// parts[1] (spanID) may contain "/" when extra path segments are present.
 		if strings.Contains(spanID, "/") {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		// Reject ".." components to prevent path traversal even if crafted DB
+		// rows bypass the SpanExists guard.
+		if strings.Contains(sessionID, "..") || strings.Contains(spanID, "..") {
 			http.Error(w, "invalid id", http.StatusBadRequest)
 			return
 		}
@@ -381,6 +403,7 @@ func makeUIHandler() http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'")
 		_, _ = io.WriteString(w, serveUI)
 	}
 }
