@@ -12,11 +12,10 @@ a SaaS.
 
 ## Status
 
-**Phase 1 (Collector MVP) — alpha.** Mode A (PTY), mode B (pipe), FTS5
-search, storage GC, entropy-based secret masking, and `shtrace report`
-all ship today. Phase 2 (MCP server) and the rest of Phase 3 (export /
-import, GitHub Actions workflow, `pr-comment`) are planned but not yet
-implemented. See [Roadmap](#roadmap).
+**Phase 1–4 complete — alpha.** The collector (PTY/pipe modes, FTS5 search,
+GC, secret masking), MCP stdio server, HTML report, export/import, GitHub
+Actions integration, `shtrace pr-comment`, and the `shtrace serve` web UI all
+ship today. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -141,6 +140,40 @@ shtrace import session.tar.gz --overwrite
 shtrace import session.tar.gz --rename
 ```
 
+## MCP server
+
+`shtrace mcp` starts a Model Context Protocol server over stdio (JSON-RPC 2.0).
+AI agents can use it to query recorded execution history without any SaaS:
+
+```sh
+shtrace mcp
+```
+
+Available tools:
+
+| Tool | Description |
+|---|---|
+| `get_session` | Return all spans and output for a session |
+| `search_commands` | Full-text search across recorded output |
+| `detect_test_runs` | Identify test framework invocations in a session |
+| `compare_runs` | Diff two sessions — highlights regressions and new failures |
+
+Wire it up in your MCP client config as a stdio server with command `shtrace mcp`.
+
+## Web UI
+
+`shtrace serve` starts a local HTTP server with a single-page UI for browsing
+sessions without touching the command line:
+
+```sh
+shtrace serve                  # default port 7474
+shtrace serve --port 8080
+```
+
+The UI lists recent sessions, shows span output with stdout/stderr colour-coding,
+and supports full-text search. It is served at `http://127.0.0.1:<port>` and
+only listens on loopback — no network exposure.
+
 ## GitHub Actions integration
 
 Copy `.github/workflows/shtrace-sample.yml` from this repo into your own
@@ -263,9 +296,9 @@ design — CI integration should be a single env var, not a checked-in file).
 | Phase | Scope | Status |
 |---|---|---|
 | 1. Collector MVP | `shtrace <cmd>`, `ls`, `show`, mode A (PTY) + mode B (pipe), `search` (FTS5), `gc`, secret masking (patterns + entropy), session propagation, SQLite + JSON Lines, `shell-init` | done |
-| 2. MCP server | `shtrace mcp` stdio server with `get_session`, `search_commands`, `detect_test_runs`, `compare_runs` | planned |
-| 3. PR verification + HTML report | `shtrace report` (done), `shtrace export/import`, GitHub Actions workflow, `shtrace pr-comment` | in progress |
-| 4. Web UI | `shtrace serve` with dynamic search, asciinema-style replay, diff view | stretch goal |
+| 2. MCP server | `shtrace mcp` stdio server with `get_session`, `search_commands`, `detect_test_runs`, `compare_runs` | done |
+| 3. PR verification + HTML report | `shtrace report`, `shtrace export/import`, GitHub Actions workflow, `shtrace pr-comment` | done |
+| 4. Web UI | `shtrace serve` with session list, span viewer, full-text search | done |
 | 5. attest layer | AI execution-verification score | stretch goal |
 
 ## Non-goals
