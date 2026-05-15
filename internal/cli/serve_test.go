@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,38 @@ func TestSessionsHandler_OK(t *testing.T) {
 	}
 	if sessions[0].Tags["pr"] != "42" {
 		t.Errorf("tags=%v, want pr=42", sessions[0].Tags)
+	}
+}
+
+func TestSessionsHandler_Capped(t *testing.T) {
+	store, _ := openTestStore(t)
+	// Insert 502 sessions (cap is 500; 501 triggers the capped flag).
+	for i := 0; i < 502; i++ {
+		if err := store.InsertSession(context.Background(), storage.Session{
+			ID:        fmt.Sprintf("sess-%04d", i),
+			StartedAt: time.Now().UTC(),
+			Tags:      map[string]string{},
+		}); err != nil {
+			t.Fatalf("insert session %d: %v", i, err)
+		}
+	}
+
+	h := makeSessionsHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Shtrace-Sessions-Capped"); got != "true" {
+		t.Errorf("X-Shtrace-Sessions-Capped=%q, want true", got)
+	}
+	var sessions []apiSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &sessions); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(sessions) != 500 {
+		t.Errorf("got %d sessions, want exactly 500", len(sessions))
 	}
 }
 

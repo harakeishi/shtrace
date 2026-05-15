@@ -173,10 +173,16 @@ func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		sessions, err := store.ListSessions(r.Context(), 500, nil)
+		const sessionCap = 500
+		// Request one extra to detect whether the list was capped.
+		sessions, err := store.ListSessions(r.Context(), sessionCap+1, nil)
 		if err != nil {
 			http.Error(w, "store error", http.StatusInternalServerError)
 			return
+		}
+		capped := len(sessions) > sessionCap
+		if capped {
+			sessions = sessions[:sessionCap]
 		}
 		out := make([]apiSession, 0, len(sessions))
 		for _, s := range sessions {
@@ -190,6 +196,9 @@ func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 				a.EndedAt = &t
 			}
 			out = append(out, a)
+		}
+		if capped {
+			w.Header().Set("X-Shtrace-Sessions-Capped", "true")
 		}
 		writeJSON(w, out)
 	}
@@ -435,10 +444,15 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"}\n" +
 	"\n" +
 	"function loadSessions(){\n" +
-	"  fetch('/api/sessions').then(function(r){return r.json();}).then(function(sessions){\n" +
+	"  fetch('/api/sessions').then(function(resp){\n" +
+	"    var capped=resp.headers.get('X-Shtrace-Sessions-Capped')==='true';\n" +
+	"    return resp.json().then(function(sessions){return{sessions:sessions,capped:capped};});\n" +
+	"  }).then(function(data){\n" +
+	"    var sessions=data.sessions,capped=data.capped;\n" +
 	"    var el=document.getElementById('sessions');\n" +
 	"    if(!sessions.length){el.innerHTML='<div style=\"padding:12px;color:#666;font-size:12px\">No sessions recorded yet.</div>';return;}\n" +
 	"    el.innerHTML='';\n" +
+	"    if(capped){var cap=document.createElement('div');cap.style='padding:6px 12px;font-size:11px;color:#f0a000;border-bottom:1px solid #333;';cap.textContent='Showing newest 500 sessions.';el.appendChild(cap);}\n" +
 	"    sessions.forEach(function(s){\n" +
 	"      var d=document.createElement('div');\n" +
 	"      d.className='sess';\n" +
