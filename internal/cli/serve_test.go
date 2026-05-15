@@ -173,6 +173,9 @@ func TestSessionsHandler_MethodNotAllowed(t *testing.T) {
 		if rec.Code != http.StatusMethodNotAllowed {
 			t.Errorf("method %s: status %d, want 405", method, rec.Code)
 		}
+		if allow := rec.Header().Get("Allow"); allow == "" {
+			t.Errorf("method %s: Allow header missing from 405 response", method)
+		}
 	}
 }
 
@@ -267,6 +270,9 @@ func TestSpansHandler_MethodNotAllowed(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status %d, want 405", rec.Code)
 	}
+	if allow := rec.Header().Get("Allow"); allow == "" {
+		t.Error("Allow header missing from 405 response")
+	}
 }
 
 // ---- /api/search ----
@@ -297,6 +303,9 @@ func TestSearchHandler_MethodNotAllowed(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status %d, want 405", rec.Code)
 	}
+	if allow := rec.Header().Get("Allow"); allow == "" {
+		t.Error("Allow header missing from 405 response")
+	}
 }
 
 // ---- / (UI) ----
@@ -319,7 +328,7 @@ func TestUIHandler_OK(t *testing.T) {
 	if !strings.Contains(body, "loadSessions") {
 		t.Error("response does not contain JS entry point")
 	}
-	const wantCSP = "default-src 'self'; script-src 'unsafe-inline'"
+	const wantCSP = "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
 	if got := rec.Header().Get("Content-Security-Policy"); got != wantCSP {
 		t.Errorf("Content-Security-Policy=%q, want %q", got, wantCSP)
 	}
@@ -341,6 +350,9 @@ func TestUIHandler_MethodNotAllowed(t *testing.T) {
 		h(rec, httptest.NewRequest(method, "/", nil))
 		if rec.Code != http.StatusMethodNotAllowed {
 			t.Errorf("method %s: status %d, want 405", method, rec.Code)
+		}
+		if allow := rec.Header().Get("Allow"); allow == "" {
+			t.Errorf("method %s: Allow header missing from 405 response", method)
 		}
 	}
 }
@@ -433,6 +445,9 @@ func TestOutputHandler_MethodNotAllowed(t *testing.T) {
 	h(rec, httptest.NewRequest(http.MethodPost, "/api/output/s/sp", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status %d, want 405", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); allow == "" {
+		t.Error("Allow header missing from 405 response")
 	}
 }
 
