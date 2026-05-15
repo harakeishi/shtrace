@@ -1107,17 +1107,19 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		curLogFile = nil
 	}
 
-	// Stamp session end time. Non-fatal: the session row already exists and
-	// the spans are recorded; losing the end-time is unfortunate but not
-	// a reason to return an error code.
-	ended := time.Now().UTC()
-	if err := store.InsertSession(ctx, storage.Session{
-		ID:        sessCtx.SessionID,
-		StartedAt: sessionStartedAt,
-		EndedAt:   &ended,
-		Tags:      sessCtx.Tags,
-	}); err != nil {
-		_, _ = fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
+	// Stamp session end time only when we own the session (IsRoot). A child
+	// shell shares its parent's session ID; stamping ended_at here would
+	// prematurely close the still-running parent session in the database.
+	if sessCtx.IsRoot {
+		ended := time.Now().UTC()
+		if err := store.InsertSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			EndedAt:   &ended,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: finalize session: %v\n", err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stderr, "\r\nshtrace: session %s ended\r\n", sessCtx.SessionID)

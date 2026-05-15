@@ -343,8 +343,12 @@ if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" =~ 'declare -a' ]]; then
     # Array form: prepend our hook and append the sentinel.
     PROMPT_COMMAND=("__shtrace_precmd" "${PROMPT_COMMAND[@]}" "__shtrace_in_prompt=0")
 elif [ -n "$PROMPT_COMMAND" ]; then
-    # Scalar form: strip trailing semicolons/whitespace before concatenating.
-    PROMPT_COMMAND="__shtrace_precmd; ${PROMPT_COMMAND%;}; __shtrace_in_prompt=0"
+    # Scalar form: strip all trailing semicolons and whitespace (handles
+    # "cmd;", "cmd; ", "cmd ;", etc.) before concatenating, to avoid
+    # generating ";;" which is a bash syntax error.
+    __shtrace_pc="$(printf '%s' "$PROMPT_COMMAND" | sed 's/[[:space:];]*$//')"
+    PROMPT_COMMAND="__shtrace_precmd; ${__shtrace_pc}; __shtrace_in_prompt=0"
+    unset __shtrace_pc
 else
     PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
 fi
@@ -368,7 +372,7 @@ __shtrace_preexec() {
     __cmd="${__cmd//$'\e'/}"
     printf '\033]133;B;%s\007' "$__cmd"
 }
-__shtrace_precmd() { local rc=$?; printf '\033]133;D;%d\007' "$rc" }
+__shtrace_precmd() { local rc=$?; printf '\033]133;D;%d\007' "$rc"; return $rc }
 add-zsh-hook preexec __shtrace_preexec
 # Prepend to precmd_functions so we read $? before other hooks run.
 precmd_functions=(__shtrace_precmd "${precmd_functions[@]}")
