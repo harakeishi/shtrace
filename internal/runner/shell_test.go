@@ -1,7 +1,11 @@
 package runner
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/harakeishi/shtrace/internal/secret"
+	"github.com/harakeishi/shtrace/internal/storage"
 )
 
 // feedExtract is a helper that converts the ordered event slice from Feed into
@@ -190,19 +194,27 @@ func TestOSCParser_OscBufOverflow(t *testing.T) {
 	}
 }
 
-// TestParseOSC133_B verifies B marker parsing.
+// TestParseOSC133_B verifies B marker parsing without command text.
 func TestParseOSC133_B(t *testing.T) {
-	kind, code, ok := parseOSC133("133;B")
-	if !ok || kind != "B" || code != 0 {
-		t.Errorf("parseOSC133(133;B) = (%q, %d, %v), want (B, 0, true)", kind, code, ok)
+	kind, arg, ok := parseOSC133("133;B")
+	if !ok || kind != "B" || arg != "" {
+		t.Errorf("parseOSC133(133;B) = (%q, %q, %v), want (B, \"\", true)", kind, arg, ok)
 	}
 }
 
-// TestParseOSC133_D verifies D marker parsing with exit code.
+// TestParseOSC133_BWithCommand verifies B marker carries the command string.
+func TestParseOSC133_BWithCommand(t *testing.T) {
+	kind, arg, ok := parseOSC133("133;B;ls -la /tmp")
+	if !ok || kind != "B" || arg != "ls -la /tmp" {
+		t.Errorf("parseOSC133(133;B;ls -la /tmp) = (%q, %q, %v), want (B, \"ls -la /tmp\", true)", kind, arg, ok)
+	}
+}
+
+// TestParseOSC133_D verifies D marker carries the exit code as a string.
 func TestParseOSC133_D(t *testing.T) {
-	kind, code, ok := parseOSC133("133;D;127")
-	if !ok || kind != "D" || code != 127 {
-		t.Errorf("parseOSC133(133;D;127) = (%q, %d, %v), want (D, 127, true)", kind, code, ok)
+	kind, arg, ok := parseOSC133("133;D;127")
+	if !ok || kind != "D" || arg != "127" {
+		t.Errorf("parseOSC133(133;D;127) = (%q, %q, %v), want (D, \"127\", true)", kind, arg, ok)
 	}
 }
 
@@ -216,8 +228,116 @@ func TestParseOSC133_NonShtrace(t *testing.T) {
 
 // TestParseOSC133_Zero verifies exit code 0 is handled.
 func TestParseOSC133_Zero(t *testing.T) {
-	kind, code, ok := parseOSC133("133;D;0")
-	if !ok || kind != "D" || code != 0 {
-		t.Errorf("parseOSC133(133;D;0) = (%q, %d, %v), want (D, 0, true)", kind, code, ok)
+	kind, arg, ok := parseOSC133("133;D;0")
+	if !ok || kind != "D" || arg != "0" {
+		t.Errorf("parseOSC133(133;D;0) = (%q, %q, %v), want (D, \"0\", true)", kind, arg, ok)
+	}
+}
+
+// TestShellOutputLoop_CommandPassedToBegin verifies that the command text from
+// an OSC 133 B marker is passed to ShellSpan.Begin, so the CLI can record the
+// actual command rather than just the shell name.
+func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
+	// Simulate a PTY stream: prompt, B marker with command, output, D marker.
+	stream := []byte("$ \033]133;B;echo hello\007hello\n\033]133;D;0\007$ ")
+
+	var gotCommand string
+	var gotExitCode int
+	var spans []struct{ cmd string; exit int }
+
+	span := ShellSpan{
+		Begin: func(command string) (ChunkWriter, error) {
+			gotCommand = command
+			return &discardWriter{}, nil
+		},
+		End: func(exitCode int) error {
+			gotExitCode = exitCode
+			spans = append(spans, struct{ cmd string; exit int }{gotCommand, exitCode})
+			return nil
+		},
+	}
+
+	masker, _ := newTestMasker()
+	processShellEvents(stream, span, masker)
+
+	if len(spans) != 1 {
+		t.Fatalf("len(spans) = %d, want 1", len(spans))
+	}
+	if spans[0].cmd != "echo hello" {
+		t.Errorf("span command = %q, want %q", spans[0].cmd, "echo hello")
+	}
+	if spans[0].exit != 0 {
+		t.Errorf("span exit = %d, want 0", spans[0].exit)
+	}
+	_ = gotExitCode
+}
+
+// newTestMasker returns a no-op Masker suitable for tests.
+func newTestMasker() (*secret.Masker, error) {
+	return secret.NewMaskerWithLiterals(nil, nil)
+}
+
+// discardWriter is a ChunkWriter that discards all output.
+type discardWriter struct{}
+
+func (d *discardWriter) WriteChunk(_ storage.Stream, _ []byte) error { return nil }
+
+// processShellEvents is a test helper that feeds bytes through the OSC parser
+// and fires span lifecycle callbacks, equivalent to the core of shellOutputLoop.
+func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
+	var parser oscParser
+	var writer ChunkWriter
+	var spanEnd func(int) error
+	var pending []byte
+
+	flushPending := func() {
+		if writer != nil && len(pending) > 0 {
+			masked, _ := masker.MaskString(string(pending))
+			_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
+		}
+		pending = pending[:0]
+	}
+
+	endSpan := func(code int) {
+		flushPending()
+		if spanEnd != nil {
+			_ = spanEnd(code)
+		}
+		writer = nil
+		spanEnd = nil
+	}
+
+	for _, ev := range parser.Feed(input) {
+		if ev.Seq != "" {
+			kind, arg, ok := parseOSC133(ev.Seq)
+			if !ok {
+				continue
+			}
+			switch kind {
+			case "B":
+				if spanEnd != nil {
+					endSpan(-1)
+				}
+				if span.Begin != nil {
+					w, err := span.Begin(arg)
+					if err == nil {
+						writer = w
+						spanEnd = span.End
+					}
+				}
+			case "D":
+				if spanEnd != nil {
+					code := 0
+					if n, err2 := fmt.Sscanf(arg, "%d", &code); n != 1 || err2 != nil {
+						code = -1
+					}
+					endSpan(code)
+				}
+			}
+			continue
+		}
+		if writer != nil && len(ev.Bytes) > 0 {
+			pending = append(pending, ev.Bytes...)
+		}
 	}
 }

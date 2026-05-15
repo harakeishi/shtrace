@@ -29,10 +29,11 @@ import (
 // ShellSpan holds the span lifecycle callbacks that RunShell calls for each
 // interactive command the user runs.
 type ShellSpan struct {
-	// Begin is called when an interactive command starts. It returns a
-	// ChunkWriter for the command's output. Returning a nil writer suppresses
-	// recording for that command.
-	Begin func() (ChunkWriter, error)
+	// Begin is called when an interactive command starts. command is the raw
+	// command string from the OSC 133 B marker (e.g. "ls -la /tmp"). It
+	// returns a ChunkWriter for the command's output. Returning a nil writer
+	// suppresses recording for that command.
+	Begin func(command string) (ChunkWriter, error)
 	// End is called when the command finishes with the given exit code.
 	End func(exitCode int) error
 }
@@ -205,7 +206,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 			// are handled relative to each other (not bytes-then-markers).
 			for _, ev := range parser.Feed(raw) {
 				if ev.Seq != "" {
-					kind, code, ok := parseOSC133(ev.Seq)
+					kind, arg, ok := parseOSC133(ev.Seq)
 					if !ok {
 						continue
 					}
@@ -215,7 +216,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 							endSpan(-1, true)
 						}
 						if opt.Span.Begin != nil {
-							w, berr := opt.Span.Begin()
+							w, berr := opt.Span.Begin(arg)
 							if berr != nil {
 								if opt.Stderr != nil {
 									_, _ = fmt.Fprintf(opt.Stderr, "shtrace: span begin: %v\n", berr)
@@ -227,6 +228,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 						}
 					case "D": // command done
 						if spanEnd != nil {
+							code, _ := strconv.Atoi(arg)
 							endSpan(code, false)
 						}
 					}
@@ -293,7 +295,7 @@ fi
 __shtrace_debug_hook() {
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
-    printf '\033]133;B\007'
+    printf '\033]133;B;%s\007' "$BASH_COMMAND"
     [ -n "$__shtrace_prev_debug" ] && eval "$__shtrace_prev_debug"
 }
 trap '__shtrace_debug_hook' DEBUG
@@ -322,7 +324,7 @@ const zshRC = `# shtrace: source user rc (skip if ZDOTDIR was already our dir)
 # preexec/precmd hooks (e.g. from powerlevel10k, zsh-syntax-highlighting)
 # are not overwritten.
 autoload -Uz add-zsh-hook
-__shtrace_preexec() { printf '\033]133;B\007' }
+__shtrace_preexec() { printf '\033]133;B;%s\007' "$1" }
 __shtrace_precmd()  { printf '\033]133;D;%d\007' "$?" }
 add-zsh-hook preexec __shtrace_preexec
 add-zsh-hook precmd  __shtrace_precmd
@@ -438,19 +440,20 @@ func (p *oscParser) Feed(input []byte) []parserEvent {
 }
 
 // parseOSC133 parses an OSC payload and returns the marker kind (A/B/C/D),
-// the exit code (for D markers), and whether it was an OSC 133 sequence.
-func parseOSC133(payload string) (kind string, exitCode int, ok bool) {
+// the raw argument string (command text for B, exit-code string for D), and
+// whether it was an OSC 133 sequence.
+func parseOSC133(payload string) (kind, arg string, ok bool) {
 	if !strings.HasPrefix(payload, "133;") {
-		return "", 0, false
+		return "", "", false
 	}
 	rest := payload[4:]
 	if idx := strings.IndexByte(rest, ';'); idx >= 0 {
 		kind = rest[:idx]
-		exitCode, _ = strconv.Atoi(rest[idx+1:])
+		arg = rest[idx+1:]
 	} else {
 		kind = rest
 	}
-	return kind, exitCode, true
+	return kind, arg, true
 }
 
 func isExitError(err error, out **exec.ExitError) bool {

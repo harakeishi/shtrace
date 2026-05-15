@@ -972,9 +972,11 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		curLogPath   string
 		curLogFile   *os.File
 		curStartedAt time.Time
+		curCommand   string
 	)
 
-	spanBegin := func() (runner.ChunkWriter, error) {
+	spanBegin := func(command string) (runner.ChunkWriter, error) {
+		curCommand = command
 		if curLogFile != nil {
 			_ = curLogFile.Close()
 			curLogFile = nil
@@ -1019,9 +1021,20 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		spanID := curSpanID
 		logPath := curLogPath
 		startedAt := curStartedAt
+		cmdText := curCommand
 		curSpanID = ""
 		curLogPath = ""
 		curStartedAt = time.Time{}
+		curCommand = ""
+
+		// Parse the command text into argv; fall back to shell name if empty.
+		cmdArgv := strings.Fields(cmdText)
+		cmdName := shell
+		if len(cmdArgv) > 0 {
+			cmdName = cmdArgv[0]
+		} else {
+			cmdArgv = []string{shell}
+		}
 
 		endedAt := time.Now().UTC()
 		code := exitCode
@@ -1031,8 +1044,8 @@ func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if err := store.InsertSpan(ctx, storage.Span{
 			ID:        spanID,
 			SessionID: sessCtx.SessionID,
-			Command:   shell,
-			Argv:      []string{shell},
+			Command:   cmdName,
+			Argv:      cmdArgv,
 			Cwd:       "",
 			Mode:      "pty",
 			StartedAt: startedAt,
