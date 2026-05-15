@@ -197,10 +197,19 @@ func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 			}
 			out = append(out, a)
 		}
+		// Marshal before setting any headers so that a marshal failure
+		// (http.Error → 500) does not emit X-Shtrace-Sessions-Capped
+		// alongside a non-200 status, which would be contradictory.
+		b, marshalErr := json.Marshal(out)
+		if marshalErr != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
 		if capped {
 			w.Header().Set("X-Shtrace-Sessions-Capped", "true")
 		}
-		writeJSON(w, out)
+		_, _ = w.Write(b)
 	}
 }
 
@@ -434,7 +443,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"var activeSessEl=null;\n" +
 	"var activeSessionID=null;\n" +
 	"\n" +
-	"function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}\n" +
+	"function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n" +
 	"\n" +
 	"function durationStr(start,end){\n" +
 	"  var ms=new Date(end)-new Date(start);\n" +
