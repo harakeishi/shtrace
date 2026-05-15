@@ -60,7 +60,7 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	argv, childEnv, err := shellInvocation(opt.Shell, tmpDir, opt.Env)
 	if err != nil {
@@ -77,7 +77,7 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 	if err != nil {
 		return fmt.Errorf("start shell pty: %w", err)
 	}
-	defer ptmx.Close()
+	defer func() { _ = ptmx.Close() }()
 
 	if opt.Tty != nil {
 		sigCh := make(chan os.Signal, 1)
