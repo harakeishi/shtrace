@@ -198,7 +198,7 @@ func TestFTS_ReindexAll(t *testing.T) {
 		{TS: "2026-01-01T00:00:00Z", Stream: "stdout", Data: "freshtoken12345"},
 	})
 
-	if err := storage.ReindexAll(ctx, fts, metaStore, dir); err != nil {
+	if err := storage.ReindexAll(ctx, fts, metaStore, dir, nil); err != nil {
 		t.Fatalf("ReindexAll: %v", err)
 	}
 
@@ -266,7 +266,7 @@ func TestFTS_ReindexAll_ManySessionsIndexesAll(t *testing.T) {
 		t.Fatalf("MigrateFTS: %v", err)
 	}
 
-	if err := storage.ReindexAll(ctx, fts, metaStore, dir); err != nil {
+	if err := storage.ReindexAll(ctx, fts, metaStore, dir, nil); err != nil {
 		t.Fatalf("ReindexAll: %v", err)
 	}
 

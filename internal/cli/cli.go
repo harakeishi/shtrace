@@ -29,7 +29,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell")
 		return 2
 	}
 
@@ -43,7 +43,7 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, shell-init, shell")
 		return 2
 	}
 
@@ -66,6 +66,8 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runSession(ctx, argv[2:], stdout, stderr)
 	case "shell-init":
 		return runShellInit(argv[2:], stdout, stderr)
+	case "shell":
+		return runShell(ctx, argv[2:], stdout, stderr)
 	case "export":
 		return runExport(ctx, argv[2:], stdout, stderr)
 	case "import":
@@ -496,7 +498,8 @@ func runReindex(ctx context.Context, _ []string, stdout, stderr io.Writer) int {
 	}
 
 	_, _ = fmt.Fprintln(stdout, "reindexing...")
-	if err := storage.ReindexAll(ctx, fts, store, dataDir); err != nil {
+	warnReindex := func(e error) { _, _ = fmt.Fprintf(stderr, "shtrace: %v\n", e) }
+	if err := storage.ReindexAll(ctx, fts, store, dataDir, warnReindex); err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: reindex: %v\n", err)
 		return 1
 	}
@@ -541,10 +544,12 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (index cleanup skipped): %v\n", err)
 		} else {
-			defer func() { _ = fts.Close() }()
 			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
 				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (index cleanup skipped): %v\n", migrErr)
+				_ = fts.Close()
 				fts = nil
+			} else {
+				defer func() { _ = fts.Close() }()
 			}
 		}
 	}
@@ -867,6 +872,238 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+// runShell starts an interactive bash or zsh session. Each command the user
+// runs in the shell is recorded as a separate span in a new shtrace session.
+//
+// Usage:
+//
+//	shtrace shell           # defaults to bash
+//	shtrace shell bash
+//	shtrace shell zsh
+func runShell(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	shell := "bash"
+	for _, a := range args {
+		switch a {
+		case "bash", "zsh":
+			shell = a
+		default:
+			_, _ = fmt.Fprintf(stderr, "shtrace shell: unknown argument %q\n", a)
+			_, _ = fmt.Fprintln(stderr, "usage: shtrace shell [bash|zsh]")
+			return 2
+		}
+	}
+
+	env := envMap()
+	dataDir, err := storage.ResolveDataDir(env, runtime.GOOS)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: mkdir data dir: %v\n", err)
+		return 1
+	}
+
+	sessCtx, err := session.FromEnv(env, session.DefaultIDGenerator())
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: %v\n", err)
+		return 1
+	}
+
+	store, err := storage.Open(dataDir + "/sessions.db")
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open store: %v\n", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(ctx); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: migrate: %v\n", err)
+		return 1
+	}
+
+	sessionStartedAt := time.Now().UTC()
+	// Mirror runWrapped's IsRoot guard: only insert when starting a new root
+	// session. If SHTRACE_SESSION_ID is already set, use EnsureSession so we
+	// don't overwrite an existing session row.
+	if sessCtx.IsRoot {
+		if err := store.InsertSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: insert session: %v\n", err)
+			return 1
+		}
+	} else {
+		if err := store.EnsureSession(ctx, storage.Session{
+			ID:        sessCtx.SessionID,
+			StartedAt: sessionStartedAt,
+			Tags:      sessCtx.Tags,
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: ensure session: %v\n", err)
+			return 1
+		}
+	}
+
+	idGen := session.DefaultIDGenerator()
+
+	_, envSecrets := secret.MaskEnv(env)
+	masker, err := secret.NewMaskerWithLiterals(nil, envSecrets)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: build masker: %v\n", err)
+		return 1
+	}
+
+	// Open FTS once for the whole session to avoid per-span open/migrate/close.
+	var fts *storage.FTSStore
+	if ftsStore, ftsErr := storage.OpenFTS(storage.FTSPath(dataDir)); ftsErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search index disabled for session): %v\n", ftsErr)
+	} else if migrErr := ftsStore.MigrateFTS(ctx); migrErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search index disabled for session): %v\n", migrErr)
+		_ = ftsStore.Close()
+	} else {
+		fts = ftsStore
+		defer func() { _ = fts.Close() }()
+	}
+
+	// Per-span state; mutated by the Begin/End callbacks below.
+	var (
+		curSpanID    string
+		curLogPath   string
+		curLogFile   *os.File
+		curStartedAt time.Time
+	)
+
+	spanBegin := func() (runner.ChunkWriter, error) {
+		if curLogFile != nil {
+			_ = curLogFile.Close()
+			curLogFile = nil
+		}
+		spanID, idErr := idGen.NewSpanID()
+		if idErr != nil {
+			return nil, fmt.Errorf("generate span id: %w", idErr)
+		}
+		// Set span state optimistically; clear it on any error so the
+		// post-RunShell cleanup guard does not see a phantom curSpanID.
+		curSpanID = spanID
+		curStartedAt = time.Now().UTC()
+
+		logPath := storage.OutputPath(dataDir, sessCtx.SessionID, spanID)
+		if err := os.MkdirAll(parentDir(logPath), 0o755); err != nil {
+			curSpanID = ""
+			curStartedAt = time.Time{}
+			return nil, fmt.Errorf("mkdir outputs: %w", err)
+		}
+		f, err := os.Create(logPath)
+		if err != nil {
+			curSpanID = ""
+			curStartedAt = time.Time{}
+			return nil, fmt.Errorf("open log: %w", err)
+		}
+		curLogFile = f
+		curLogPath = logPath
+		return storage.NewJSONLWriter(f, nil), nil
+	}
+
+	spanEnd := func(exitCode int) error {
+		if curLogFile != nil {
+			_ = curLogFile.Sync()
+			_ = curLogFile.Close()
+			curLogFile = nil
+		}
+		if curSpanID == "" {
+			return nil
+		}
+		// Clear span state before the DB write so a failure leaves a clean
+		// slate (prevents stale curSpanID/curStartedAt from persisting).
+		spanID := curSpanID
+		logPath := curLogPath
+		startedAt := curStartedAt
+		curSpanID = ""
+		curLogPath = ""
+		curStartedAt = time.Time{}
+
+		endedAt := time.Now().UTC()
+		code := exitCode
+		if code < 0 {
+			code = -1
+		}
+		if err := store.InsertSpan(ctx, storage.Span{
+			ID:        spanID,
+			SessionID: sessCtx.SessionID,
+			Command:   shell,
+			Argv:      []string{shell},
+			Cwd:       "",
+			Mode:      "pty",
+			StartedAt: startedAt,
+			EndedAt:   endedAt,
+			ExitCode:  &code,
+		}); err != nil {
+			return fmt.Errorf("insert span: %w", err)
+		}
+
+		// Best-effort FTS indexing using the session-scoped FTS handle.
+		if fts != nil {
+			_ = fts.IndexSpan(ctx, spanID, sessCtx.SessionID, logPath)
+		}
+		return nil
+	}
+
+	var tty *os.File
+	if f, ok := stdout.(*os.File); ok && isatty.IsTerminal(f.Fd()) {
+		tty = f
+	}
+
+	cwd, cwdErr := os.Getwd()
+	if cwdErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not determine working directory: %v\n", cwdErr)
+	}
+	childEnv := append(os.Environ(), envMapToSlice(sessCtx.ChildEnv())...)
+
+	_, _ = fmt.Fprintf(stderr, "shtrace: recording session %s (type 'exit' to stop)\r\n", sessCtx.SessionID)
+
+	runErr := runner.RunShell(ctx, runner.ShellOptions{
+		Shell:  shell,
+		Env:    childEnv,
+		Cwd:    cwd,
+		Tty:    tty,
+		Stderr: stderr,
+		Masker: masker,
+		Span: runner.ShellSpan{
+			Begin: spanBegin,
+			End:   spanEnd,
+		},
+	})
+
+	// Close any span still open (e.g. shell killed mid-command) and insert
+	// the partial span into the DB so it is visible to shtrace show/ls.
+	if curLogFile != nil {
+		_ = curLogFile.Sync()
+		_ = curLogFile.Close()
+		curLogFile = nil
+	}
+	if curSpanID != "" {
+		_ = spanEnd(-1)
+	}
+
+	// Stamp session end time.
+	ended := time.Now().UTC()
+	_ = store.InsertSession(ctx, storage.Session{
+		ID:        sessCtx.SessionID,
+		StartedAt: sessionStartedAt,
+		EndedAt:   &ended,
+		Tags:      sessCtx.Tags,
+	})
+
+	_, _ = fmt.Fprintf(stderr, "\r\nshtrace: session %s ended\r\n", sessCtx.SessionID)
+
+	if runErr != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: shell: %v\n", runErr)
+		return 1
+	}
+	return 0
+}
+
 // shellQuote wraps s in POSIX single-quotes so it can be safely embedded in a
 // shell snippet even when s contains spaces or other special characters.
 // Single-quote characters within s are handled via the '\''-idiom.
@@ -943,10 +1180,12 @@ func runMCP(ctx context.Context, _ []string, r io.Reader, stdout, stderr io.Writ
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "shtrace: open fts (search_commands disabled): %v\n", err)
 		} else {
-			defer func() { _ = fts.Close() }()
 			if migrErr := fts.MigrateFTS(ctx); migrErr != nil {
 				_, _ = fmt.Fprintf(stderr, "shtrace: fts migrate (search_commands disabled): %v\n", migrErr)
+				_ = fts.Close()
 				fts = nil
+			} else {
+				defer func() { _ = fts.Close() }()
 			}
 		}
 	}

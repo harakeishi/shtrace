@@ -177,7 +177,7 @@ func (f *FTSStore) Search(ctx context.Context, query string, limit int) ([]Searc
 // either the old index or the fully rebuilt one — never a partial state.
 // The span_contents_ai trigger propagates each INSERT to outputs_fts, so no
 // manual 'rebuild' command is needed after the re-insert phase.
-func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string) error {
+func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string, warn func(error)) error {
 	// math.MaxInt32 fetches all sessions; passing 0 would silently cap at 50.
 	sessions, err := store.ListSessions(ctx, math.MaxInt32, nil)
 	if err != nil {
@@ -208,7 +208,9 @@ func ReindexAll(ctx context.Context, fts *FTSStore, store *Store, baseDir string
 			content, readErr := readLogContent(logPath)
 			if readErr != nil {
 				// Non-fatal: report but continue with remaining spans.
-				fmt.Fprintf(os.Stderr, "shtrace: reindex span %s: %v\n", sp.ID, readErr)
+				if warn != nil {
+					warn(fmt.Errorf("reindex span %s: %w", sp.ID, readErr))
+				}
 				continue
 			}
 			// The span_contents_ai trigger propagates each insert to outputs_fts.
