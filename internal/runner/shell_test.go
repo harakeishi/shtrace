@@ -1,7 +1,7 @@
 package runner
 
 import (
-	"strconv"
+	"bytes"
 	"testing"
 
 	"github.com/harakeishi/shtrace/internal/secret"
@@ -292,7 +292,12 @@ func TestShellOutputLoop_CommandPassedToBegin(t *testing.T) {
 	}
 
 	masker, _ := newTestMasker()
-	processShellEvents(stream, span, masker)
+	// Drive the real shellEventLoop (not a test-helper copy) so any future
+	// change to the production event loop is automatically exercised here.
+	shellEventLoop(bytes.NewReader(stream), ShellOptions{
+		Masker: masker,
+		Span:   span,
+	})
 
 	if len(spans) != 1 {
 		t.Fatalf("len(spans) = %d, want 1", len(spans))
@@ -314,85 +319,3 @@ func newTestMasker() (*secret.Masker, error) {
 type discardWriter struct{}
 
 func (d *discardWriter) WriteChunk(_ storage.Stream, _ []byte) error { return nil }
-
-// processShellEvents is a test helper that feeds bytes through the OSC parser
-// and fires span lifecycle callbacks, equivalent to the core of shellOutputLoop.
-func processShellEvents(input []byte, span ShellSpan, masker *secret.Masker) {
-	var parser oscParser
-	var writer ChunkWriter
-	var spanEnd func(int) error
-	var pending []byte
-
-	flushPending := func() {
-		if writer == nil || len(pending) == 0 {
-			return
-		}
-		masked, _ := masker.MaskString(string(pending))
-		_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
-		pending = pending[:0]
-	}
-
-	endSpan := func(code int) {
-		flushPending()
-		pending = nil // release backing array between spans
-		if spanEnd != nil {
-			_ = spanEnd(code)
-		}
-		writer = nil
-		spanEnd = nil
-	}
-
-	// writeCleaned mirrors the safety-tail masking in production shellOutputLoop:
-	// bytes are buffered in pending and flushed in safetyTail-sized chunks so
-	// that secrets straddling chunk boundaries are caught by the masker.
-	writeCleaned := func(b []byte) {
-		if writer == nil || len(b) == 0 {
-			return
-		}
-		pending = append(pending, b...)
-		if len(pending) > safetyTail {
-			masked, _ := masker.MaskString(string(pending))
-			if len(masked) > safetyTail {
-				cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
-				_ = writer.WriteChunk(storage.StreamPTY, []byte(masked[:cutoff]))
-				pending = []byte(masked[cutoff:])
-			} else {
-				pending = []byte(masked)
-			}
-		}
-	}
-
-	for _, ev := range parser.Feed(input) {
-		if ev.Seq != "" {
-			kind, arg, ok := parseOSC133(ev.Seq)
-			if !ok {
-				continue
-			}
-			switch kind {
-			case "B":
-				if spanEnd != nil {
-					endSpan(-1)
-				}
-				if span.Begin != nil {
-					w, err := span.Begin(stripOSCUnsafe(arg))
-					if err == nil && w != nil {
-						writer = w
-						spanEnd = span.End
-					}
-				}
-			case "D":
-				if spanEnd != nil {
-					code, _ := strconv.Atoi(arg)
-					endSpan(code)
-				}
-			}
-			continue
-		}
-		writeCleaned(ev.Bytes)
-	}
-	// If the input ended with an open span (B but no D), close it implicitly
-	// so End is always called — mirroring the post-RunShell cleanup in cli.go.
-	if spanEnd != nil {
-		endSpan(-1)
-	}
-}

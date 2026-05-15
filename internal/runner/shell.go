@@ -8,6 +8,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -121,19 +122,22 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 		// A non-zero exit from the shell is expected (e.g. the user ran a
 		// failing command last, or typed exit N). Surface it only when it is
 		// not an ExitError so the caller can propagate the exit code naturally.
-		var exitErr *exec.ExitError
-		if !isExitError(err, &exitErr) {
+		if !errors.As(err, new(*exec.ExitError)) {
 			return err
 		}
 	}
 	return nil
 }
 
-// shellOutputLoop reads from the PTY master, forwards all bytes to the user
-// terminal, and drives span recording by reacting to OSC 133 markers.
-// Events from the parser are processed in stream order so that command output
-// appearing between a B and D marker is correctly attributed to its span.
+// shellOutputLoop reads from the PTY master, forwards bytes to the terminal,
+// and drives span recording. It delegates to shellEventLoop.
 func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
+	shellEventLoop(ptmx, opt)
+}
+
+// shellEventLoop is the testable core of shellOutputLoop. It accepts any
+// io.Reader so unit tests can feed synthetic PTY bytes without a real PTY.
+func shellEventLoop(r io.Reader, opt ShellOptions) {
 	var (
 		parser  oscParser
 		writer  ChunkWriter
@@ -192,7 +196,7 @@ func shellOutputLoop(ptmx *os.File, opt ShellOptions) {
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := ptmx.Read(buf)
+		n, err := r.Read(buf)
 		if n > 0 {
 			raw := buf[:n]
 
@@ -305,11 +309,10 @@ if __shtrace_trap_out=$(trap -p DEBUG 2>/dev/null) && [ -n "$__shtrace_trap_out"
 fi
 
 __shtrace_debug_hook() {
-    # The first DEBUG trigger after PROMPT_COMMAND is the user's next real
-    # command: clear the in_prompt sentinel and fall through to emit B.
-    if [ "$__shtrace_in_prompt" = "1" ]; then
-        __shtrace_in_prompt=0
-    fi
+    # Suppress B markers for commands that run inside PROMPT_COMMAND (e.g.
+    # the user's existing prompt hooks). The sentinel is cleared at the end
+    # of PROMPT_COMMAND (see below) so real user commands pass through.
+    [ "$__shtrace_in_prompt" = "1" ] && return
     [ "$__shtrace_cmd_fired" = "1" ] && return
     __shtrace_cmd_fired=1
     # Strip BEL (\007) and ESC (\033) so they cannot prematurely terminate
@@ -334,9 +337,9 @@ __shtrace_precmd() {
     return "$rc"
 }
 if [ -n "$PROMPT_COMMAND" ]; then
-    PROMPT_COMMAND="__shtrace_precmd; $PROMPT_COMMAND"
+    PROMPT_COMMAND="__shtrace_precmd; $PROMPT_COMMAND; __shtrace_in_prompt=0"
 else
-    PROMPT_COMMAND="__shtrace_precmd"
+    PROMPT_COMMAND="__shtrace_precmd; __shtrace_in_prompt=0"
 fi
 `
 
@@ -502,14 +505,4 @@ func stripOSCUnsafe(s string) string {
 		}
 	}
 	return string(out)
-}
-
-func isExitError(err error, out **exec.ExitError) bool {
-	if e, ok := err.(*exec.ExitError); ok {
-		if out != nil {
-			*out = e
-		}
-		return true
-	}
-	return false
 }
