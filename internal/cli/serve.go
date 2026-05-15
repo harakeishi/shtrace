@@ -249,7 +249,9 @@ func makeOutputHandler(store *storage.Store, dataDir string) http.HandlerFunc {
 			return
 		}
 		sessionID, spanID := parts[0], parts[1]
-		if strings.Contains(sessionID, "/") || strings.Contains(spanID, "/") {
+		// SplitN(…, 2) guarantees parts[0] (sessionID) never contains "/".
+		// parts[1] (spanID) may contain "/" when extra path segments are present.
+		if strings.Contains(spanID, "/") {
 			http.Error(w, "invalid id", http.StatusBadRequest)
 			return
 		}
@@ -441,6 +443,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"      var d=document.createElement('div');\n" +
 	"      d.className='sess';\n" +
 	"      var tags=Object.entries(s.tags||{}).map(function(kv){return kv[0]+'='+kv[1];}).join(' ');\n" +
+	"      d.dataset.sid=s.id;\n" +
 	"      var html='<div class=\"sid\">'+esc(s.id.slice(0,20))+'</div>';\n" +
 	"      html+='<div class=\"stime\">'+esc(s.started_at.replace('T',' ').slice(0,16))+'</div>';\n" +
 	"      if(tags) html+='<div class=\"stags\">'+esc(tags)+'</div>';\n" +
@@ -516,8 +519,7 @@ const serveUI = "<!DOCTYPE html>\n" +
 	"        return function(){\n" +
 	"          var sessEls=document.querySelectorAll('.sess');\n" +
 	"          for(var i=0;i<sessEls.length;i++){\n" +
-	"            var sidEl=sessEls[i].querySelector('.sid');\n" +
-	"            if(sidEl&&sessID.indexOf(sidEl.textContent)===0){selectSession(sessID,sessEls[i]);break;}\n" +
+	"            if(sessEls[i].dataset.sid===sessID){selectSession(sessID,sessEls[i]);break;}\n" +
 	"          }\n" +
 	"        };\n" +
 	"      })(res.session_id);\n" +
