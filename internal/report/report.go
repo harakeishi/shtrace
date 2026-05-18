@@ -46,6 +46,11 @@ type Options struct {
 	// Warn receives non-fatal per-row parse failures from the store. nil is
 	// allowed and silences warnings.
 	Warn func(error)
+	// Now overrides the clock used for the report's "generated at"
+	// timestamp. Tests pass a fixed value so byte-for-byte determinism
+	// checks across multiple Render calls stay stable across the second
+	// boundary. nil falls back to time.Now.
+	Now func() time.Time
 }
 
 // chunkView is one rendered line in the timeline view. Stream maps to a
@@ -67,6 +72,11 @@ type spanView struct {
 	Mode         string
 	StartedAt    string
 	DurationMS   int64
+	// BarWidth is the duration bar's width as a percent of the longest
+	// span in the session (0..100). It is purely presentational and never
+	// affects ordering — it lets the timeline mimic a Datadog-style trace
+	// view without any client-side JS.
+	BarWidth     int
 	ExitCode     string
 	ExitClass    string // "ok" | "fail" | "unknown"
 	Chunks       []chunkView
@@ -143,11 +153,15 @@ func Render(ctx context.Context, src Source, w io.Writer, opts Options) (string,
 		return spans[i].StartedAt.Before(spans[j].StartedAt)
 	})
 
+	now := time.Now
+	if opts.Now != nil {
+		now = opts.Now
+	}
 	page := pageData{
 		SessionID:   sess.ID,
 		StartedAt:   sess.StartedAt.UTC().Format(time.RFC3339),
 		Tags:        sortTags(sess.Tags),
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: now().UTC().Format(time.RFC3339),
 	}
 	if sess.EndedAt != nil {
 		page.EndedAt = sess.EndedAt.UTC().Format(time.RFC3339)
@@ -192,6 +206,30 @@ func Render(ctx context.Context, src Source, w io.Writer, opts Options) (string,
 		sv.CorruptLines = corrupt
 		page.Spans = append(page.Spans, sv)
 		page.TotalChunks += len(chunks)
+	}
+
+	// Normalise each span's bar width against the longest one so the
+	// timeline reads at a glance. A minimum of 2% keeps zero-duration
+	// spans visible as a tick mark.
+	var maxDur int64
+	for _, sp := range page.Spans {
+		if sp.DurationMS > maxDur {
+			maxDur = sp.DurationMS
+		}
+	}
+	for i := range page.Spans {
+		if maxDur <= 0 {
+			page.Spans[i].BarWidth = 2
+			continue
+		}
+		w := int((page.Spans[i].DurationMS * 100) / maxDur)
+		if w < 2 {
+			w = 2
+		}
+		if w > 100 {
+			w = 100
+		}
+		page.Spans[i].BarWidth = w
 	}
 
 	tmpl, err := template.New("report").Funcs(template.FuncMap{

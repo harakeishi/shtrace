@@ -5,104 +5,300 @@
 <title>shtrace report — {{.SessionID}}</title>
 <style>
 :root {
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --muted: #6a6a6a;
-  --border: #e2e2e2;
-  --card: #fafafa;
-  --stdout: #1a1a1a;
-  --stderr: #b91c1c;
-  --pty: #1d4ed8;
-  --ok: #047857;
-  --fail: #b91c1c;
-  --unknown: #6a6a6a;
+  --bg: #1b1c1d;
+  --bg-elev-1: #22232a;
+  --bg-elev-2: #2a2b33;
+  --bg-elev-3: #32333c;
+  --fg: #f5f5f7;
+  --fg-strong: #ffffff;
+  --muted: #8e91a4;
+  --muted-2: #b6b8c6;
+  --border: #3a3b46;
+  --border-strong: #4a4b58;
+  --accent: #774aff;
+  --accent-2: #9a7bff;
+  --accent-soft: rgba(119, 74, 255, 0.18);
+  --ok: #4cd181;
+  --ok-soft: rgba(76, 209, 129, 0.16);
+  --fail: #ff5b6a;
+  --fail-soft: rgba(255, 91, 106, 0.18);
+  --warn: #ffb454;
+  --warn-soft: rgba(255, 180, 84, 0.18);
+  --unknown: #8e91a4;
+  --unknown-soft: rgba(142, 145, 164, 0.18);
+  --stdout: #e6e8ef;
+  --stderr: #ff8a94;
+  --pty: #7ec1ff;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117;
-    --fg: #e6edf3;
-    --muted: #8b949e;
-    --border: #30363d;
-    --card: #161b22;
-    --stdout: #e6edf3;
-    --stderr: #ff7b72;
-    --pty: #79c0ff;
-    --ok: #56d364;
-    --fail: #ff7b72;
-    --unknown: #8b949e;
-  }
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
 }
 * { box-sizing: border-box; }
+html, body { background: var(--bg); }
 body {
-  background: var(--bg);
   color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-family: var(--sans);
   margin: 0;
-  padding: 24px;
+  padding: 0;
   line-height: 1.5;
-}
-.container { max-width: 1100px; margin: 0 auto; }
-h1 { font-size: 22px; margin: 0 0 8px; }
-h2 { font-size: 16px; margin: 24px 0 8px; }
-.session-meta {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px 16px;
-  margin-bottom: 24px;
-}
-.session-meta dl {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 4px 16px;
-  margin: 0;
   font-size: 13px;
+  -webkit-font-smoothing: antialiased;
 }
-.session-meta dt { color: var(--muted); }
-.session-meta dd { margin: 0; font-family: var(--mono); word-break: break-all; }
-.hint {
+.topbar {
+  background: linear-gradient(180deg, #1d1e26 0%, #181920 100%);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 28px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fg-strong);
+}
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, var(--accent) 0%, #4f8cff 100%);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
+}
+.crumbs {
+  color: var(--muted);
   font-size: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.crumbs .sep { opacity: 0.5; }
+.crumbs .current { color: var(--fg); font-family: var(--mono); }
+.topbar-spacer { flex: 1; }
+.topbar .pill {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--muted-2);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: var(--mono);
+}
+.container {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 28px 48px;
+}
+h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+  color: var(--fg-strong);
+  font-weight: 600;
+}
+h2 {
+  font-size: 12px;
+  margin: 28px 0 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.subhead {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 18px;
+  font-family: var(--mono);
+}
+.panel {
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.session-meta {
+  padding: 16px 20px;
+  margin-bottom: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px 20px;
+}
+.meta-item { display: flex; flex-direction: column; gap: 4px; }
+.meta-label {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.meta-value {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg);
+  word-break: break-all;
+}
+.meta-value.id { color: var(--accent-2); }
+.tags-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag {
+  display: inline-flex;
+  align-items: center;
+  background: var(--accent-soft);
+  border: 1px solid rgba(119, 74, 255, 0.32);
+  color: var(--accent-2);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hint {
+  font-size: 11px;
   color: var(--muted);
   margin: 0 0 16px;
 }
+.span-list { display: flex; flex-direction: column; gap: 6px; }
 .span {
+  background: var(--bg-elev-1);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  margin-bottom: 16px;
+  border-radius: 8px;
   overflow: hidden;
+  transition: border-color 120ms ease;
 }
-.span-header {
-  background: var(--card);
+.span[open] { border-color: var(--border-strong); }
+.span:hover { border-color: var(--border-strong); }
+.span > summary {
+  list-style: none;
+  cursor: pointer;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1.4fr) 110px 110px 1fr 90px;
+  gap: 14px;
   align-items: center;
-  font-size: 13px;
+  font-size: 12.5px;
 }
+.span > summary::-webkit-details-marker { display: none; }
+.span > summary::marker { display: none; content: ""; }
+.span > summary:hover { background: var(--bg-elev-2); }
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--unknown);
+  box-shadow: 0 0 0 3px var(--unknown-soft);
+}
+.status-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.status-dot.fail { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-soft); }
+.status-dot.unknown { background: var(--unknown); box-shadow: 0 0 0 3px var(--unknown-soft); }
 .span-cmd {
   font-family: var(--mono);
   font-weight: 600;
+  color: var(--fg-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.exit { font-family: var(--mono); padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-.exit.ok { background: rgba(4, 120, 87, 0.12); color: var(--ok); }
-.exit.fail { background: rgba(185, 28, 28, 0.12); color: var(--fail); }
-.exit.unknown { background: rgba(106, 106, 106, 0.12); color: var(--unknown); }
-.mode, .duration, .timestamp { color: var(--muted); font-family: var(--mono); font-size: 12px; }
-.span-details {
-  font-size: 12px;
-  color: var(--muted);
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--bg-elev-3);
+  color: var(--muted-2);
+  border: 1px solid var(--border);
+  width: max-content;
+}
+.exit {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  width: max-content;
+}
+.exit.ok { background: var(--ok-soft); color: var(--ok); border: 1px solid rgba(76, 209, 129, 0.32); }
+.exit.fail { background: var(--fail-soft); color: var(--fail); border: 1px solid rgba(255, 91, 106, 0.4); }
+.exit.unknown { background: var(--unknown-soft); color: var(--muted-2); border: 1px solid var(--border); }
+.mode {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted-2);
+}
+.duration-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted-2);
+}
+.duration { color: var(--fg); }
+.bar-track {
+  height: 4px;
+  background: var(--bg-elev-3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-2) 100%);
+  border-radius: 2px;
+}
+.bar-fill.fail { background: linear-gradient(90deg, var(--fail) 0%, #ff8a94 100%); }
+.timestamp {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+.span-body {
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.span-details {
+  padding: 12px 16px;
+  background: var(--bg-elev-1);
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 24px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.span-details .kv { display: flex; flex-direction: column; gap: 3px; }
+.span-details .k {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: var(--sans);
+}
+.span-details .v {
+  color: var(--fg);
   word-break: break-all;
 }
-.span-details > div { margin: 2px 0; }
+.output-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--bg-elev-1);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+}
+.output-toolbar .legend { display: flex; gap: 14px; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); }
+.legend-swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.legend-swatch.stdout { background: var(--stdout); }
+.legend-swatch.stderr { background: var(--stderr); }
+.legend-swatch.pty    { background: var(--pty); }
 .output {
   margin: 0;
-  padding: 12px 14px;
+  padding: 14px 16px;
   background: var(--bg);
   font-family: var(--mono);
   font-size: 12.5px;
@@ -110,87 +306,141 @@ h2 { font-size: 16px; margin: 24px 0 8px; }
   word-break: break-all;
   max-height: 600px;
   overflow: auto;
+  color: var(--stdout);
 }
 .output .stream-stdout { color: var(--stdout); }
 .output .stream-stderr { color: var(--stderr); }
 .output .stream-pty    { color: var(--pty); }
 .empty {
-  padding: 12px 14px;
+  padding: 14px 16px;
   color: var(--muted);
   font-style: italic;
-  font-size: 13px;
+  font-size: 12px;
 }
 .corrupt-note {
-  padding: 6px 14px;
-  color: var(--stderr);
-  font-size: 12px;
-  border-top: 1px solid var(--border);
-  background: var(--card);
+  padding: 8px 16px;
+  color: var(--fail);
+  font-size: 11px;
+  background: var(--fail-soft);
+  border-top: 1px solid rgba(255, 91, 106, 0.32);
+  font-family: var(--mono);
 }
 footer {
-  margin-top: 32px;
+  margin-top: 36px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
-  font-size: 12px;
-  color: var(--muted);
-}
-.tag {
-  display: inline-block;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 6px;
-  margin: 0 4px 4px 0;
-  font-family: var(--mono);
   font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+@media (max-width: 880px) {
+  .span > summary {
+    grid-template-columns: 14px 1fr;
+    grid-auto-rows: auto;
+    gap: 8px;
+  }
+  .span > summary > :nth-child(n+3) { grid-column: 2; }
 }
 </style>
 </head>
 <body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <span>shtrace</span>
+  </div>
+  <div class="crumbs">
+    <span>Sessions</span>
+    <span class="sep">/</span>
+    <span class="current">{{.SessionID}}</span>
+  </div>
+  <div class="topbar-spacer"></div>
+  <span class="pill">{{len .Spans}} spans</span>
+  <span class="pill">{{.TotalChunks}} chunks</span>
+</header>
+
 <div class="container">
 
 <h1>shtrace session</h1>
-<section class="session-meta">
-  <dl>
-    <dt>session id</dt><dd>{{.SessionID}}</dd>
-    <dt>started</dt><dd>{{.StartedAt}}</dd>
-    {{if .EndedAt}}<dt>ended</dt><dd>{{.EndedAt}}</dd>{{end}}
-    <dt>spans</dt><dd>{{len .Spans}}</dd>
-    <dt>chunks</dt><dd>{{.TotalChunks}}</dd>
-    {{if .Tags}}<dt>tags</dt><dd>{{range .Tags}}<span class="tag">{{.K}}={{.V}}</span>{{end}}</dd>{{end}}
-  </dl>
+<p class="subhead">{{.SessionID}}</p>
+
+<section class="panel session-meta">
+  <div class="meta-item">
+    <span class="meta-label">Session ID</span>
+    <span class="meta-value id">{{.SessionID}}</span>
+  </div>
+  <div class="meta-item">
+    <span class="meta-label">Started</span>
+    <span class="meta-value">{{.StartedAt}}</span>
+  </div>
+  {{if .EndedAt}}
+  <div class="meta-item">
+    <span class="meta-label">Ended</span>
+    <span class="meta-value">{{.EndedAt}}</span>
+  </div>
+  {{end}}
+  <div class="meta-item">
+    <span class="meta-label">Spans</span>
+    <span class="meta-value">{{len .Spans}}</span>
+  </div>
+  <div class="meta-item">
+    <span class="meta-label">Chunks</span>
+    <span class="meta-value">{{.TotalChunks}}</span>
+  </div>
+  {{if .Tags}}
+  <div class="meta-item" style="grid-column: 1 / -1;">
+    <span class="meta-label">Tags</span>
+    <span class="tags-row">{{range .Tags}}<span class="tag">{{.K}}={{.V}}</span>{{end}}</span>
+  </div>
+  {{end}}
 </section>
 
-<p class="hint">Tip: use your browser's find-in-page (Ctrl/Cmd+F) to search within this report.</p>
-
 <h2>Timeline</h2>
+<p class="hint">Click a row to expand details. Use your browser's find-in-page (Ctrl/Cmd+F) to search.</p>
+
+<div class="span-list">
 {{range .Spans}}
-<article class="span">
-  <header class="span-header">
+<details class="span">
+  <summary>
+    <span class="status-dot {{.ExitClass}}"></span>
     <span class="span-cmd">{{.Command}}</span>
     <span class="exit {{.ExitClass}}">exit {{.ExitCode}}</span>
     <span class="mode">mode={{.Mode}}</span>
-    <span class="duration">{{.DurationMS}}ms</span>
+    <span class="duration-cell">
+      <span class="duration">{{.DurationMS}}ms</span>
+      <span class="bar-track"><span class="bar-fill {{if eq .ExitClass "fail"}}fail{{end}}" style="width: {{.BarWidth}}%"></span></span>
+    </span>
     <span class="timestamp">{{.StartedAt}}</span>
-  </header>
-  <div class="span-details">
-    <div>span id: {{.ID}}</div>
-    {{if .ParentSpanID}}<div>parent: {{.ParentSpanID}}</div>{{end}}
-    <div>argv: {{.Argv}}</div>
-    {{if .Cwd}}<div>cwd: {{.Cwd}}</div>{{end}}
+  </summary>
+  <div class="span-body">
+    <div class="span-details">
+      <div class="kv"><span class="k">span id</span><span class="v">{{.ID}}</span></div>
+      {{if .ParentSpanID}}<div class="kv"><span class="k">parent</span><span class="v">{{.ParentSpanID}}</span></div>{{end}}
+      <div class="kv"><span class="k">argv</span><span class="v">{{.Argv}}</span></div>
+      {{if .Cwd}}<div class="kv"><span class="k">cwd</span><span class="v">{{.Cwd}}</span></div>{{end}}
+    </div>
+    <div class="output-toolbar">
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch stdout"></span>stdout</span>
+        <span class="legend-item"><span class="legend-swatch stderr"></span>stderr</span>
+        <span class="legend-item"><span class="legend-swatch pty"></span>pty</span>
+      </div>
+      <span>{{len .Chunks}} chunks</span>
+    </div>
+    {{if .Chunks}}
+    <pre class="output">{{range .Chunks}}<span class="{{streamClass .Stream}}">{{.Data}}</span>{{end}}</pre>
+    {{else}}
+    <div class="empty">(no recorded output)</div>
+    {{end}}
+    {{if .CorruptLines}}
+    <div class="corrupt-note">{{.CorruptLines}} corrupt line(s) skipped from this span's log.</div>
+    {{end}}
   </div>
-  {{if .Chunks}}
-  <pre class="output">{{range .Chunks}}<span class="{{streamClass .Stream}}">{{.Data}}</span>{{end}}</pre>
-  {{else}}
-  <div class="empty">(no recorded output)</div>
-  {{end}}
-  {{if .CorruptLines}}
-  <div class="corrupt-note">{{.CorruptLines}} corrupt line(s) skipped from this span's log.</div>
-  {{end}}
-</article>
+</details>
 {{else}}
 <p class="empty">(no spans recorded for this session)</p>
 {{end}}
+</div>
 
 <footer>
   Generated at {{.GeneratedAt}} by shtrace.
