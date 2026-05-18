@@ -46,6 +46,11 @@ type Options struct {
 	// Warn receives non-fatal per-row parse failures from the store. nil is
 	// allowed and silences warnings.
 	Warn func(error)
+	// Now overrides the clock used for the report's "generated at"
+	// timestamp. Tests pass a fixed value so byte-for-byte determinism
+	// checks across multiple Render calls stay stable across the second
+	// boundary. nil falls back to time.Now.
+	Now func() time.Time
 }
 
 // chunkView is one rendered line in the timeline view. Stream maps to a
@@ -148,11 +153,15 @@ func Render(ctx context.Context, src Source, w io.Writer, opts Options) (string,
 		return spans[i].StartedAt.Before(spans[j].StartedAt)
 	})
 
+	now := time.Now
+	if opts.Now != nil {
+		now = opts.Now
+	}
 	page := pageData{
 		SessionID:   sess.ID,
 		StartedAt:   sess.StartedAt.UTC().Format(time.RFC3339),
 		Tags:        sortTags(sess.Tags),
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: now().UTC().Format(time.RFC3339),
 	}
 	if sess.EndedAt != nil {
 		page.EndedAt = sess.EndedAt.UTC().Format(time.RFC3339)

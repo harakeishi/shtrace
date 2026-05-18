@@ -331,13 +331,17 @@ func TestRender_TagsAreDeterministic(t *testing.T) {
 			"tags": {{ID: "sp", SessionID: "tags", Command: "sh", Mode: "pipe", StartedAt: now, EndedAt: now, ExitCode: intPtr(0)}},
 		},
 	}
+	// Pin Now so the rendered "generated at" timestamp does not differ
+	// between iterations if the loop happens to cross a second boundary.
+	fixed := time.Date(2026, 5, 18, 1, 2, 3, 0, time.UTC)
+	nowFn := func() time.Time { return fixed }
 	var first bytes.Buffer
-	if _, err := Render(context.Background(), src, &first, Options{SessionID: "tags", DataDir: dataDir}); err != nil {
+	if _, err := Render(context.Background(), src, &first, Options{SessionID: "tags", DataDir: dataDir, Now: nowFn}); err != nil {
 		t.Fatalf("Render 1: %v", err)
 	}
 	for i := 0; i < 10; i++ {
 		var next bytes.Buffer
-		if _, err := Render(context.Background(), src, &next, Options{SessionID: "tags", DataDir: dataDir}); err != nil {
+		if _, err := Render(context.Background(), src, &next, Options{SessionID: "tags", DataDir: dataDir, Now: nowFn}); err != nil {
 			t.Fatalf("Render %d: %v", i+2, err)
 		}
 		if next.String() != first.String() {
