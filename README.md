@@ -204,24 +204,40 @@ shtrace pr-comment --latest --pr 42
 shtrace pr-comment --session <id> --pr 42
 ```
 
-## Automatic session grouping (shell-init)
+## Automatic session grouping
 
-By default each `shtrace` invocation starts a fresh session. To group every
-command you run in a terminal window into **one session** automatically, add
-this line to your `~/.bashrc` or `~/.zshrc`:
-
-```sh
-# ~/.bashrc  (or ~/.zshrc)
-eval "$(shtrace shell-init bash)"   # use zsh for zsh
-```
-
-After opening a new terminal, `SHTRACE_SESSION_ID` is exported automatically.
-Every subsequent `shtrace` call in that terminal joins the same session:
+Runs launched by the same parent process are grouped into one session
+automatically — no configuration required. This matters most for AI agents,
+which typically spawn a throwaway shell per command: one agent instance
+becomes one session, and each command becomes a span within it.
 
 ```sh
 shtrace -- go test ./...
 shtrace -- pytest tests/
-shtrace show $SHTRACE_SESSION_ID    # see both runs together
+shtrace ls          # both runs appear under a single session
+```
+
+The session for an invocation is resolved in this order:
+
+1. `SHTRACE_SESSION_ID`, when set — nested calls, CI jobs, and containers keep
+   their existing behaviour and join that session explicitly.
+2. The session already claimed by this invocation's parent process, if any.
+3. Otherwise a fresh session, which the parent then claims.
+
+The parent is identified by its pid *and* start time, so a recycled pid cannot
+merge unrelated runs. If the start time cannot be read, grouping is skipped and
+the run starts its own session — the behaviour before grouping existed.
+
+### `shell-init` (deprecated)
+
+`shtrace shell-init` predates automatic grouping and is no longer needed in
+normal use. It still works, and remains useful when you want every command in
+a terminal pinned to one explicit session id regardless of process ancestry,
+or when running on a platform where the parent's start time is unavailable:
+
+```sh
+# ~/.bashrc  (or ~/.zshrc)
+eval "$(shtrace shell-init bash)"   # use zsh for zsh
 ```
 
 If `SHTRACE_SESSION_ID` is already set (e.g. from a parent CI job), the
@@ -350,6 +366,10 @@ variables:
 
 This means `shtrace make all` whose `Makefile` calls `shtrace pytest` records
 one session containing both spans, with parent/child linkage preserved.
+
+When no `SHTRACE_SESSION_ID` is inherited, the invocation falls back to
+[parent-process grouping](#automatic-session-grouping) instead of always
+starting a new session.
 
 ### Storage layout
 
