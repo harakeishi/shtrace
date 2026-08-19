@@ -168,8 +168,15 @@ func bashEnvScript(shtracePath, realBash string) string {
 // zshenvBody is the zsh counterpart to bashEnvScript. ~/.zshenv is sourced for
 // every zsh invocation including `zsh -c`, and ZSH_EXECUTION_STRING is set only
 // for -c, giving the same "only wrap command strings" behaviour.
-func zshenvBody(shtracePath, realZsh string) string {
+//
+// PATH and BASH_ENV are set here too, not just in .bashrc: a zsh terminal never
+// reads .bashrc, so without this an agent launched from zsh would get neither
+// the shims nor absolute-path bash capture. They must precede the re-exec below,
+// which replaces the process.
+func zshenvBody(shtracePath, realZsh, shimDir, bashEnvPath string) string {
 	var b strings.Builder
+	b.WriteString("export PATH=" + shellQuote(shimDir) + ":\"$PATH\"\n")
+	b.WriteString("export BASH_ENV=" + shellQuote(bashEnvPath) + "\n")
 	b.WriteString("if [ -z \"${SHTRACE_SESSION_ID:-}\" ] && [ -n \"${ZSH_EXECUTION_STRING:-}\" ]; then\n")
 	b.WriteString("  if [[ -o login ]]; then\n")
 	b.WriteString("    exec " + shellQuote(shtracePath) + " -- " + shellQuote(realZsh) + " -l -c \"$ZSH_EXECUTION_STRING\"\n")
@@ -300,7 +307,7 @@ func runEnable(_ context.Context, args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "shtrace: update .bashrc: %v\n", err)
 		return 1
 	}
-	if err := updateBlockInFile(p.zshenv, zshenvBody(p.selfPath, realShells["zsh"])); err != nil {
+	if err := updateBlockInFile(p.zshenv, zshenvBody(p.selfPath, realShells["zsh"], p.shimDir, p.bashEnv)); err != nil {
 		_, _ = fmt.Fprintf(stderr, "shtrace: update .zshenv: %v\n", err)
 		return 1
 	}
@@ -455,7 +462,7 @@ func probeShim(ctx context.Context, p autoWrapPaths) (bool, string) {
 		return false, fmt.Sprintf("resolve data dir: %v", err)
 	}
 
-	before := countSessions(ctx, dataDir)
+	before := latestSessionID(ctx, dataDir)
 
 	cmd := exec.CommandContext(ctx, shimPath, "-c", "true")
 	// Clearing SHTRACE_SESSION_ID matters: if doctor itself runs inside a
@@ -466,27 +473,28 @@ func probeShim(ctx context.Context, p autoWrapPaths) (bool, string) {
 		return false, fmt.Sprintf("probe command failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
-	after := countSessions(ctx, dataDir)
-	if after <= before {
+	after := latestSessionID(ctx, dataDir)
+	if after == "" || after == before {
 		return false, "shim ran but no new session was recorded"
 	}
 	return true, "bash -c through shim recorded a new session"
 }
 
-// countSessions returns the number of stored sessions, or -1 when the store is
-// unavailable (so a failed read never looks like a successful probe).
-func countSessions(ctx context.Context, dataDir string) int {
+// latestSessionID returns the ID of the newest stored session, or "" when the
+// store is unavailable or empty. Comparing IDs rather than counting rows keeps
+// the probe correct once the store grows past any list limit.
+func latestSessionID(ctx context.Context, dataDir string) string {
 	store, err := storage.Open(dataDir + "/sessions.db")
 	if err != nil {
-		return -1
+		return ""
 	}
 	defer func() { _ = store.Close() }()
 	if err := store.Migrate(ctx); err != nil {
-		return -1
+		return ""
 	}
-	sessions, err := store.ListSessions(ctx, 1000, func(error) {})
-	if err != nil {
-		return -1
+	sessions, err := store.ListSessions(ctx, 1, func(error) {})
+	if err != nil || len(sessions) == 0 {
+		return ""
 	}
-	return len(sessions)
+	return sessions[0].ID
 }

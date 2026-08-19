@@ -164,6 +164,23 @@ func TestShimScript_ContainsGuardsAndQuotesPaths(t *testing.T) {
 	}
 }
 
+func TestZshenvBody_SetsPathAndBashEnvBeforeReExec(t *testing.T) {
+	body := zshenvBody("/usr/local/bin/shtrace", "/bin/zsh", "/home/u/.shtrace/shims", "/home/u/.shtrace/bashenv.sh")
+
+	pathIdx := strings.Index(body, "/home/u/.shtrace/shims")
+	bashEnvIdx := strings.Index(body, "BASH_ENV")
+	reExecIdx := strings.Index(body, "ZSH_EXECUTION_STRING")
+
+	if pathIdx < 0 || bashEnvIdx < 0 || reExecIdx < 0 {
+		t.Fatalf("zshenv body missing PATH, BASH_ENV, or re-exec: %q", body)
+	}
+	// exec replaces the process, so anything after the re-exec never runs for
+	// `zsh -c` invocations.
+	if pathIdx > reExecIdx || bashEnvIdx > reExecIdx {
+		t.Fatalf("PATH/BASH_ENV must be set before the re-exec block: %q", body)
+	}
+}
+
 func TestEnable_CreatesShimsAndInjectsRCBlocks(t *testing.T) {
 	home, _ := autowrapHarness(t)
 
@@ -200,6 +217,15 @@ func TestEnable_CreatesShimsAndInjectsRCBlocks(t *testing.T) {
 	zshenv := readFile(t, filepath.Join(home, ".zshenv"))
 	if !strings.Contains(zshenv, "ZSH_EXECUTION_STRING") {
 		t.Fatalf(".zshenv missing execution-string guard: %q", zshenv)
+	}
+	// A zsh terminal never reads .bashrc, so .zshenv has to carry the PATH and
+	// BASH_ENV setup itself or agents launched from zsh are not wrapped at all.
+	shimDir := filepath.Join(home, ".shtrace", "shims")
+	if !strings.Contains(zshenv, shimDir) {
+		t.Fatalf(".zshenv block should prepend the shim dir to PATH: %q", zshenv)
+	}
+	if !strings.Contains(zshenv, "BASH_ENV") {
+		t.Fatalf(".zshenv block should export BASH_ENV for child bash: %q", zshenv)
 	}
 
 	if !strings.Contains(stdout, "shtrace disable") {
@@ -330,6 +356,31 @@ func TestDoctor_ProbeRecordsSessionThroughShim(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "sessions.db")); err != nil {
 		t.Fatalf("probe did not record a session: %v", err)
+	}
+}
+
+// latestSessionID must not depend on a row-count ceiling: a store holding more
+// sessions than any list limit would otherwise make the probe report a false NG.
+func TestLatestSessionID_ChangesWhenSessionIsAdded(t *testing.T) {
+	_, dataDir := autowrapHarness(t)
+	ctx := context.Background()
+
+	empty := latestSessionID(ctx, dataDir)
+
+	if _, se, exit := runCLI(t, "shtrace", "--", "sh", "-c", "true"); exit != 0 {
+		t.Fatalf("record session exit = %d: %s", exit, se)
+	}
+	first := latestSessionID(ctx, dataDir)
+	if first == "" || first == empty {
+		t.Fatalf("latestSessionID did not change after recording (empty=%q, first=%q)", empty, first)
+	}
+
+	if _, se, exit := runCLI(t, "shtrace", "--", "sh", "-c", "true"); exit != 0 {
+		t.Fatalf("record second session exit = %d: %s", exit, se)
+	}
+	second := latestSessionID(ctx, dataDir)
+	if second == first {
+		t.Fatalf("latestSessionID did not change after a second session: %q", second)
 	}
 }
 
