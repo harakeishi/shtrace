@@ -29,7 +29,7 @@ import (
 func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell, enable, disable, doctor")
 		return 2
 	}
 
@@ -43,7 +43,7 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 	}
 	if len(argv) < 2 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace [--mode pipe|pty] <subcommand> [args...]")
-		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell")
+		_, _ = fmt.Fprintln(stderr, "subcommands: run (default), ls, show, search, reindex, gc, report, export, import, pr-comment, mcp, session, serve, shell-init, shell, enable, disable, doctor")
 		return 2
 	}
 
@@ -68,6 +68,12 @@ func Run(ctx context.Context, argv []string, stdout, stderr io.Writer) int {
 		return runSession(ctx, argv[2:], stdout, stderr)
 	case "shell-init":
 		return runShellInit(argv[2:], stdout, stderr)
+	case "enable":
+		return runEnable(ctx, argv[2:], stdout, stderr)
+	case "disable":
+		return runDisable(ctx, argv[2:], stdout, stderr)
+	case "doctor":
+		return runDoctor(ctx, argv[2:], stdout, stderr)
 	case "shell":
 		return runShell(ctx, argv[2:], stdout, stderr)
 	case "export":
