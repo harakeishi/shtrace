@@ -379,6 +379,9 @@ func TestLatestSessionID_ChangesWhenSessionIsAdded(t *testing.T) {
 		t.Fatalf("latestSessionID did not change after recording (empty=%q, first=%q)", empty, first)
 	}
 
+	// Parent-process grouping would make a second bare run join the first
+	// session, so force a distinct one to test that a new id is observed.
+	t.Setenv("SHTRACE_SESSION_ID", "second-distinct-session")
 	if _, se, exit := runCLI(t, "shtrace", "--", "sh", "-c", "true"); exit != 0 {
 		t.Fatalf("record second session exit = %d: %s", exit, se)
 	}

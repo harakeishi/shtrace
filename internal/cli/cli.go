@@ -127,6 +127,18 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 	}
 
 	startedAt := time.Now().UTC()
+
+	// With no inherited session, group by parent process so an agent that
+	// spawns a fresh shell per command still produces one session per agent
+	// instance. The session row is created before the claim so a concurrent
+	// run never observes a mapping pointing at a not-yet-existing session.
+	if sessCtx.IsRoot {
+		if joined, ok := groupByParent(ctx, store, sessCtx, startedAt, stderr); ok && joined != sessCtx.SessionID {
+			sessCtx.SessionID = joined
+			sessCtx.IsRoot = false
+		}
+	}
+
 	if sessCtx.IsRoot {
 		if err := store.InsertSession(ctx, storage.Session{
 			ID:        sessCtx.SessionID,
@@ -289,6 +301,44 @@ func runWrapped(ctx context.Context, mode string, cmdArgs []string, stdout, stde
 	return exitCode
 }
 
+// groupByParent resolves which session this invocation belongs to when no
+// SHTRACE_SESSION_ID was inherited, keyed on the parent process. It reports the
+// session to use and whether grouping applied at all.
+//
+// The candidate session row is inserted before the claim: ClaimSessionForParent
+// discards mappings whose session no longer exists, so claiming first would let
+// a concurrent run prune this one before its row landed.
+//
+// Any failure here is non-fatal — grouping is an optimisation, and falling back
+// to a fresh session is the pre-grouping behaviour.
+func groupByParent(ctx context.Context, store *storage.Store, sessCtx *session.Context, startedAt time.Time, stderr io.Writer) (string, bool) {
+	parentKey, err := session.ParentKey()
+	if err != nil {
+		return "", false
+	}
+	if err := store.InsertSession(ctx, storage.Session{
+		ID:        sessCtx.SessionID,
+		StartedAt: startedAt,
+		Tags:      sessCtx.Tags,
+	}); err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: session grouping disabled: %v\n", err)
+		return "", false
+	}
+	claimed, err := store.ClaimSessionForParent(ctx, parentKey, sessCtx.SessionID)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "shtrace: warning: session grouping disabled: %v\n", err)
+		return "", false
+	}
+	if claimed != sessCtx.SessionID {
+		// Another run under this parent owns the session; drop the row we just
+		// created so an unused empty session is not left behind.
+		if err := store.DeleteSession(ctx, sessCtx.SessionID); err != nil {
+			_, _ = fmt.Fprintf(stderr, "shtrace: warning: could not remove unused session: %v\n", err)
+		}
+	}
+	return claimed, true
+}
+
 func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	jsonOut := false
 	for _, a := range args {
@@ -343,7 +393,10 @@ func runLs(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		cmdSummary := ""
 		if len(spans) > 0 {
-			cmdSummary = spans[0].Command
+			cmdSummary = truncate(commandLabel(spans[0].Argv), 60)
+			if cmdSummary == "" {
+				cmdSummary = spans[0].Command
+			}
 		}
 		_, _ = fmt.Fprintf(stdout, "%s  %s  spans=%d  %s\n", s.StartedAt.Format(time.RFC3339), s.ID, len(spans), cmdSummary)
 	}
@@ -386,7 +439,11 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	for _, sp := range spans {
-		_, _ = fmt.Fprintf(stdout, "== span %s  cmd=%s  exit=%v  mode=%s\n", sp.ID, sp.Command, derefInt(sp.ExitCode), sp.Mode)
+		label := truncate(commandLabel(sp.Argv), 200)
+		if label == "" {
+			label = sp.Command
+		}
+		_, _ = fmt.Fprintf(stdout, "== span %s  cmd=%s  exit=%v  mode=%s\n", sp.ID, label, derefInt(sp.ExitCode), sp.Mode)
 		logPath := storage.OutputPath(dataDir, sessionID, sp.ID)
 		b, err := os.ReadFile(logPath)
 		if err != nil {
@@ -846,6 +903,7 @@ func runSession(_ context.Context, args []string, stdout, stderr io.Writer) int 
 func runShellInit(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		_, _ = fmt.Fprintln(stderr, "usage: shtrace shell-init <bash|zsh>")
+		_, _ = fmt.Fprintln(stderr, "note: deprecated — shtrace now groups runs by parent process automatically")
 		return 2
 	}
 	shell := args[0]
@@ -872,7 +930,9 @@ func runShellInit(args []string, stdout, stderr io.Writer) int {
 		// works for both bash and zsh without separate branches.
 		// shellQuote wraps the path in single-quotes so that spaces and
 		// special characters in the binary path do not break the snippet.
-		_, _ = fmt.Fprintf(stdout, "if [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
+		// The snippet is eval'd, so the deprecation note has to be a shell
+		// comment rather than stderr output.
+		_, _ = fmt.Fprintf(stdout, "# shtrace shell-init is deprecated: runs are now grouped by parent process automatically.\n# Keep it only to pin every terminal command to one explicit session.\nif [ -z \"${SHTRACE_SESSION_ID:-}\" ]; then\n  export SHTRACE_SESSION_ID=\"$(%s session new)\"\nfi\n", shellQuote(self))
 		return 0
 	default:
 		_, _ = fmt.Fprintf(stderr, "shtrace: unsupported shell %q (supported: bash, zsh)\n", shell)
