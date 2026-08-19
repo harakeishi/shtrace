@@ -271,10 +271,25 @@ Both the `PATH` entry and `BASH_ENV` are set from `~/.bashrc` *and* `~/.zshenv`,
 because a zsh terminal never reads `~/.bashrc`. Without the zsh copy, an agent
 started from a zsh shell would get neither the shims nor absolute-path capture.
 
-Two guards keep wrapping from running away: a shell that already has
-`SHTRACE_SESSION_ID` set passes straight through (no double wrapping), and an
-invocation with no arguments or with `-i` is treated as interactive and left
-alone.
+Two guards keep wrapping from running away: `SHTRACE_AUTOWRAP_ACTIVE` is
+exported before the wrapping `exec`, so any shell deeper in the same process
+tree passes straight through (no double wrapping), and an invocation with no
+arguments or with `-i` is treated as interactive and left alone.
+
+### Using auto-wrap with `shell-init`
+
+The two compose. `shell-init` exports `SHTRACE_SESSION_ID` for a terminal, and
+auto-wrap deliberately does *not* gate on that variable — it uses
+`SHTRACE_AUTOWRAP_ACTIVE` instead. Commands an agent runs in such a terminal
+are therefore still wrapped, and they join the terminal's session as child
+spans rather than starting sessions of their own:
+
+```sh
+shtrace show "$SHTRACE_SESSION_ID"   # terminal session, with agent commands as spans
+```
+
+Gating on `SHTRACE_SESSION_ID` would silently disable auto-wrap for exactly the
+users who enabled both features.
 
 All rc edits live between `# >>> shtrace auto-wrap >>>` and
 `# <<< shtrace auto-wrap <<<` markers, are written atomically, and never touch
@@ -366,6 +381,7 @@ design — CI integration should be a single env var, not a checked-in file).
 | `SHTRACE_SESSION_ID` | unset (new session) | Join an existing session |
 | `SHTRACE_PARENT_SPAN_ID` | unset | Parent span id for nested calls |
 | `SHTRACE_TAGS` | `{}` | JSON object of tags propagated to child spans |
+| `SHTRACE_AUTOWRAP_ACTIVE` | unset | Set by auto-wrap shims to prevent double wrapping; not intended to be set by hand |
 
 ## Roadmap
 
