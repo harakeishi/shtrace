@@ -262,10 +262,14 @@ that one recording.
    resolved and baked in at `enable` time, so the shim never resolves to
    itself.
 2. **Startup-file hooks** — an agent that invokes `/bin/bash` by absolute path
-   bypasses `PATH` entirely. `~/.shtrace/bashenv.sh` (armed via `BASH_ENV` in
-   `~/.bashrc`) and a block in `~/.zshenv` re-exec the shell under `shtrace`
-   when `BASH_EXECUTION_STRING` / `ZSH_EXECUTION_STRING` is non-empty — i.e.
-   only for `-c` command strings.
+   bypasses `PATH` entirely. `~/.shtrace/bashenv.sh` (armed via `BASH_ENV`) and
+   a block in `~/.zshenv` re-exec the shell under `shtrace` when
+   `BASH_EXECUTION_STRING` / `ZSH_EXECUTION_STRING` is non-empty — i.e. only
+   for `-c` command strings.
+
+Both the `PATH` entry and `BASH_ENV` are set from `~/.bashrc` *and* `~/.zshenv`,
+because a zsh terminal never reads `~/.bashrc`. Without the zsh copy, an agent
+started from a zsh shell would get neither the shims nor absolute-path capture.
 
 Two guards keep wrapping from running away: a shell that already has
 `SHTRACE_SESSION_ID` set passes straight through (no double wrapping), and an
@@ -284,6 +288,11 @@ it is safe to run repeatedly.
 - **Absolute-path `dash` (and other POSIX `sh`) is not captured.** The `sh`
   shim covers `PATH` lookups, but shells without a `BASH_ENV` equivalent
   cannot be hooked when invoked by absolute path.
+- **A bash login shell reads `~/.bash_profile`, not `~/.bashrc`** (this is the
+  default for a macOS terminal), so auto-wrap does not activate there unless
+  `~/.bash_profile` sources `~/.bashrc` — the common arrangement, but not
+  guaranteed. Add `[ -f ~/.bashrc ] && . ~/.bashrc` to `~/.bash_profile` if
+  `shtrace doctor` reports the PATH entry as NG in a new terminal.
 - **Disk usage grows quickly**, since every agent command is now recorded. Run
   `shtrace gc` periodically, or set `SHTRACE_TTL_DAYS` / `SHTRACE_MAX_SIZE_BYTES`.
 - The shims bake in absolute paths at `enable` time. Re-run `shtrace enable`
