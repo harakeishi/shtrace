@@ -233,6 +233,62 @@ You can also generate a session ID manually:
 export SHTRACE_SESSION_ID="$(shtrace session new)"
 ```
 
+## Automatic wrapping (experimental)
+
+By default `shtrace` only records what you explicitly wrap. If you want an AI
+coding agent (Claude Code, Codex, …) to have *every* command it runs recorded
+without teaching it about `shtrace`, opt in to auto-wrap:
+
+```sh
+shtrace enable     # install shims + rc hooks
+shtrace doctor     # verify the setup actually wraps
+shtrace disable    # remove everything
+```
+
+Open a new shell (or restart the agent) for the change to take effect.
+
+### How it works
+
+Agents ultimately run their commands through `bash -c` / `zsh -c`, so
+replacing the entry point to the shell is enough to catch everything an agent
+does — the outermost shell is wrapped, and all descendant output flows through
+that one recording.
+
+`shtrace enable` installs two complementary mechanisms:
+
+1. **PATH shims** — `~/.shtrace/shims/{bash,zsh,sh}` are placed ahead of the
+   real shells on `PATH`. Each shim `exec`s `shtrace -- <real shell> "$@"`.
+   The absolute path of the real shell and of the `shtrace` binary are
+   resolved and baked in at `enable` time, so the shim never resolves to
+   itself.
+2. **Startup-file hooks** — an agent that invokes `/bin/bash` by absolute path
+   bypasses `PATH` entirely. `~/.shtrace/bashenv.sh` (armed via `BASH_ENV` in
+   `~/.bashrc`) and a block in `~/.zshenv` re-exec the shell under `shtrace`
+   when `BASH_EXECUTION_STRING` / `ZSH_EXECUTION_STRING` is non-empty — i.e.
+   only for `-c` command strings.
+
+Two guards keep wrapping from running away: a shell that already has
+`SHTRACE_SESSION_ID` set passes straight through (no double wrapping), and an
+invocation with no arguments or with `-i` is treated as interactive and left
+alone.
+
+All rc edits live between `# >>> shtrace auto-wrap >>>` and
+`# <<< shtrace auto-wrap <<<` markers, are written atomically, and never touch
+content outside the block. Re-running `enable` replaces the block in place, so
+it is safe to run repeatedly.
+
+### Limitations
+
+- **Interactive shells are not wrapped.** v1 deliberately stays out of the way
+  of a human at a prompt; use `shtrace shell` for that.
+- **Absolute-path `dash` (and other POSIX `sh`) is not captured.** The `sh`
+  shim covers `PATH` lookups, but shells without a `BASH_ENV` equivalent
+  cannot be hooked when invoked by absolute path.
+- **Disk usage grows quickly**, since every agent command is now recorded. Run
+  `shtrace gc` periodically, or set `SHTRACE_TTL_DAYS` / `SHTRACE_MAX_SIZE_BYTES`.
+- The shims bake in absolute paths at `enable` time. Re-run `shtrace enable`
+  after moving or upgrading the `shtrace` binary or your shells.
+
 ## How it works
 
 ### Recording modes
@@ -318,9 +374,10 @@ design — CI integration should be a single env var, not a checked-in file).
 - Multi-host aggregation
 - Telemetry of any kind (the binary never phones home)
 - Windows support (Linux and macOS only)
-- Automatic shell hooks / aliases — `shtrace` records what it is explicitly
-  asked to wrap; wrapping is the caller's responsibility (see the plan for
-  the rationale behind this choice over the shell-hook approach)
+- Implicit, always-on shell hooks — explicit wrapping remains the principle:
+  `shtrace` records what it is asked to wrap. Auto-wrap exists, but only as an
+  opt-in the user turns on with `shtrace enable` and can fully remove with
+  `shtrace disable` (see [Automatic wrapping](#automatic-wrapping-experimental))
 
 ## Contributing
 
