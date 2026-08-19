@@ -147,9 +147,13 @@ func TestResolveRealShell_FallsBackWhenNotFound(t *testing.T) {
 func TestShimScript_ContainsGuardsAndQuotesPaths(t *testing.T) {
 	script := shimScript("/opt/my tools/shtrace", "/bin/bash")
 
-	// Recursion guard: an already-traced process must exec the real shell.
-	if !strings.Contains(script, "SHTRACE_SESSION_ID") {
-		t.Fatalf("shim missing recursion guard: %q", script)
+	// Recursion guard is auto-wrap specific: gating on SHTRACE_SESSION_ID would
+	// make shell-init (which exports it in every terminal) disable auto-wrap.
+	if !strings.Contains(script, envAutoWrapActive) {
+		t.Fatalf("shim missing auto-wrap recursion guard: %q", script)
+	}
+	if strings.Contains(script, "SHTRACE_SESSION_ID") {
+		t.Fatalf("shim must not gate on SHTRACE_SESSION_ID: %q", script)
 	}
 	// Interactive shells are out of scope for v1.
 	if !strings.Contains(script, "-i") {
@@ -381,6 +385,125 @@ func TestLatestSessionID_ChangesWhenSessionIsAdded(t *testing.T) {
 	second := latestSessionID(ctx, dataDir)
 	if second == first {
 		t.Fatalf("latestSessionID did not change after a second session: %q", second)
+	}
+}
+
+// The startup-file hooks must use the same auto-wrap guard as the shims: if
+// they gated on SHTRACE_SESSION_ID, shell-init would silently disable them.
+func TestStartupHooks_GuardOnAutoWrapNotSessionID(t *testing.T) {
+	bashEnv := bashEnvScript("/usr/local/bin/shtrace", "/bin/bash")
+	zshEnv := zshenvBody("/usr/local/bin/shtrace", "/bin/zsh", "/home/u/shims", "/home/u/bashenv.sh")
+
+	for name, body := range map[string]string{"bashenv.sh": bashEnv, ".zshenv": zshEnv} {
+		if !strings.Contains(body, envAutoWrapActive) {
+			t.Errorf("%s missing auto-wrap guard: %q", name, body)
+		}
+		if strings.Contains(body, "SHTRACE_SESSION_ID") {
+			t.Errorf("%s must not gate on SHTRACE_SESSION_ID: %q", name, body)
+		}
+	}
+}
+
+// Behavioural check on the real generated shim: it must wrap when only
+// SHTRACE_SESSION_ID is set (the shell-init case) and pass through once
+// auto-wrap is already active.
+func TestShimScript_WrapsUnderSessionIDButNotWhenAutoWrapActive(t *testing.T) {
+	dir := t.TempDir()
+
+	// Stand-ins that record how they were invoked instead of really wrapping.
+	marker := filepath.Join(dir, "marker")
+	fakeShtrace := filepath.Join(dir, "fake-shtrace")
+	writeExecutable(t, fakeShtrace, "#!/bin/sh\necho wrapped >>"+marker+"\nexit 0\n")
+	realShell := filepath.Join(dir, "fake-shell")
+	writeExecutable(t, realShell, "#!/bin/sh\necho passthrough >>"+marker+"\nexit 0\n")
+
+	shim := filepath.Join(dir, "shim")
+	writeExecutable(t, shim, shimScript(fakeShtrace, realShell))
+
+	run := func(t *testing.T, extraEnv ...string) string {
+		t.Helper()
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("reset marker: %v", err)
+		}
+		cmd := exec.Command(shim, "-c", "true")
+		cmd.Env = append(os.Environ(), extraEnv...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("shim run failed: %v: %s", err, out)
+		}
+		b, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatalf("read marker: %v", err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+
+	t.Run("session id set still wraps", func(t *testing.T) {
+		got := run(t, "SHTRACE_SESSION_ID=existing-session", envAutoWrapActive+"=")
+		if got != "wrapped" {
+			t.Fatalf("shim should wrap when only SHTRACE_SESSION_ID is set, got %q", got)
+		}
+	})
+
+	t.Run("auto-wrap active passes through", func(t *testing.T) {
+		got := run(t, "SHTRACE_SESSION_ID=", envAutoWrapActive+"=1")
+		if got != "passthrough" {
+			t.Fatalf("shim should pass through when auto-wrap is active, got %q", got)
+		}
+	})
+}
+
+func TestEnable_PreservesRestrictiveRCPermissions(t *testing.T) {
+	home, _ := autowrapHarness(t)
+
+	bashrcPath := filepath.Join(home, ".bashrc")
+	if err := os.WriteFile(bashrcPath, []byte("export SECRET=1\n"), 0o600); err != nil {
+		t.Fatalf("seed .bashrc: %v", err)
+	}
+
+	if _, se, exit := runCLI(t, "shtrace", "enable"); exit != 0 {
+		t.Fatalf("enable exit = %d: %s", exit, se)
+	}
+
+	info, err := os.Stat(bashrcPath)
+	if err != nil {
+		t.Fatalf("stat .bashrc: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf(".bashrc perm = %o, want 0600 (enable must not widen access)", perm)
+	}
+}
+
+func TestEnable_WritesThroughSymlinkedRC(t *testing.T) {
+	home, _ := autowrapHarness(t)
+
+	// Mimic a dotfiles setup: ~/.bashrc is a symlink into a repo.
+	realDir := t.TempDir()
+	target := filepath.Join(realDir, "bashrc")
+	if err := os.WriteFile(target, []byte("export FROM_DOTFILES=1\n"), 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	link := filepath.Join(home, ".bashrc")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, se, exit := runCLI(t, "shtrace", "enable"); exit != 0 {
+		t.Fatalf("enable exit = %d: %s", exit, se)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat .bashrc: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("enable replaced the symlink with a regular file")
+	}
+	body := readFile(t, target)
+	if !strings.Contains(body, blockBegin) {
+		t.Fatalf("symlink target was not updated: %q", body)
+	}
+	if !strings.Contains(body, "export FROM_DOTFILES=1") {
+		t.Fatalf("symlink target lost user content: %q", body)
 	}
 }
 
