@@ -384,6 +384,51 @@ func TestPipeRunner_NilStdinDoesNotHang(t *testing.T) {
 	}
 }
 
+// TestPipeRunner_BlockingStdinDoesNotHangWait guards the os.Pipe
+// normalization in attachStdin. A non-*os.File reader that never reaches EOF
+// (a TTY, a socket) used to make exec's internal copier outlive the child and
+// block cmd.Wait forever; the child's exit must end the call regardless.
+func TestPipeRunner_BlockingStdinDoesNotHangWait(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+
+	var teeOut bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunPipe(context.Background(), PipeOptions{
+			Argv:   []string{"sh", "-c", "echo hi"},
+			Writer: &recordingWriter{},
+			Stdin:  idleReader{stop: stop},
+			Stdout: &teeOut,
+			Stderr: io.Discard,
+			Masker: secret.DefaultMasker(),
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunPipe: %v", err)
+		}
+		if got := strings.TrimSpace(teeOut.String()); got != "hi" {
+			t.Fatalf("output = %q, want \"hi\"", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunPipe hung: cmd.Wait is waiting on the stdin copier, not the child")
+	}
+}
+
+// idleReader blocks in Read without ever yielding a byte, which is how an idle
+// terminal behaves. Distinct from pty_test.go's blockingReader, which trickles
+// bytes and so cannot expose a Wait that is stuck on the copier.
+type idleReader struct{ stop chan struct{} }
+
+func (r idleReader) Read([]byte) (int, error) {
+	<-r.stop
+	return 0, io.EOF
+}
+
 // TestPipeRunner_StdinIsNotRecorded pins the deliberate choice to forward
 // stdin without recording it: recorded chunks must not contain the input,
 // since it may carry passwords typed at a prompt.

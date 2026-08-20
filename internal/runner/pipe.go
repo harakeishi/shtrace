@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 
@@ -26,7 +27,12 @@ type PipeOptions struct {
 	Env    []string // optional; nil means inherit os.Environ
 	Cwd    string   // optional; empty means inherit current cwd
 	Writer ChunkWriter
-	Stdin  io.Reader // nil means the child gets an empty stdin, never the parent's
+	// Stdin is forwarded to the child; nil means the child gets an empty
+	// stdin, never the parent's. RunPipe takes ownership for the duration of
+	// the call: a non-*os.File reader is drained by a relay goroutine that is
+	// detached at return, so it may consume bytes past the child's exit. Do
+	// not reuse such a reader across calls.
+	Stdin  io.Reader
 	Stdout io.Writer // tee target; pass io.Discard if the caller doesn't want a pass-through
 	Stderr io.Writer
 	Masker *secret.Masker
@@ -58,9 +64,16 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 	if opt.Cwd != "" {
 		cmd.Dir = opt.Cwd
 	}
-	// Passing *os.File through hands the fd to the child directly; any other
-	// reader makes exec spawn a copier that cmd.Wait blocks on until EOF.
-	cmd.Stdin = opt.Stdin
+	// exec only hands an fd straight to the child for *os.File. For any other
+	// reader it spawns an internal copier that cmd.Wait blocks on until the
+	// reader hits EOF — so a reader that stays open (a TTY, a socket) hangs
+	// Wait long after the child is gone. Normalizing through os.Pipe keeps
+	// cmd.Wait tied to the child alone and lets us detach the relay instead.
+	stdinCleanup, err := attachStdin(cmd, opt.Stdin)
+	if err != nil {
+		return Result{}, err
+	}
+	defer stdinCleanup()
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -91,6 +104,42 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 		}
 	}
 	return res, err
+}
+
+// attachStdin wires r to cmd.Stdin as a real *os.File and returns a cleanup to
+// run once cmd.Wait has returned.
+//
+// An *os.File is passed straight through: the child inherits the fd and no
+// copier exists to outlive it. Anything else is relayed into an os.Pipe by a
+// goroutine that is deliberately not awaited — a reader parked on a TTY cannot
+// be interrupted, so waiting for it would hang every interactive run at exit.
+// Closing the write end in cleanup makes the pending relay Write fail with
+// ErrClosed rather than reach a recycled fd; a relay blocked in Read simply
+// outlives the call, which is why Stdin ownership transfers to RunPipe.
+func attachStdin(cmd *exec.Cmd, r io.Reader) (func(), error) {
+	if r == nil {
+		return func() {}, nil
+	}
+	if f, ok := r.(*os.File); ok {
+		cmd.Stdin = f
+		return func() {}, nil
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stdin = pr
+
+	go func() {
+		_, _ = io.Copy(pw, r)
+		_ = pw.Close()
+	}()
+
+	return func() {
+		_ = pw.Close()
+		_ = pr.Close()
+	}, nil
 }
 
 // forward is the goroutine wrapper around forwardStream.

@@ -227,6 +227,43 @@ func TestPTYRunner_NilStdinDoesNotHang(t *testing.T) {
 	}
 }
 
+// TestPTYRunner_EchoesStdinIntoRecording pins the known limitation documented
+// under "Secret masking" in README.md: the line discipline echoes relayed
+// stdin back onto the PTY master, and that echo is recorded. `stty -echo` does
+// not prevent it, because the relay can deliver input before the child has
+// finished disabling echo — with a non-TTY reader the input always wins.
+//
+// This asserts current behaviour, not desired behaviour. If a future change
+// closes the race, update README.md in the same commit rather than deleting
+// this test: the README's guidance not to type secrets under mode A depends on
+// it staying true.
+func TestPTYRunner_EchoesStdinIntoRecording(t *testing.T) {
+	const secretInput = "hunter2-plaintext-password"
+
+	rec := &recordingWriter{}
+	if _, err := RunPTY(context.Background(), PTYOptions{
+		Argv:   []string{"sh", "-c", "stty -echo; read -r pw; echo done"},
+		Writer: rec,
+		Stdin:  strings.NewReader(secretInput + "\n"),
+		Tty:    nil,
+		Masker: secret.DefaultMasker(),
+	}); err != nil {
+		t.Fatalf("RunPTY: %v", err)
+	}
+
+	var all string
+	for _, c := range rec.snapshot() {
+		all += c.Data
+	}
+	if !strings.Contains(all, "done") {
+		t.Fatalf("child did not run to completion; recorded %q", all)
+	}
+	if !strings.Contains(all, secretInput) {
+		t.Skipf("stdin echo did not occur; if this is now reliable, "+
+			"update the README limitation note. recorded=%q", all)
+	}
+}
+
 // TestPTYRunner_StdinOutlivingChildDoesNotPanic exercises the detached relay
 // goroutine against a reader that never reaches EOF, which is what a real TTY
 // looks like. The child ignores stdin and exits immediately, so ptmx.Close

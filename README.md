@@ -352,6 +352,20 @@ untouched. Built-in patterns cover AWS access keys, GitHub PATs
 masker buffers a small trailing window between reads so a secret that
 straddles a pipe-buffer boundary still gets caught.
 
+> **Interactive input can land in the recording (mode A / PTY).**
+> shtrace never records your stdin directly, but in PTY mode the kernel's
+> line discipline echoes what you type back onto the PTY master — and that
+> echo *is* recorded. Turning echo off (as `sudo`, `ssh`, and `read -s`
+> do) does not reliably prevent this: shtrace can forward input before the
+> child has finished calling `stty -echo`, and those bytes are echoed and
+> recorded. With piped or pasted input the input almost always wins that
+> race. Anything typed at such a prompt is masked only if it matches a
+> built-in pattern, and a password generally does not.
+>
+> This affects `shtrace shell` and `shtrace -- <cmd>` whenever stdout is a
+> TTY. Avoid entering secrets under shtrace; use `--mode pipe`, which does
+> not echo stdin into the recording, when you must.
+
 ### Session/span propagation
 
 Each invocation gets a UUIDv7 `span_id`. The root invocation gets a fresh
