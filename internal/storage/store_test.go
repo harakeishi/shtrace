@@ -3,11 +3,25 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "sessions.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	return s
+}
 
 func TestStore_RecordsSessionAndSpan(t *testing.T) {
 	dir := t.TempDir()
@@ -487,3 +501,96 @@ func TestStore_GetSession_RoundTripsHealthyRow(t *testing.T) {
 }
 
 func ptrInt(i int) *int { return &i }
+
+func TestRecentSpansAcrossSessions(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	base := time.Now().UTC().Add(-time.Hour)
+	for i, sess := range []string{"s1", "s2"} {
+		if err := store.InsertSession(ctx, Session{ID: sess, StartedAt: base, Tags: map[string]string{}}); err != nil {
+			t.Fatalf("insert session: %v", err)
+		}
+		if err := store.InsertSpan(ctx, Span{
+			ID:        sess + "-span",
+			SessionID: sess,
+			Command:   "echo",
+			Argv:      []string{"echo", sess},
+			Mode:      "pipe",
+			StartedAt: base.Add(time.Duration(i) * time.Minute),
+			EndedAt:   base.Add(time.Duration(i)*time.Minute + time.Second),
+		}); err != nil {
+			t.Fatalf("insert span: %v", err)
+		}
+	}
+
+	spans, err := store.RecentSpans(ctx, 10, nil)
+	if err != nil {
+		t.Fatalf("RecentSpans: %v", err)
+	}
+	if len(spans) != 2 {
+		t.Fatalf("got %d spans, want 2", len(spans))
+	}
+	// newest-first
+	if spans[0].SessionID != "s2" {
+		t.Errorf("first span session = %q, want s2", spans[0].SessionID)
+	}
+
+	limited, err := store.RecentSpans(ctx, 1, nil)
+	if err != nil {
+		t.Fatalf("RecentSpans(limit=1): %v", err)
+	}
+	if len(limited) != 1 {
+		t.Errorf("got %d spans, want 1", len(limited))
+	}
+}
+
+func TestRootSpanCommands(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	base := time.Now().UTC().Add(-time.Hour)
+	if err := store.InsertSession(ctx, Session{ID: "s1", StartedAt: base, Tags: map[string]string{}}); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	// two root spans: the earliest one wins
+	for i, argv := range [][]string{{"make", "ci"}, {"go", "test"}} {
+		if err := store.InsertSpan(ctx, Span{
+			ID:        fmt.Sprintf("root-%d", i),
+			SessionID: "s1",
+			Command:   argv[0],
+			Argv:      argv,
+			Mode:      "pipe",
+			StartedAt: base.Add(time.Duration(i) * time.Minute),
+			EndedAt:   base.Add(time.Duration(i)*time.Minute + time.Second),
+		}); err != nil {
+			t.Fatalf("insert span: %v", err)
+		}
+	}
+	// a span whose parent IS a recorded span must never become the label,
+	// even when it started earliest
+	if err := store.InsertSpan(ctx, Span{
+		ID:           "child",
+		SessionID:    "s1",
+		ParentSpanID: "root-0",
+		Command:      "ls",
+		Argv:         []string{"ls"},
+		Mode:         "pipe",
+		StartedAt:    base.Add(-time.Minute),
+		EndedAt:      base,
+	}); err != nil {
+		t.Fatalf("insert child: %v", err)
+	}
+
+	roots, err := store.RootSpanCommands(ctx, nil)
+	if err != nil {
+		t.Fatalf("RootSpanCommands: %v", err)
+	}
+	got := strings.Join(roots["s1"], " ")
+	if got != "make ci" {
+		t.Errorf("roots[s1] = %q, want %q", got, "make ci")
+	}
+	if _, ok := roots["nope"]; ok {
+		t.Error("unknown session present in root map")
+	}
+}

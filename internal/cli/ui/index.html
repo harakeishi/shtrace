@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shtrace</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><span class="logo">$</span>shtrace</div>
+    <div class="spacer"></div>
+    <div class="localbadge"><span class="dot"></span><span id="hostLabel">local only</span></div>
+  </header>
+
+  <div class="main">
+    <!-- ========== View A: Explorer ========== -->
+    <div class="view on" id="viewA">
+      <aside class="facets">
+        <div class="facets-head"><h2>Facets</h2><button id="clearAll">Clear all</button></div>
+        <div id="facetList"></div>
+      </aside>
+
+      <section class="center">
+        <div class="querybar">
+          <div class="qwrap">
+            <span class="icon">⌕</span>
+            <input id="q" placeholder="status:failed command:pytest cwd:*/shtrace  — search spans">
+          </div>
+          <div class="seg" id="range">
+            <button data-ms="900000">15m</button><button data-ms="3600000">1h</button><button data-ms="14400000">4h</button><button data-ms="86400000">1d</button><button class="on" data-ms="0">All</button>
+          </div>
+          <div class="livetail" id="tail"><span class="switch"></span>Live tail</div>
+        </div>
+
+        <div class="notice" id="notice"></div>
+
+        <div class="histo">
+          <div class="histo-head">
+            <span class="t">Executions over time</span>
+            <div class="legend">
+              <span><i class="lg-ok"></i>success</span>
+              <span><i class="lg-err"></i>failed</span>
+            </div>
+          </div>
+          <div class="bars" id="bars"></div>
+          <div class="axis" id="histoAxis"></div>
+        </div>
+
+        <div class="summary">
+          <span class="lead" id="summaryLead"></span>
+          <span class="frm" id="summaryFrom"></span>
+          <span class="spacer"></span>
+          <span class="hint">Session チップ <kbd>click</kbd> で waterfall へ</span>
+        </div>
+
+        <div class="resbar">
+          <span class="rlbl">Filters</span>
+          <div class="chips" id="chips"></div>
+        </div>
+
+        <div class="tablewrap">
+          <table class="spans">
+            <thead><tr>
+              <th class="c-bar"></th>
+              <th class="c-time">Time</th>
+              <th class="c-status">Status</th>
+              <th class="c-dur">Duration</th>
+              <th>Spans — command</th>
+              <th class="c-cwd">Cwd</th>
+              <th class="c-sess">Session</th>
+            </tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <div class="empty u-hidden" id="empty">条件に一致する span はありません</div>
+        </div>
+      </section>
+
+      <aside class="detail" id="detail">
+        <div class="d-head">
+          <div class="d-title">
+            <div class="cmd" id="dCmd"></div>
+            <button class="d-close" id="dClose">✕</button>
+          </div>
+          <div class="d-meta" id="dMeta"></div>
+        </div>
+        <div class="tabs" id="dTabs">
+          <button class="on" data-t="output">Output</button>
+          <button data-t="meta">Metadata</button>
+          <button data-t="rel">Related spans</button>
+        </div>
+        <div class="d-body" id="dBody"></div>
+      </aside>
+    </div>
+
+    <!-- ========== View B: Waterfall ========== -->
+    <div class="view wfview" id="viewB">
+      <div class="crumbs">
+        <button class="link" id="crumbBack">Spans</button>
+        <span class="sep">/</span>
+        <span class="cur" id="crumbCur"></span>
+        <span class="spacer"></span>
+        <button class="actionbtn ghost" id="backToList">← 一覧に戻る</button>
+      </div>
+      <div class="trace-header" id="traceHeader"></div>
+      <div class="wf-wrap">
+        <div class="wf-toolbar">
+          <span id="wfHint"></span>
+          <div class="legend">
+            <span><i class="lg ok"></i>success</span>
+            <span><i class="lg err"></i>exit≠0</span>
+            <span><i class="lg run"></i>running</span>
+          </div>
+        </div>
+        <div class="wf-head">
+          <div class="h-name">Command / span</div>
+          <div class="h-axis" id="axis"></div>
+        </div>
+        <div class="wf-body" id="wfBody"></div>
+      </div>
+      <div class="wdetail collapsed" id="wDetail">
+        <div class="wd-head" id="wdHead"></div>
+        <div class="wd-body" id="wdBody"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

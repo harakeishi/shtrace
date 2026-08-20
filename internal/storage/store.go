@@ -297,42 +297,7 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string, warn func
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-
-	var out []Span
-	for rows.Next() {
-		var (
-			sp       Span
-			argvJSON string
-			started  string
-			ended    string
-			exitCode sql.NullInt64
-		)
-		if err := rows.Scan(&sp.ID, &sp.SessionID, &sp.ParentSpanID, &sp.Command, &argvJSON, &sp.Cwd, &sp.Mode, &started, &ended, &exitCode); err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal([]byte(argvJSON), &sp.Argv); err != nil {
-			reportWarn(warn, fmt.Errorf("span %s: parse argv_json: %w", sp.ID, err))
-			continue
-		}
-		t, err := time.Parse(time.RFC3339Nano, started)
-		if err != nil {
-			reportWarn(warn, fmt.Errorf("span %s: parse started_at %q: %w", sp.ID, started, err))
-			continue
-		}
-		sp.StartedAt = t
-		t, err = time.Parse(time.RFC3339Nano, ended)
-		if err != nil {
-			reportWarn(warn, fmt.Errorf("span %s: parse ended_at %q: %w", sp.ID, ended, err))
-			continue
-		}
-		sp.EndedAt = t
-		if exitCode.Valid {
-			v := int(exitCode.Int64)
-			sp.ExitCode = &v
-		}
-		out = append(out, sp)
-	}
-	return out, rows.Err()
+	return scanSpans(rows, warn)
 }
 
 // DeleteSession removes a session and all of its spans from the metadata DB
@@ -373,4 +338,98 @@ func reportWarn(warn func(error), err error) {
 	if warn != nil {
 		warn(err)
 	}
+}
+
+// RecentSpans returns spans across all sessions, newest-first, up to limit.
+// The web UI's span list is a cross-session timeline; fetching it per session
+// would be one query per session.
+//
+// Per-row parse failures are reported via warn and the row is skipped.
+func (s *Store) RecentSpans(ctx context.Context, limit int, warn func(error)) ([]Span, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, session_id, parent_span_id, command, argv_json, cwd, mode, started_at, ended_at, exit_code
+		FROM spans
+		ORDER BY started_at DESC, id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanSpans(rows, warn)
+}
+
+func scanSpans(rows *sql.Rows, warn func(error)) ([]Span, error) {
+	var out []Span
+	for rows.Next() {
+		var (
+			sp       Span
+			argvJSON string
+			started  string
+			ended    string
+			exitCode sql.NullInt64
+		)
+		if err := rows.Scan(&sp.ID, &sp.SessionID, &sp.ParentSpanID, &sp.Command, &argvJSON, &sp.Cwd, &sp.Mode, &started, &ended, &exitCode); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(argvJSON), &sp.Argv); err != nil {
+			reportWarn(warn, fmt.Errorf("span %s: parse argv_json: %w", sp.ID, err))
+			continue
+		}
+		t, err := time.Parse(time.RFC3339Nano, started)
+		if err != nil {
+			reportWarn(warn, fmt.Errorf("span %s: parse started_at %q: %w", sp.ID, started, err))
+			continue
+		}
+		sp.StartedAt = t
+		t, err = time.Parse(time.RFC3339Nano, ended)
+		if err != nil {
+			reportWarn(warn, fmt.Errorf("span %s: parse ended_at %q: %w", sp.ID, ended, err))
+			continue
+		}
+		sp.EndedAt = t
+		if exitCode.Valid {
+			v := int(exitCode.Int64)
+			sp.ExitCode = &v
+		}
+		out = append(out, sp)
+	}
+	return out, rows.Err()
+}
+
+// RootSpanCommands maps each session id to the argv of its earliest root
+// span, which the web UI renders as the session's label. A root span is one
+// whose parent is not itself a recorded span: parent_span_id is either empty
+// or points at a process (e.g. the shell) that shtrace never wrapped.
+// Sessions with no spans at all are absent from the map.
+func (s *Store) RootSpanCommands(ctx context.Context, warn func(error)) (map[string][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sp.session_id, sp.argv_json, sp.command
+		FROM spans sp
+		WHERE sp.parent_span_id = ''
+		   OR NOT EXISTS (SELECT 1 FROM spans p WHERE p.id = sp.parent_span_id)
+		ORDER BY sp.started_at DESC, sp.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var sessionID, argvJSON, command string
+		if err := rows.Scan(&sessionID, &argvJSON, &command); err != nil {
+			return nil, err
+		}
+		var argv []string
+		if err := json.Unmarshal([]byte(argvJSON), &argv); err != nil {
+			reportWarn(warn, fmt.Errorf("session %s: parse argv_json: %w", sessionID, err))
+			argv = []string{command}
+		}
+		// Rows arrive newest-first, so the last write per session wins and
+		// leaves the earliest root span.
+		out[sessionID] = argv
+	}
+	return out, rows.Err()
 }

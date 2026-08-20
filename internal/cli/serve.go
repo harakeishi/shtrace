@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -101,6 +103,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/sessions", makeSessionsHandler(store))
+	mux.HandleFunc("/api/spans", makeAllSpansHandler(store))
 	mux.HandleFunc("/api/sessions/", makeSpansHandler(store))
 	mux.HandleFunc("/api/output/", makeOutputHandler(store, dataDir))
 	mux.HandleFunc("/api/search", makeSearchHandler(fts))
@@ -155,24 +158,76 @@ type apiSession struct {
 	StartedAt string            `json:"started_at"`
 	EndedAt   *string           `json:"ended_at"`
 	Tags      map[string]string `json:"tags"`
+	Label     string            `json:"label,omitempty"`
 }
 
 type apiSpan struct {
-	ID        string   `json:"id"`
-	SessionID string   `json:"session_id"`
-	Command   string   `json:"command"`
-	Argv      []string `json:"argv"`
-	Cwd       string   `json:"cwd"`
-	Mode      string   `json:"mode"`
-	StartedAt string   `json:"started_at"`
-	EndedAt   string   `json:"ended_at"`
-	ExitCode  *int     `json:"exit_code"`
+	ID           string   `json:"id"`
+	SessionID    string   `json:"session_id"`
+	ParentSpanID string   `json:"parent_span_id"`
+	Command      string   `json:"command"`
+	Argv         []string `json:"argv"`
+	Cwd          string   `json:"cwd"`
+	Mode         string   `json:"mode"`
+	StartedAt    string   `json:"started_at"`
+	EndedAt      string   `json:"ended_at"`
+	ExitCode     *int     `json:"exit_code"`
+	Group        string   `json:"group"`
+}
+
+// apiSpansPage is the /api/spans payload: the span timeline plus the sessions
+// those spans belong to, so the UI can label session chips without a second
+// round trip per session.
+type apiSpansPage struct {
+	Spans    []apiSpan    `json:"spans"`
+	Sessions []apiSession `json:"sessions"`
 }
 
 type apiSearchResult struct {
 	SpanID    string `json:"span_id"`
 	SessionID string `json:"session_id"`
 	Snippet   string `json:"snippet"`
+}
+
+func toAPISpan(sp storage.Span) apiSpan {
+	return apiSpan{
+		ID:           sp.ID,
+		SessionID:    sp.SessionID,
+		ParentSpanID: sp.ParentSpanID,
+		Command:      sp.Command,
+		Argv:         sp.Argv,
+		Cwd:          sp.Cwd,
+		Mode:         sp.Mode,
+		StartedAt:    sp.StartedAt.Format(time.RFC3339),
+		EndedAt:      sp.EndedAt.Format(time.RFC3339),
+		ExitCode:     sp.ExitCode,
+		Group:        commandGroup(sp.Argv),
+	}
+}
+
+func toAPISession(sess storage.Session, label string) apiSession {
+	a := apiSession{
+		ID:        sess.ID,
+		StartedAt: sess.StartedAt.Format(time.RFC3339),
+		Tags:      sess.Tags,
+		Label:     label,
+	}
+	if sess.EndedAt != nil {
+		t := sess.EndedAt.Format(time.RFC3339)
+		a.EndedAt = &t
+	}
+	return a
+}
+
+// sessionLabel is the human-readable name for a session: the argv of its
+// earliest root span. Returns "" when the session has no root span, so the UI
+// falls back to the bare id.
+func sessionLabel(roots map[string][]string, sessionID string) string {
+	argv, ok := roots[sessionID]
+	if !ok || len(argv) == 0 {
+		return ""
+	}
+	return strings.Join(argv, " ")
 }
 
 func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
@@ -193,18 +248,14 @@ func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 		if capped {
 			sessions = sessions[:sessionCap]
 		}
+		roots, err := store.RootSpanCommands(r.Context(), nil)
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
 		out := make([]apiSession, 0, len(sessions))
 		for _, s := range sessions {
-			a := apiSession{
-				ID:        s.ID,
-				StartedAt: s.StartedAt.Format(time.RFC3339),
-				Tags:      s.Tags,
-			}
-			if s.EndedAt != nil {
-				t := s.EndedAt.Format(time.RFC3339)
-				a.EndedAt = &t
-			}
-			out = append(out, a)
+			out = append(out, toAPISession(s, sessionLabel(roots, s.ID)))
 		}
 		// Marshal before setting any headers so that a marshal failure
 		// (http.Error → 500) does not emit X-Shtrace-Sessions-Capped
@@ -217,6 +268,82 @@ func makeSessionsHandler(store *storage.Store) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		if capped {
 			w.Header().Set("X-Shtrace-Sessions-Capped", "true")
+		}
+		_, _ = w.Write(b)
+	}
+}
+
+// makeAllSpansHandler serves the cross-session span timeline that the web UI's
+// list view renders, together with the sessions those spans belong to.
+func makeAllSpansHandler(store *storage.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		const (
+			defaultSpanLimit = 1000
+			maxSpanLimit     = 5000
+		)
+		limit := defaultSpanLimit
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			n, convErr := strconv.Atoi(raw)
+			if convErr != nil || n < 1 || n > maxSpanLimit {
+				http.Error(w, "limit must be an integer between 1 and 5000", http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+
+		// Request one extra to detect whether the list was capped.
+		spans, err := store.RecentSpans(r.Context(), limit+1, nil)
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		capped := len(spans) > limit
+		if capped {
+			spans = spans[:limit]
+		}
+
+		roots, err := store.RootSpanCommands(r.Context(), nil)
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		sessions, err := store.ListSessions(r.Context(), maxSpanLimit, nil)
+		if err != nil {
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+
+		needed := make(map[string]bool, len(spans))
+		for _, sp := range spans {
+			needed[sp.SessionID] = true
+		}
+		page := apiSpansPage{
+			Spans:    make([]apiSpan, 0, len(spans)),
+			Sessions: make([]apiSession, 0, len(needed)),
+		}
+		for _, sp := range spans {
+			page.Spans = append(page.Spans, toAPISpan(sp))
+		}
+		for _, sess := range sessions {
+			if !needed[sess.ID] {
+				continue
+			}
+			page.Sessions = append(page.Sessions, toAPISession(sess, sessionLabel(roots, sess.ID)))
+		}
+
+		b, marshalErr := json.Marshal(page)
+		if marshalErr != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if capped {
+			w.Header().Set("X-Shtrace-Spans-Capped", "true")
 		}
 		_, _ = w.Write(b)
 	}
@@ -257,17 +384,7 @@ func makeSpansHandler(store *storage.Store) http.HandlerFunc {
 		}
 		out := make([]apiSpan, 0, len(spans))
 		for _, sp := range spans {
-			out = append(out, apiSpan{
-				ID:        sp.ID,
-				SessionID: sp.SessionID,
-				Command:   sp.Command,
-				Argv:      sp.Argv,
-				Cwd:       sp.Cwd,
-				Mode:      sp.Mode,
-				StartedAt: sp.StartedAt.Format(time.RFC3339),
-				EndedAt:   sp.EndedAt.Format(time.RFC3339),
-				ExitCode:  sp.ExitCode,
-			})
+			out = append(out, toAPISpan(sp))
 		}
 		writeJSON(w, out)
 	}
@@ -412,194 +529,58 @@ func stripANSI(s string) string {
 	return ansiEscapeRe.ReplaceAllString(s, "")
 }
 
+
+//go:embed ui
+var uiFS embed.FS
+
+// uiContentSecurityPolicy locks the UI down to same-origin assets. Serving CSS
+// and JS as separate files removes the need for 'unsafe-inline'.
+const uiContentSecurityPolicy = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
 func makeUIHandler() http.HandlerFunc {
+	sub, err := fs.Sub(uiFS, "ui")
+	if err != nil {
+		panic("embed ui: " + err.Error())
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if r.URL.Path != "/" {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		if name == "" {
+			name = "index.html"
+		}
+		if !fs.ValidPath(name) {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
-		_, _ = io.WriteString(w, serveUI)
+		b, readErr := fs.ReadFile(sub, name)
+		if readErr != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", uiContentType(name))
+		w.Header().Set("Content-Security-Policy", uiContentSecurityPolicy)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+			return
+		}
+		_, _ = w.Write(b)
 	}
 }
 
-// serveUI is the embedded single-page web UI served at "/".
-// It uses only standard JS (no template literals) so the raw string works without escaping.
-const serveUI = "<!DOCTYPE html>\n" +
-	"<html lang=\"en\">\n" +
-	"<head>\n" +
-	"<meta charset=\"UTF-8\">\n" +
-	"<title>shtrace</title>\n" +
-	"<style>\n" +
-	"*{box-sizing:border-box;margin:0;padding:0}\n" +
-	"body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;height:100vh;overflow:hidden}\n" +
-	"#sidebar{width:280px;min-width:180px;background:#1a1a1a;border-right:1px solid #333;display:flex;flex-direction:column;overflow:hidden}\n" +
-	"#sidebar h2{padding:12px;font-size:13px;color:#888;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid #333}\n" +
-	"#sessions{flex:1;overflow-y:auto}\n" +
-	".sess{padding:10px 12px;cursor:pointer;border-bottom:1px solid #222;font-size:12px}\n" +
-	".sess:hover,.sess.active{background:#252525}\n" +
-	".sess .sid{font-family:monospace;color:#7ee8a2;word-break:break-all}\n" +
-	".sess .stime{color:#666;margin-top:2px}\n" +
-	".sess .stags{color:#888;margin-top:2px;font-size:11px}\n" +
-	"#main{flex:1;display:flex;flex-direction:column;overflow:hidden}\n" +
-	"#toolbar{padding:10px 12px;border-bottom:1px solid #333;display:flex;gap:8px;align-items:center}\n" +
-	"#toolbar input{flex:1;background:#222;border:1px solid #444;border-radius:4px;padding:6px 10px;color:#eee;font-size:13px;outline:none}\n" +
-	"#toolbar input:focus{border-color:#666}\n" +
-	"#toolbar button{background:#333;border:1px solid #555;color:#ccc;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:13px}\n" +
-	"#toolbar button:hover{background:#444}\n" +
-	"#content{flex:1;overflow:auto;padding:12px}\n" +
-	"#content h3{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}\n" +
-	".span-card{background:#1a1a1a;border:1px solid #333;border-radius:6px;margin-bottom:8px;overflow:hidden}\n" +
-	".span-header{padding:8px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;background:#1e1e1e}\n" +
-	".span-header:hover{background:#252525}\n" +
-	".span-cmd{font-family:monospace;font-size:13px;color:#7ee8a2}\n" +
-	".span-meta{font-size:11px;color:#666;margin-left:auto;white-space:nowrap}\n" +
-	".exit-ok{color:#4caf50}.exit-fail{color:#f44336}.exit-unk{color:#888}\n" +
-	".span-output{display:none;padding:10px 12px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;color:#ccc;border-top:1px solid #333;max-height:400px;overflow:auto;background:#111}\n" +
-	".span-output.open{display:block}\n" +
-	".search-result{background:#1a1a1a;border:1px solid #333;border-radius:6px;margin-bottom:8px;padding:10px 12px}\n" +
-	".search-result .sr-ids{font-size:11px;color:#666;margin-bottom:4px;font-family:monospace}\n" +
-	".search-result .sr-snippet{font-family:monospace;font-size:12px;color:#ccc;white-space:pre-wrap;word-break:break-all}\n" +
-	"#loading{color:#666;font-size:13px;padding:20px}\n" +
-	"#empty{color:#666;font-size:13px;padding:20px}\n" +
-	"</style>\n" +
-	"</head>\n" +
-	"<body>\n" +
-	"<div id=\"sidebar\">\n" +
-	"  <h2>Sessions</h2>\n" +
-	"  <div id=\"sessions\"><div id=\"loading\">Loading...</div></div>\n" +
-	"</div>\n" +
-	"<div id=\"main\">\n" +
-	"  <div id=\"toolbar\">\n" +
-	"    <input id=\"searchbox\" type=\"text\" placeholder=\"Search output (Enter)\">\n" +
-	"    <button id=\"searchbtn\">Search</button>\n" +
-	"    <button id=\"refreshbtn\" title=\"Refresh sessions\">Refresh</button>\n" +
-	"  </div>\n" +
-	"  <div id=\"content\"><div id=\"empty\">Select a session or search.</div></div>\n" +
-	"</div>\n" +
-	"<script>\n" +
-	"var activeSessEl=null;\n" +
-	"var activeSessionID=null;\n" +
-	"\n" +
-	"function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n" +
-	"\n" +
-	"function durationStr(start,end){\n" +
-	"  var ms=new Date(end)-new Date(start);\n" +
-	"  if(ms<1000) return ms+'ms';\n" +
-	"  if(ms<60000) return (ms/1000).toFixed(1)+'s';\n" +
-	"  return Math.floor(ms/60000)+'m'+(Math.floor(ms/1000)%60)+'s';\n" +
-	"}\n" +
-	"\n" +
-	"function loadSessions(){\n" +
-	"  fetch('/api/sessions').then(function(resp){\n" +
-	"    var capped=resp.headers.get('X-Shtrace-Sessions-Capped')==='true';\n" +
-	"    return resp.json().then(function(sessions){return{sessions:sessions,capped:capped};});\n" +
-	"  }).then(function(data){\n" +
-	"    var sessions=data.sessions,capped=data.capped;\n" +
-	"    var el=document.getElementById('sessions');\n" +
-	"    if(!sessions.length){el.innerHTML='<div style=\"padding:12px;color:#666;font-size:12px\">No sessions recorded yet.</div>';return;}\n" +
-	"    el.innerHTML='';\n" +
-	"    if(capped){var cap=document.createElement('div');cap.style='padding:6px 12px;font-size:11px;color:#f0a000;border-bottom:1px solid #333;';cap.textContent='Showing newest 500 sessions.';el.appendChild(cap);}\n" +
-	"    sessions.forEach(function(s){\n" +
-	"      var d=document.createElement('div');\n" +
-	"      d.className='sess';\n" +
-	"      var tags=Object.entries(s.tags||{}).map(function(kv){return kv[0]+'='+kv[1];}).join(' ');\n" +
-	"      d.dataset.sid=s.id;\n" +
-	"      var html='<div class=\"sid\">'+esc(s.id.slice(0,20))+'</div>';\n" +
-	"      html+='<div class=\"stime\">'+esc(s.started_at.replace('T',' ').slice(0,16))+'</div>';\n" +
-	"      if(tags) html+='<div class=\"stags\">'+esc(tags)+'</div>';\n" +
-	"      d.innerHTML=html;\n" +
-	"      d.onclick=(function(sid,el){return function(){selectSession(sid,el);};})(s.id,d);\n" +
-	"      el.appendChild(d);\n" +
-	"    });\n" +
-	"  }).catch(function(e){document.getElementById('sessions').innerHTML='<div style=\"padding:12px;color:#f44\">Error: '+esc(String(e))+'</div>';});\n" +
-	"}\n" +
-	"\n" +
-	"function selectSession(id,el){\n" +
-	"  if(activeSessEl) activeSessEl.classList.remove('active');\n" +
-	"  activeSessEl=el; el.classList.add('active');\n" +
-	"  activeSessionID=id;\n" +
-	"  document.getElementById('searchbox').value='';\n" +
-	"  var content=document.getElementById('content');\n" +
-	"  content.innerHTML='<div id=\"loading\">Loading...</div>';\n" +
-	"  fetch('/api/sessions/'+encodeURIComponent(id)+'/spans').then(function(r){return r.json();}).then(function(spans){\n" +
-	"    if(!spans.length){content.innerHTML='<div id=\"empty\">No spans in this session.</div>';return;}\n" +
-	"    content.innerHTML='<h3>Spans ('+spans.length+')</h3>';\n" +
-	"    spans.forEach(function(sp){\n" +
-	"      var card=document.createElement('div');\n" +
-	"      card.className='span-card';\n" +
-	"      var exitHtml=sp.exit_code==null?'<span class=\"exit-unk\">?</span>':\n" +
-	"        sp.exit_code===0?'<span class=\"exit-ok\">OK</span>':\n" +
-	"        '<span class=\"exit-fail\">exit:'+esc(String(sp.exit_code))+'</span>';\n" +
-	"      var dur=durationStr(sp.started_at,sp.ended_at);\n" +
-	"      var hdrHtml='<div class=\"span-header\">';\n" +
-	"      hdrHtml+='<span class=\"span-cmd\">'+esc(sp.argv.join(' '))+'</span>';\n" +
-	"      hdrHtml+='<span class=\"span-meta\">'+exitHtml+' '+esc(sp.mode)+' '+esc(dur)+'</span>';\n" +
-	"      hdrHtml+='</div><div class=\"span-output\"></div>';\n" +
-	"      card.innerHTML=hdrHtml;\n" +
-	"      var hdr=card.querySelector('.span-header');\n" +
-	"      var out=card.querySelector('.span-output');\n" +
-	"      var loaded=false;\n" +
-	"      hdr.onclick=(function(sessID,spanID,outEl){\n" +
-	"        return function(){\n" +
-	"          outEl.classList.toggle('open');\n" +
-	"          if(outEl.classList.contains('open')&&!loaded){\n" +
-	"            loaded=true;\n" +
-	"            outEl.textContent='Loading...';\n" +
-	"            fetch('/api/output/'+encodeURIComponent(sessID)+'/'+encodeURIComponent(spanID))\n" +
-	"              .then(function(res){return res.text();})\n" +
-	"              .then(function(txt){outEl.textContent=txt;})\n" +
-	"              .catch(function(e){outEl.textContent='Error: '+e;});\n" +
-	"          }\n" +
-	"        };\n" +
-	"      })(id,sp.id,out);\n" +
-	"      content.appendChild(card);\n" +
-	"    });\n" +
-	"  }).catch(function(e){content.innerHTML='<div id=\"empty\">Error: '+esc(String(e))+'</div>';});\n" +
-	"}\n" +
-	"\n" +
-	"function doSearch(){\n" +
-	"  var q=document.getElementById('searchbox').value.trim();\n" +
-	"  if(!q)return;\n" +
-	"  if(activeSessEl){activeSessEl.classList.remove('active');activeSessEl=null;}\n" +
-	"  var content=document.getElementById('content');\n" +
-	"  content.innerHTML='<div id=\"loading\">Searching...</div>';\n" +
-	"  fetch('/api/search?q='+encodeURIComponent(q)).then(function(r){\n" +
-	"    if(r.status===503){content.innerHTML='<div id=\"empty\">Search index not available -- run shtrace reindex first.</div>';return Promise.reject('503');}\n" +
-	"    return r.json();\n" +
-	"  }).then(function(results){\n" +
-	"    if(!results.length){content.innerHTML='<div id=\"empty\">No results for &quot;'+esc(q)+'&quot;.</div>';return;}\n" +
-	"    content.innerHTML='<h3>Search results ('+results.length+')</h3>';\n" +
-	"    results.forEach(function(res){\n" +
-	"      var d=document.createElement('div');\n" +
-	"      d.className='search-result';\n" +
-	"      var snippet=esc(res.snippet).replace(/\\[([^\\]]*?)\\]/g,'<span style=\"color:#f0c040;font-weight:bold\">$1</span>');\n" +
-	"      d.innerHTML='<div class=\"sr-ids\">session '+esc(res.session_id)+' / span '+esc(res.span_id)+'</div><div class=\"sr-snippet\">'+snippet+'</div>';\n" +
-	"      d.style.cursor='pointer';\n" +
-	"      d.onclick=(function(sessID){\n" +
-	"        return function(){\n" +
-	"          var sessEls=document.querySelectorAll('.sess');\n" +
-	"          for(var i=0;i<sessEls.length;i++){\n" +
-	"            if(sessEls[i].dataset.sid===sessID){selectSession(sessID,sessEls[i]);break;}\n" +
-	"          }\n" +
-	"        };\n" +
-	"      })(res.session_id);\n" +
-	"      content.appendChild(d);\n" +
-	"    });\n" +
-	"  }).catch(function(e){if(e!=='503')content.innerHTML='<div id=\"empty\">Error: '+esc(String(e))+'</div>';});\n" +
-	"}\n" +
-	"\n" +
-	"document.getElementById('searchbtn').onclick=doSearch;\n" +
-	"document.getElementById('searchbox').addEventListener('keydown',function(e){if(e.key==='Enter')doSearch();});\n" +
-	"document.getElementById('refreshbtn').onclick=loadSessions;\n" +
-	"\n" +
-	"loadSessions();\n" +
-	"</script>\n" +
-	"</body>\n" +
-	"</html>\n"
+func uiContentType(name string) string {
+	switch filepath.Ext(name) {
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".js":
+		return "text/javascript; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	default:
+		return "text/html; charset=utf-8"
+	}
+}
