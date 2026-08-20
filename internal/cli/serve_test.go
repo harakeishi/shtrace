@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -231,7 +232,7 @@ func TestSpansHandler_BadPath(t *testing.T) {
 	}{
 		{"/api/sessions//spans", http.StatusBadRequest},
 		{"/api/sessions/a/b/spans", http.StatusBadRequest},
-		{"/api/sessions/foo", http.StatusNotFound},         // missing /spans suffix
+		{"/api/sessions/foo", http.StatusNotFound},             // missing /spans suffix
 		{"/api/sessions/foo/spans/extra", http.StatusNotFound}, // extra segment
 	}
 	for _, tc := range cases {
@@ -308,6 +309,334 @@ func TestSearchHandler_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestSessionsHandler_Label(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-l")
+	if err := store.InsertSpan(context.Background(), storage.Span{
+		ID:        "r1",
+		SessionID: "sess-l",
+		Command:   "make",
+		Argv:      []string{"make", "ci"},
+		Mode:      "pty",
+		StartedAt: time.Now().UTC(),
+		EndedAt:   time.Now().UTC().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("insert span: %v", err)
+	}
+
+	h := makeSessionsHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+	var out []apiSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out) != 1 || out[0].Label != "make ci" {
+		t.Fatalf("got %+v, want one session labelled %q", out, "make ci")
+	}
+}
+
+// ---- /api/spans ----
+
+func TestAllSpansHandler_OK(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-1")
+	insertTestSession(t, store, "sess-2")
+	insertTestSpan(t, store, "sess-1", "span-1", "go")
+	insertTestSpan(t, store, "sess-2", "span-2", "pytest")
+
+	h := makeAllSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/spans", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type=%q, want application/json", ct)
+	}
+	var page apiSpansPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(page.Spans) != 2 {
+		t.Fatalf("got %d spans, want 2", len(page.Spans))
+	}
+	if len(page.Sessions) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(page.Sessions))
+	}
+	for _, sp := range page.Spans {
+		if sp.Group == "" {
+			t.Errorf("span %s: empty command group", sp.ID)
+		}
+	}
+	if rec.Header().Get("X-Shtrace-Spans-Capped") != "" {
+		t.Error("X-Shtrace-Spans-Capped set for an uncapped result")
+	}
+}
+
+func TestAllSpansHandler_SessionLabel(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-lbl")
+	if err := store.InsertSpan(context.Background(), storage.Span{
+		ID:        "root-span",
+		SessionID: "sess-lbl",
+		Command:   "make",
+		Argv:      []string{"make", "ci"},
+		Mode:      "pty",
+		StartedAt: time.Now().UTC(),
+		EndedAt:   time.Now().UTC().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("insert root span: %v", err)
+	}
+	if err := store.InsertSpan(context.Background(), storage.Span{
+		ID:           "child-span",
+		SessionID:    "sess-lbl",
+		ParentSpanID: "root-span",
+		Command:      "go",
+		Argv:         []string{"go", "test", "./..."},
+		Mode:         "pipe",
+		StartedAt:    time.Now().UTC().Add(100 * time.Millisecond),
+		EndedAt:      time.Now().UTC().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("insert child span: %v", err)
+	}
+
+	h := makeAllSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/spans", nil))
+	var page apiSpansPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(page.Sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(page.Sessions))
+	}
+	if page.Sessions[0].Label != "make ci" {
+		t.Errorf("session label = %q, want %q", page.Sessions[0].Label, "make ci")
+	}
+	for _, sp := range page.Spans {
+		if sp.ID == "child-span" {
+			if sp.ParentSpanID != "root-span" {
+				t.Errorf("child parent_span_id = %q, want root-span", sp.ParentSpanID)
+			}
+			if sp.Group != "go test" {
+				t.Errorf("child group = %q, want %q", sp.Group, "go test")
+			}
+		}
+	}
+}
+
+func TestAllSpansHandler_OrphanParentCountsAsRoot(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-orphan")
+	// The parent process (a shell) is not itself a recorded span, so this
+	// span is the session's tree root and supplies the label.
+	if err := store.InsertSpan(context.Background(), storage.Span{
+		ID:           "orphan",
+		SessionID:    "sess-orphan",
+		ParentSpanID: "shell-pid-not-a-span",
+		Command:      "make",
+		Argv:         []string{"make", "ci"},
+		Mode:         "pipe",
+		StartedAt:    time.Now().UTC(),
+		EndedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("insert span: %v", err)
+	}
+
+	h := makeAllSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/spans", nil))
+	var page apiSpansPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(page.Sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(page.Sessions))
+	}
+	if page.Sessions[0].Label != "make ci" {
+		t.Errorf("label = %q, want %q", page.Sessions[0].Label, "make ci")
+	}
+}
+
+func TestSessionsHandler_LabelEmptyWithoutSpans(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-bare")
+
+	h := makeSessionsHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+	var out []apiSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(out))
+	}
+	if out[0].Label != "" {
+		t.Errorf("label = %q, want empty for a session with no spans", out[0].Label)
+	}
+}
+
+func TestAllSpansHandler_Capped(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-cap")
+	for i := 0; i < 4; i++ {
+		insertTestSpan(t, store, "sess-cap", fmt.Sprintf("span-%02d", i), "echo")
+	}
+
+	h := makeAllSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/spans?limit=2", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Shtrace-Spans-Capped"); got != "true" {
+		t.Errorf("X-Shtrace-Spans-Capped=%q, want true", got)
+	}
+	var page apiSpansPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(page.Spans) != 2 {
+		t.Errorf("got %d spans, want 2", len(page.Spans))
+	}
+}
+
+func TestAllSpansHandler_BadLimit(t *testing.T) {
+	store, _ := openTestStore(t)
+	h := makeAllSpansHandler(store)
+	// "+10" is a valid Atoi input but is rejected as a hand-written limit;
+	// the overflow value must not wrap around into the accepted range.
+	for _, raw := range []string{
+		"0", "-1", "-5", "abc", "5001", "1e3", "+10",
+		"9223372036854775808", "99999999999999999999",
+	} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, "/api/spans?limit="+raw, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("limit=%q: status %d, want 400", raw, rec.Code)
+		}
+	}
+}
+
+func TestAllSpansHandler_LimitBoundaries(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-lim")
+	insertTestSpan(t, store, "sess-lim", "span-lim", "echo")
+
+	h := makeAllSpansHandler(store)
+	for _, raw := range []string{"1", "5000", ""} {
+		rec := httptest.NewRecorder()
+		url := "/api/spans"
+		if raw != "" {
+			url += "?limit=" + raw
+		}
+		h(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("limit=%q: status %d, want 200", raw, rec.Code)
+		}
+	}
+}
+
+// A HEAD request must expose the same status, headers and Content-Length as GET
+// while net/http suppresses the body on the wire.
+func TestAllSpansHandler_Head(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-head")
+	insertTestSpan(t, store, "sess-head", "span-head", "echo")
+
+	srv := httptest.NewServer(http.HandlerFunc(makeAllSpansHandler(store)))
+	defer srv.Close()
+
+	getResp, err := http.Get(srv.URL + "/api/spans")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+
+	headResp, err := http.Head(srv.URL + "/api/spans")
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	headBody, _ := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD status %d, want 200", headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Errorf("HEAD body = %q, want empty", headBody)
+	}
+	if got, want := headResp.Header.Get("Content-Type"), getResp.Header.Get("Content-Type"); got != want {
+		t.Errorf("HEAD Content-Type=%q, want %q", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+		t.Errorf("HEAD Content-Length=%q, want %q (GET body length)", got, want)
+	}
+}
+
+func TestUIHandler_Head(t *testing.T) {
+	srv := httptest.NewServer(makeUIHandler())
+	defer srv.Close()
+
+	getResp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+
+	headResp, err := http.Head(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	headBody, _ := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD status %d, want 200", headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Errorf("HEAD body = %q, want empty", headBody)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+		t.Errorf("HEAD Content-Length=%q, want %q (GET body length)", got, want)
+	}
+	if got := headResp.Header.Get("Content-Security-Policy"); got != uiContentSecurityPolicy {
+		t.Errorf("HEAD CSP=%q, want it set as on GET", got)
+	}
+}
+
+func TestAllSpansHandler_MethodNotAllowed(t *testing.T) {
+	store, _ := openTestStore(t)
+	h := makeAllSpansHandler(store)
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(method, "/api/spans", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("method %s: status %d, want 405", method, rec.Code)
+		}
+		if rec.Header().Get("Allow") == "" {
+			t.Errorf("method %s: Allow header missing", method)
+		}
+	}
+}
+
+func TestAllSpansHandler_Empty(t *testing.T) {
+	store, _ := openTestStore(t)
+	h := makeAllSpansHandler(store)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/spans", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"spans":[]`) || !strings.Contains(body, `"sessions":[]`) {
+		t.Errorf("body = %s, want empty arrays not null", body)
+	}
+}
+
 // ---- / (UI) ----
 
 func TestUIHandler_OK(t *testing.T) {
@@ -325,12 +654,52 @@ func TestUIHandler_OK(t *testing.T) {
 	if !strings.Contains(body, "<title>shtrace</title>") {
 		t.Error("response does not contain expected title")
 	}
-	if !strings.Contains(body, "loadSessions") {
-		t.Error("response does not contain JS entry point")
+	if !strings.Contains(body, `src="/app.js"`) {
+		t.Error("response does not reference the embedded script")
 	}
-	const wantCSP = "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
-	if got := rec.Header().Get("Content-Security-Policy"); got != wantCSP {
-		t.Errorf("Content-Security-Policy=%q, want %q", got, wantCSP)
+	if !strings.Contains(body, `href="/app.css"`) {
+		t.Error("response does not reference the embedded stylesheet")
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != uiContentSecurityPolicy {
+		t.Errorf("Content-Security-Policy=%q, want %q", got, uiContentSecurityPolicy)
+	}
+	if strings.Contains(rec.Header().Get("Content-Security-Policy"), "unsafe-inline") {
+		t.Error("CSP still allows 'unsafe-inline'")
+	}
+}
+
+func TestUIHandler_Assets(t *testing.T) {
+	h := makeUIHandler()
+	cases := []struct{ path, wantCT, wantBody string }{
+		{"/app.css", "text/css", "--accent:#7c5cff"},
+		{"/app.js", "text/javascript", "/api/spans"},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d, want 200", tc.path, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, tc.wantCT) {
+			t.Errorf("%s: Content-Type=%q, want %q", tc.path, ct, tc.wantCT)
+		}
+		if !strings.Contains(rec.Body.String(), tc.wantBody) {
+			t.Errorf("%s: body does not contain %q", tc.path, tc.wantBody)
+		}
+		if got := rec.Header().Get("Content-Security-Policy"); got != uiContentSecurityPolicy {
+			t.Errorf("%s: CSP=%q, want %q", tc.path, got, uiContentSecurityPolicy)
+		}
+	}
+}
+
+func TestUIHandler_EscapesEmbedRoot(t *testing.T) {
+	h := makeUIHandler()
+	for _, path := range []string{"/../serve.go", "/ui/index.html", "//etc/passwd"} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("path %q: got 200, want non-200", path)
+		}
 	}
 }
 
