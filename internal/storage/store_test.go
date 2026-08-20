@@ -545,6 +545,42 @@ func TestRecentSpansAcrossSessions(t *testing.T) {
 	}
 }
 
+// A non-positive limit falls back to 50 rather than being passed to SQLite,
+// where a negative LIMIT means "no limit".
+func TestRecentSpansNonPositiveLimitFallsBackTo50(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	base := time.Now().UTC().Add(-time.Hour)
+	if err := store.InsertSession(ctx, Session{ID: "s1", StartedAt: base, Tags: map[string]string{}}); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	const total = 60
+	for i := 0; i < total; i++ {
+		if err := store.InsertSpan(ctx, Span{
+			ID:        fmt.Sprintf("span-%02d", i),
+			SessionID: "s1",
+			Command:   "echo",
+			Argv:      []string{"echo"},
+			Mode:      "pipe",
+			StartedAt: base.Add(time.Duration(i) * time.Second),
+			EndedAt:   base.Add(time.Duration(i)*time.Second + time.Millisecond),
+		}); err != nil {
+			t.Fatalf("insert span %d: %v", i, err)
+		}
+	}
+
+	for _, limit := range []int{0, -1, -5} {
+		spans, err := store.RecentSpans(ctx, limit, nil)
+		if err != nil {
+			t.Fatalf("RecentSpans(limit=%d): %v", limit, err)
+		}
+		if len(spans) != 50 {
+			t.Errorf("RecentSpans(limit=%d) returned %d spans, want 50", limit, len(spans))
+		}
+	}
+}
+
 func TestRootSpanCommands(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

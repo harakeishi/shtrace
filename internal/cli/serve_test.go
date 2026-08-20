@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -231,7 +232,7 @@ func TestSpansHandler_BadPath(t *testing.T) {
 	}{
 		{"/api/sessions//spans", http.StatusBadRequest},
 		{"/api/sessions/a/b/spans", http.StatusBadRequest},
-		{"/api/sessions/foo", http.StatusNotFound},         // missing /spans suffix
+		{"/api/sessions/foo", http.StatusNotFound},             // missing /spans suffix
 		{"/api/sessions/foo/spans/extra", http.StatusNotFound}, // extra segment
 	}
 	for _, tc := range cases {
@@ -505,12 +506,106 @@ func TestAllSpansHandler_Capped(t *testing.T) {
 func TestAllSpansHandler_BadLimit(t *testing.T) {
 	store, _ := openTestStore(t)
 	h := makeAllSpansHandler(store)
-	for _, raw := range []string{"0", "-1", "abc", "5001", "1e3"} {
+	// "+10" is a valid Atoi input but is rejected as a hand-written limit;
+	// the overflow value must not wrap around into the accepted range.
+	for _, raw := range []string{
+		"0", "-1", "-5", "abc", "5001", "1e3", "+10",
+		"9223372036854775808", "99999999999999999999",
+	} {
 		rec := httptest.NewRecorder()
 		h(rec, httptest.NewRequest(http.MethodGet, "/api/spans?limit="+raw, nil))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("limit=%q: status %d, want 400", raw, rec.Code)
 		}
+	}
+}
+
+func TestAllSpansHandler_LimitBoundaries(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-lim")
+	insertTestSpan(t, store, "sess-lim", "span-lim", "echo")
+
+	h := makeAllSpansHandler(store)
+	for _, raw := range []string{"1", "5000", ""} {
+		rec := httptest.NewRecorder()
+		url := "/api/spans"
+		if raw != "" {
+			url += "?limit=" + raw
+		}
+		h(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("limit=%q: status %d, want 200", raw, rec.Code)
+		}
+	}
+}
+
+// A HEAD request must expose the same status, headers and Content-Length as GET
+// while net/http suppresses the body on the wire.
+func TestAllSpansHandler_Head(t *testing.T) {
+	store, _ := openTestStore(t)
+	insertTestSession(t, store, "sess-head")
+	insertTestSpan(t, store, "sess-head", "span-head", "echo")
+
+	srv := httptest.NewServer(http.HandlerFunc(makeAllSpansHandler(store)))
+	defer srv.Close()
+
+	getResp, err := http.Get(srv.URL + "/api/spans")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+
+	headResp, err := http.Head(srv.URL + "/api/spans")
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	headBody, _ := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD status %d, want 200", headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Errorf("HEAD body = %q, want empty", headBody)
+	}
+	if got, want := headResp.Header.Get("Content-Type"), getResp.Header.Get("Content-Type"); got != want {
+		t.Errorf("HEAD Content-Type=%q, want %q", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+		t.Errorf("HEAD Content-Length=%q, want %q (GET body length)", got, want)
+	}
+}
+
+func TestUIHandler_Head(t *testing.T) {
+	srv := httptest.NewServer(makeUIHandler())
+	defer srv.Close()
+
+	getResp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+
+	headResp, err := http.Head(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("HEAD: %v", err)
+	}
+	headBody, _ := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD status %d, want 200", headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Errorf("HEAD body = %q, want empty", headBody)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+		t.Errorf("HEAD Content-Length=%q, want %q (GET body length)", got, want)
+	}
+	if got := headResp.Header.Get("Content-Security-Policy"); got != uiContentSecurityPolicy {
+		t.Errorf("HEAD CSP=%q, want it set as on GET", got)
 	}
 }
 

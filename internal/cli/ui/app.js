@@ -287,6 +287,10 @@ function fetchOutput(sessID, spanID){
     })
     .then(txt => { outputCache.set(key, txt); return txt; });
 }
+// a finished span's output never changes; only running ones need re-fetching
+function evictRunningOutput(){
+  SPANS.forEach(s => { if(s.st === "running") outputCache.delete(s.sess + "/" + s.id); });
+}
 // classify a plain output line so real logs get the mock's colour treatment
 function lineClass(t){
   if(/^\s*(FAIL|ERROR|error:|E\s|panic:|\-\-\- FAIL|✗)/.test(t) || /\berror\b/i.test(t)) return "o-err";
@@ -294,10 +298,16 @@ function lineClass(t){
   if(/^\s*(WARN|warning:|hint:)/i.test(t)) return "o-warn";
   return "o-plain";
 }
+let termGen = 0;
 function renderTerm(container, sessID, spanID){
+  // a slower earlier fetch must not paint over whatever is current now
+  const gen = ++termGen;
+  container.dataset.termGen = String(gen);
+  const stale = () => container.dataset.termGen !== String(gen);
   container.innerHTML = `<div class="termbar">GET /api/output/${esc(sessID)}/${esc(spanID)}<span class="spacer"></span>
       <button data-term-raw="1">raw</button></div><div class="loading">Loading output…</div>`;
   fetchOutput(sessID, spanID).then(txt => {
+    if(stale()) return;
     const lines = txt.replace(/\n$/, "").split("\n");
     const body = lines.length === 1 && lines[0] === ""
       ? `<div class="ln"><span class="no">1</span><span class="tx o-dim">(empty)</span></div>`
@@ -310,6 +320,7 @@ function renderTerm(container, sessID, spanID){
     term.innerHTML = body;
     container.appendChild(term);
   }).catch(e => {
+    if(stale()) return;
     const box = container.querySelector(".loading");
     if(box){ box.className = "errbox"; box.textContent = "output load failed: " + e.message; }
   });
@@ -332,6 +343,13 @@ function openDetail(id){
   applyStyles(el("dMeta"));
   renderTab();
   renderRows();
+}
+function closeDetail(){
+  selectedId = null;
+  el("detail").classList.remove("open");
+  el("dCmd").textContent = "";
+  el("dMeta").innerHTML = "";
+  el("dBody").innerHTML = "";
 }
 function renderTab(){
   const s = SPANS.find(x => x.id === selectedId);
@@ -541,16 +559,27 @@ function routedSessionID(){
   const m = location.hash.match(/^#\/session\/(.+)$/);
   return m ? decodeURIComponent(m[1]) : null;
 }
+const cappedNotice = () => capped ? "Showing the newest 1000 spans." : "";
+// the cap is usually why a session is missing, so keep that context in the message
+function notFoundNotice(id){
+  return `session ${id} は読み込んだ範囲に見つかりません`
+    + (capped ? "（最新 1000 span のみ読み込み済み）" : "");
+}
 function applyRoute(){
   const id = routedSessionID();
   if(id && SESS_BY_ID[id]){
-    if(!curSession || curSession.id !== id){ curSession = SESS_BY_ID[id]; curSpan = null; wTab = "output"; }
-    else { curSession = SESS_BY_ID[id]; }
+    const same = curSession && curSession.id === id;
+    const keepSpanID = same && curSpan ? curSpan.id : null;
+    curSession = SESS_BY_ID[id];
+    if(!same) wTab = "output";
+    // ingest() rebuilds every span object, so re-resolve the selection by id
+    curSpan = keepSpanID ? (curSession.spans.find(sp => sp.id === keepSpanID) || null) : null;
+    el("notice").textContent = cappedNotice();
     showView("B");
     renderB();
     el("wDetail").classList.toggle("collapsed", !curSpan);
   } else {
-    if(id) el("notice").textContent = `session ${id} は読み込んだ範囲に見つかりません`;
+    el("notice").textContent = id ? notFoundNotice(id) : cappedNotice();
     showView("A");
     renderA();
   }
@@ -569,8 +598,7 @@ function applyCommandFilter(group){
   sel.bin.add(group);
   query = "";
   el("q").value = "";
-  selectedId = null;
-  el("detail").classList.remove("open");
+  closeDetail();
 }
 
 /* ---------- events: view A ---------- */
@@ -604,10 +632,7 @@ el("rows").addEventListener("click", e => {
   const tr = e.target.closest("tr[data-id]");
   if(tr) openDetail(tr.dataset.id);
 });
-el("dClose").addEventListener("click", () => {
-  el("detail").classList.remove("open");
-  selectedId = null; renderRows();
-});
+el("dClose").addEventListener("click", () => { closeDetail(); renderRows(); });
 el("dTabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]");
   if(b){ tab = b.dataset.t; renderTab(); }
@@ -641,7 +666,7 @@ el("range").addEventListener("click", e => {
 el("tail").addEventListener("click", e => {
   const on = e.currentTarget.classList.toggle("on");
   if(tailTimer){ clearInterval(tailTimer); tailTimer = null; }
-  if(on) tailTimer = setInterval(() => { outputCache.clear(); load(); }, 3000);
+  if(on) tailTimer = setInterval(() => { evictRunningOutput(); load(); }, 3000);
 });
 
 /* ---------- events: view B ---------- */
@@ -690,8 +715,7 @@ el("wdBody").addEventListener("click", e => {
 document.addEventListener("keydown", e => {
   if(e.key === "Escape"){
     if(el("viewB").classList.contains("on")){ gotoList(); return; }
-    el("detail").classList.remove("open");
-    selectedId = null; renderRows();
+    closeDetail(); renderRows();
   }
   if(e.key === "/" && document.activeElement.id !== "q" && el("viewA").classList.contains("on")){
     e.preventDefault(); el("q").focus();
@@ -710,9 +734,10 @@ function load(){
     })
     .then(page => {
       ingest(page);
-      el("notice").textContent = capped ? "Showing the newest 1000 spans." : "";
-      if(selectedId && !SPANS.some(s => s.id === selectedId)) selectedId = null;
+      if(selectedId && !SPANS.some(s => s.id === selectedId)) closeDetail();
       applyRoute();
+      // ingest() rebuilds every span object, so redraw the panel from the fresh one
+      if(selectedId) openDetail(selectedId);
     })
     .catch(e => {
       el("rows").innerHTML = "";
