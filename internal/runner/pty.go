@@ -28,9 +28,10 @@ import (
 // PTYOptions configures one mode A invocation.
 type PTYOptions struct {
 	Argv   []string
-	Env    []string  // optional; nil means inherit os.Environ
-	Cwd    string    // optional; empty means inherit current cwd
+	Env    []string // optional; nil means inherit os.Environ
+	Cwd    string   // optional; empty means inherit current cwd
 	Writer ChunkWriter
+	Stdin  io.Reader // nil means the child gets an empty stdin, never the parent's
 	Tty    *os.File  // terminal to forward PTY output to (typically os.Stdout)
 	Stderr io.Writer // for soft-error messages (e.g. MakeRaw failure); may be nil
 	Masker *secret.Masker
@@ -115,6 +116,20 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 		} else {
 			defer func() { _ = term.Restore(int(opt.Tty.Fd()), oldState) }()
 		}
+	}
+
+	// Relay the caller's stdin into the PTY master so interactive children
+	// (vim, password prompts) stay operable.
+	//
+	// This goroutine is deliberately not awaited. os.Stdin does not support
+	// read deadlines, so a read parked on a TTY cannot be interrupted; waiting
+	// for it would hang every interactive run at exit. Detaching is safe
+	// because *os.File tracks its own closed state: once the deferred
+	// ptmx.Close runs, the pending Write fails with ErrClosed instead of
+	// reaching a recycled fd, and io.Copy returns. A goroutine blocked on a
+	// TTY read outlives the call only until the process exits.
+	if opt.Stdin != nil {
+		go func() { _, _ = io.Copy(ptmx, opt.Stdin) }()
 	}
 
 	// forwardStream runs synchronously and blocks until the PTY master returns

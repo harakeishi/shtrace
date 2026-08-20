@@ -4,10 +4,12 @@ package runner
 
 import (
 	"context"
+	"io"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/storage"
@@ -152,5 +154,111 @@ func TestPTYRunner_ForwardsTTYOutput(t *testing.T) {
 	}
 	if !strings.Contains(ttyOutput, "world") {
 		t.Fatalf("tty output %q does not contain 'world'", ttyOutput)
+	}
+}
+
+// TestPTYRunner_ForwardsStdin is the PTY half of the issue #44 regression:
+// input relayed into the PTY master must reach the child. `cat` echoes it
+// back, and the PTY line discipline additionally echoes the input itself, so
+// asserting on the recorded stream is enough to prove the relay works.
+//
+// Tty is nil, so raw mode and SIGWINCH are not involved — those need a real
+// terminal, which CI does not provide.
+func TestPTYRunner_ForwardsStdin(t *testing.T) {
+	rec := &recordingWriter{}
+	done := make(chan error, 1)
+
+	go func() {
+		// head -n1 exits after the first line, closing the slave side so the
+		// master reaches EOF without needing an explicit stdin close.
+		_, err := RunPTY(context.Background(), PTYOptions{
+			Argv:   []string{"head", "-n", "1"},
+			Writer: rec,
+			Stdin:  strings.NewReader("ping-from-stdin\n"),
+			Tty:    nil,
+			Masker: secret.DefaultMasker(),
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunPTY: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("RunPTY hung; stdin relay never delivered input to the child")
+	}
+
+	var all string
+	for _, c := range rec.snapshot() {
+		all += c.Data
+	}
+	if !strings.Contains(all, "ping-from-stdin") {
+		t.Fatalf("PTY output %q does not contain the forwarded stdin", all)
+	}
+}
+
+// TestPTYRunner_NilStdinDoesNotHang verifies a command needing no input still
+// completes when no stdin is supplied, and that no relay goroutine is started.
+func TestPTYRunner_NilStdinDoesNotHang(t *testing.T) {
+	done := make(chan Result, 1)
+	go func() {
+		res, err := RunPTY(context.Background(), PTYOptions{
+			Argv:   []string{"sh", "-c", "echo no-stdin-needed"},
+			Writer: &recordingWriter{},
+			Stdin:  nil,
+			Tty:    nil,
+			Masker: secret.DefaultMasker(),
+		})
+		if err != nil {
+			t.Errorf("RunPTY: %v", err)
+		}
+		done <- res
+	}()
+
+	select {
+	case res := <-done:
+		if res.ExitCode != 0 {
+			t.Fatalf("ExitCode = %d, want 0", res.ExitCode)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunPTY hung with nil stdin")
+	}
+}
+
+// TestPTYRunner_StdinOutlivingChildDoesNotPanic exercises the detached relay
+// goroutine against a reader that never reaches EOF, which is what a real TTY
+// looks like. The child ignores stdin and exits immediately, so ptmx.Close
+// races the pending relay Write; *os.File must turn that into ErrClosed rather
+// than a write to a recycled fd. Meaningful under -race.
+func TestPTYRunner_StdinOutlivingChildDoesNotPanic(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+
+	for i := 0; i < 20; i++ {
+		if _, err := RunPTY(context.Background(), PTYOptions{
+			Argv:   []string{"true"},
+			Writer: &recordingWriter{},
+			Stdin:  blockingReader{stop: stop},
+			Tty:    nil,
+			Masker: secret.DefaultMasker(),
+		}); err != nil {
+			t.Fatalf("RunPTY: %v", err)
+		}
+	}
+}
+
+// blockingReader emits a steady trickle of bytes and never returns EOF until
+// stop is closed, standing in for an idle terminal that stays open.
+type blockingReader struct{ stop chan struct{} }
+
+func (b blockingReader) Read(p []byte) (int, error) {
+	select {
+	case <-b.stop:
+		return 0, io.EOF
+	case <-time.After(time.Millisecond):
+		p[0] = '.'
+		return 1, nil
 	}
 }

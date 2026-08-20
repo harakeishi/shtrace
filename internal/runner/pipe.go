@@ -26,6 +26,7 @@ type PipeOptions struct {
 	Env    []string // optional; nil means inherit os.Environ
 	Cwd    string   // optional; empty means inherit current cwd
 	Writer ChunkWriter
+	Stdin  io.Reader // nil means the child gets an empty stdin, never the parent's
 	Stdout io.Writer // tee target; pass io.Discard if the caller doesn't want a pass-through
 	Stderr io.Writer
 	Masker *secret.Masker
@@ -57,6 +58,9 @@ func RunPipe(ctx context.Context, opt PipeOptions) (Result, error) {
 	if opt.Cwd != "" {
 		cmd.Dir = opt.Cwd
 	}
+	// Passing *os.File through hands the fd to the child directly; any other
+	// reader makes exec spawn a copier that cmd.Wait blocks on until EOF.
+	cmd.Stdin = opt.Stdin
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {

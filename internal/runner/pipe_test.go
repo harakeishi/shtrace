@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/harakeishi/shtrace/internal/secret"
 	"github.com/harakeishi/shtrace/internal/storage"
@@ -279,5 +282,132 @@ func TestPipeRunner_WritesJSONLToBackingWriter(t *testing.T) {
 	}
 	if c.Stream != "stdout" || c.Data != "hi" {
 		t.Fatalf("unexpected chunk: %+v", c)
+	}
+}
+
+// TestPipeRunner_ForwardsStdin is the regression test for issue #44: the
+// wrapped command must receive the caller's stdin. Mirrors the reported
+// reproduction `printf 'a\nb\nc\n' | shtrace -- wc -l`.
+func TestPipeRunner_ForwardsStdin(t *testing.T) {
+	rec := &recordingWriter{}
+	var teeOut bytes.Buffer
+
+	res, err := RunPipe(context.Background(), PipeOptions{
+		Argv:   []string{"wc", "-l"},
+		Writer: rec,
+		Stdin:  strings.NewReader("a\nb\nc\n"),
+		Stdout: &teeOut,
+		Stderr: io.Discard,
+		Masker: secret.DefaultMasker(),
+	})
+	if err != nil {
+		t.Fatalf("RunPipe: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if got := strings.TrimSpace(teeOut.String()); got != "3" {
+		t.Fatalf("wc -l counted %q, want \"3\" (stdin not forwarded)", got)
+	}
+}
+
+// TestPipeRunner_ForwardsStdinFromFile covers the *os.File path, which exec
+// hands to the child as a raw fd instead of spawning an internal copier. This
+// is what the CLI does with os.Stdin, so the two paths are exercised.
+func TestPipeRunner_ForwardsStdinFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "input")
+	if err := os.WriteFile(path, []byte("hello\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	rec := &recordingWriter{}
+	var teeOut bytes.Buffer
+	if _, err := RunPipe(context.Background(), PipeOptions{
+		Argv:   []string{"cat"},
+		Writer: rec,
+		Stdin:  f,
+		Stdout: &teeOut,
+		Stderr: io.Discard,
+		Masker: secret.DefaultMasker(),
+	}); err != nil {
+		t.Fatalf("RunPipe: %v", err)
+	}
+	if got := teeOut.String(); got != "hello\n" {
+		t.Fatalf("cat output = %q, want %q", got, "hello\n")
+	}
+}
+
+// TestPipeRunner_NilStdinDoesNotHang guards the other half of #44: a child
+// that reads stdin must see EOF rather than block forever when the caller
+// supplied no stdin. Run under a timeout so a regression fails instead of
+// hanging the suite.
+func TestPipeRunner_NilStdinDoesNotHang(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stdin io.Reader
+	}{
+		{"nil", nil},
+		{"empty", strings.NewReader("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var teeOut bytes.Buffer
+			done := make(chan error, 1)
+			go func() {
+				_, err := RunPipe(context.Background(), PipeOptions{
+					Argv:   []string{"cat"},
+					Writer: &recordingWriter{},
+					Stdin:  tc.stdin,
+					Stdout: &teeOut,
+					Stderr: io.Discard,
+					Masker: secret.DefaultMasker(),
+				})
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("RunPipe: %v", err)
+				}
+				if teeOut.Len() != 0 {
+					t.Fatalf("expected no output, got %q", teeOut.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("RunPipe hung with no stdin; child never saw EOF")
+			}
+		})
+	}
+}
+
+// TestPipeRunner_StdinIsNotRecorded pins the deliberate choice to forward
+// stdin without recording it: recorded chunks must not contain the input,
+// since it may carry passwords typed at a prompt.
+func TestPipeRunner_StdinIsNotRecorded(t *testing.T) {
+	rec := &recordingWriter{}
+	const input = "hunter2-plaintext-password\n"
+
+	if _, err := RunPipe(context.Background(), PipeOptions{
+		Argv:   []string{"wc", "-c"},
+		Writer: rec,
+		Stdin:  strings.NewReader(input),
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+		Masker: secret.DefaultMasker(),
+	}); err != nil {
+		t.Fatalf("RunPipe: %v", err)
+	}
+
+	for _, c := range rec.snapshot() {
+		if c.Stream == "stdin" {
+			t.Errorf("stdin must not be recorded, got chunk %q", c.Data)
+		}
+		if strings.Contains(c.Data, "hunter2") {
+			t.Errorf("recorded chunk leaked stdin content: %q", c.Data)
+		}
 	}
 }
