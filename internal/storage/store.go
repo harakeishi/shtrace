@@ -78,6 +78,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 			FOREIGN KEY(session_id) REFERENCES sessions(id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS spans_session_idx ON spans(session_id)`,
+		// Maps a parent process (pid + start time) to the session its child
+		// shtrace runs join, so one agent instance yields one session.
+		`CREATE TABLE IF NOT EXISTS parent_sessions (
+			parent_key  TEXT PRIMARY KEY,
+			session_id  TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS parent_sessions_session_idx ON parent_sessions(session_id)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -178,10 +185,10 @@ func (s *Store) ListSessions(ctx context.Context, limit int, warn func(error)) (
 	var out []Session
 	for rows.Next() {
 		var (
-			sess        Session
-			startedAt   string
-			endedAt     sql.NullString
-			tagsJSON    string
+			sess      Session
+			startedAt string
+			endedAt   sql.NullString
+			tagsJSON  string
 		)
 		if err := rows.Scan(&sess.ID, &startedAt, &endedAt, &tagsJSON); err != nil {
 			return nil, err
@@ -294,11 +301,11 @@ func (s *Store) SpansForSession(ctx context.Context, sessionID string, warn func
 	var out []Span
 	for rows.Next() {
 		var (
-			sp        Span
-			argvJSON  string
-			started   string
-			ended     string
-			exitCode  sql.NullInt64
+			sp       Span
+			argvJSON string
+			started  string
+			ended    string
+			exitCode sql.NullInt64
 		)
 		if err := rows.Scan(&sp.ID, &sp.SessionID, &sp.ParentSpanID, &sp.Command, &argvJSON, &sp.Cwd, &sp.Mode, &started, &ended, &exitCode); err != nil {
 			return nil, err
@@ -341,6 +348,9 @@ func (s *Store) DeleteSession(ctx context.Context, sessionID string) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, sessionID); err != nil {
 		return fmt.Errorf("delete session: delete session row: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM parent_sessions WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("delete session: delete parent mapping: %w", err)
 	}
 	return tx.Commit()
 }

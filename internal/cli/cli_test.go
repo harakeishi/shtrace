@@ -93,7 +93,9 @@ func TestCLI_LsShowsRecordedSession(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ls exit = %d, stderr=%s", code, se.String())
 	}
-	if !strings.Contains(so.String(), "sh") {
+	// ls shows the shell's command string, which is what identifies the run;
+	// argv[0] alone would just be "sh".
+	if !strings.Contains(so.String(), "printf ls-test") {
 		t.Fatalf("ls output should mention the recorded command, got %q", so.String())
 	}
 }
@@ -128,7 +130,9 @@ func TestCLI_ShowSplitsStdoutAndStderr(t *testing.T) {
 	if !strings.Contains(sso.String(), "out-line") {
 		t.Fatalf("show stdout missing stdout data: %q", sso.String())
 	}
-	if strings.Contains(sso.String(), "err-line") {
+	// Check the recorded data only: the span header echoes the command string,
+	// which legitimately contains "err-line" as part of the command text.
+	if strings.Contains(stripSpanHeaders(sso.String()), "err-line") {
 		t.Fatalf("show stdout should not carry stderr data: %q", sso.String())
 	}
 	if !strings.Contains(sse.String(), "err-line") {
@@ -205,7 +209,7 @@ func TestCLI_LsSurvivesCorruptSessionRow(t *testing.T) {
 		t.Fatalf("ls exit = %d (should still succeed): stderr=%q", code, se.String())
 	}
 	// Healthy session line should still be there.
-	if !strings.Contains(so.String(), "sh") {
+	if !strings.Contains(so.String(), "printf healthy") {
 		t.Fatalf("healthy session not listed: stdout=%q", so.String())
 	}
 	// The corrupt row should be surfaced as a warning.
@@ -656,4 +660,17 @@ func walkLogFiles(t *testing.T, root string) []string {
 		t.Fatalf("walk %s: %v", root, err)
 	}
 	return out
+}
+
+// stripSpanHeaders removes the "== span ..." lines so assertions can target the
+// recorded output rather than the header, which echoes the command string.
+func stripSpanHeaders(s string) string {
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "== span ") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }

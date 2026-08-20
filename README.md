@@ -204,24 +204,40 @@ shtrace pr-comment --latest --pr 42
 shtrace pr-comment --session <id> --pr 42
 ```
 
-## Automatic session grouping (shell-init)
+## Automatic session grouping
 
-By default each `shtrace` invocation starts a fresh session. To group every
-command you run in a terminal window into **one session** automatically, add
-this line to your `~/.bashrc` or `~/.zshrc`:
-
-```sh
-# ~/.bashrc  (or ~/.zshrc)
-eval "$(shtrace shell-init bash)"   # use zsh for zsh
-```
-
-After opening a new terminal, `SHTRACE_SESSION_ID` is exported automatically.
-Every subsequent `shtrace` call in that terminal joins the same session:
+Runs launched by the same parent process are grouped into one session
+automatically — no configuration required. This matters most for AI agents,
+which typically spawn a throwaway shell per command: one agent instance
+becomes one session, and each command becomes a span within it.
 
 ```sh
 shtrace -- go test ./...
 shtrace -- pytest tests/
-shtrace show $SHTRACE_SESSION_ID    # see both runs together
+shtrace ls          # both runs appear under a single session
+```
+
+The session for an invocation is resolved in this order:
+
+1. `SHTRACE_SESSION_ID`, when set — nested calls, CI jobs, and containers keep
+   their existing behaviour and join that session explicitly.
+2. The session already claimed by this invocation's parent process, if any.
+3. Otherwise a fresh session, which the parent then claims.
+
+The parent is identified by its pid *and* start time, so a recycled pid cannot
+merge unrelated runs. If the start time cannot be read, grouping is skipped and
+the run starts its own session — the behaviour before grouping existed.
+
+### `shell-init` (deprecated)
+
+`shtrace shell-init` predates automatic grouping and is no longer needed in
+normal use. It still works, and remains useful when you want every command in
+a terminal pinned to one explicit session id regardless of process ancestry,
+or when running on a platform where the parent's start time is unavailable:
+
+```sh
+# ~/.bashrc  (or ~/.zshrc)
+eval "$(shtrace shell-init bash)"   # use zsh for zsh
 ```
 
 If `SHTRACE_SESSION_ID` is already set (e.g. from a parent CI job), the
@@ -232,6 +248,86 @@ You can also generate a session ID manually:
 ```sh
 export SHTRACE_SESSION_ID="$(shtrace session new)"
 ```
+
+## Automatic wrapping (experimental)
+
+By default `shtrace` only records what you explicitly wrap. If you want an AI
+coding agent (Claude Code, Codex, …) to have *every* command it runs recorded
+without teaching it about `shtrace`, opt in to auto-wrap:
+
+```sh
+shtrace enable     # install shims + rc hooks
+shtrace doctor     # verify the setup actually wraps
+shtrace disable    # remove everything
+```
+
+Open a new shell (or restart the agent) for the change to take effect.
+
+### How it works
+
+Agents ultimately run their commands through `bash -c` / `zsh -c`, so
+replacing the entry point to the shell is enough to catch everything an agent
+does — the outermost shell is wrapped, and all descendant output flows through
+that one recording.
+
+`shtrace enable` installs two complementary mechanisms:
+
+1. **PATH shims** — `~/.shtrace/shims/{bash,zsh,sh}` are placed ahead of the
+   real shells on `PATH`. Each shim `exec`s `shtrace -- <real shell> "$@"`.
+   The absolute path of the real shell and of the `shtrace` binary are
+   resolved and baked in at `enable` time, so the shim never resolves to
+   itself.
+2. **Startup-file hooks** — an agent that invokes `/bin/bash` by absolute path
+   bypasses `PATH` entirely. `~/.shtrace/bashenv.sh` (armed via `BASH_ENV`) and
+   a block in `~/.zshenv` re-exec the shell under `shtrace` when
+   `BASH_EXECUTION_STRING` / `ZSH_EXECUTION_STRING` is non-empty — i.e. only
+   for `-c` command strings.
+
+Both the `PATH` entry and `BASH_ENV` are set from `~/.bashrc` *and* `~/.zshenv`,
+because a zsh terminal never reads `~/.bashrc`. Without the zsh copy, an agent
+started from a zsh shell would get neither the shims nor absolute-path capture.
+
+Two guards keep wrapping from running away: `SHTRACE_AUTOWRAP_ACTIVE` is
+exported before the wrapping `exec`, so any shell deeper in the same process
+tree passes straight through (no double wrapping), and an invocation with no
+arguments or with `-i` is treated as interactive and left alone.
+
+### Using auto-wrap with `shell-init`
+
+The two compose. `shell-init` exports `SHTRACE_SESSION_ID` for a terminal, and
+auto-wrap deliberately does *not* gate on that variable — it uses
+`SHTRACE_AUTOWRAP_ACTIVE` instead. Commands an agent runs in such a terminal
+are therefore still wrapped, and they join the terminal's session as child
+spans rather than starting sessions of their own:
+
+```sh
+shtrace show "$SHTRACE_SESSION_ID"   # terminal session, with agent commands as spans
+```
+
+Gating on `SHTRACE_SESSION_ID` would silently disable auto-wrap for exactly the
+users who enabled both features.
+
+All rc edits live between `# >>> shtrace auto-wrap >>>` and
+`# <<< shtrace auto-wrap <<<` markers, are written atomically, and never touch
+content outside the block. Re-running `enable` replaces the block in place, so
+it is safe to run repeatedly.
+
+### Limitations
+
+- **Interactive shells are not wrapped.** v1 deliberately stays out of the way
+  of a human at a prompt; use `shtrace shell` for that.
+- **Absolute-path `dash` (and other POSIX `sh`) is not captured.** The `sh`
+  shim covers `PATH` lookups, but shells without a `BASH_ENV` equivalent
+  cannot be hooked when invoked by absolute path.
+- **A bash login shell reads `~/.bash_profile`, not `~/.bashrc`** (this is the
+  default for a macOS terminal), so auto-wrap does not activate there unless
+  `~/.bash_profile` sources `~/.bashrc` — the common arrangement, but not
+  guaranteed. Add `[ -f ~/.bashrc ] && . ~/.bashrc` to `~/.bash_profile` if
+  `shtrace doctor` reports the PATH entry as NG in a new terminal.
+- **Disk usage grows quickly**, since every agent command is now recorded. Run
+  `shtrace gc` periodically, or set `SHTRACE_TTL_DAYS` / `SHTRACE_MAX_SIZE_BYTES`.
+- The shims bake in absolute paths at `enable` time. Re-run `shtrace enable`
+  after moving or upgrading the `shtrace` binary or your shells.
 
 ## How it works
 
@@ -271,6 +367,10 @@ variables:
 This means `shtrace make all` whose `Makefile` calls `shtrace pytest` records
 one session containing both spans, with parent/child linkage preserved.
 
+When no `SHTRACE_SESSION_ID` is inherited, the invocation falls back to
+[parent-process grouping](#automatic-session-grouping) instead of always
+starting a new session.
+
 ### Storage layout
 
 ```
@@ -301,6 +401,7 @@ design — CI integration should be a single env var, not a checked-in file).
 | `SHTRACE_SESSION_ID` | unset (new session) | Join an existing session |
 | `SHTRACE_PARENT_SPAN_ID` | unset | Parent span id for nested calls |
 | `SHTRACE_TAGS` | `{}` | JSON object of tags propagated to child spans |
+| `SHTRACE_AUTOWRAP_ACTIVE` | unset | Set by auto-wrap shims to prevent double wrapping; not intended to be set by hand |
 
 ## Roadmap
 
@@ -318,9 +419,10 @@ design — CI integration should be a single env var, not a checked-in file).
 - Multi-host aggregation
 - Telemetry of any kind (the binary never phones home)
 - Windows support (Linux and macOS only)
-- Automatic shell hooks / aliases — `shtrace` records what it is explicitly
-  asked to wrap; wrapping is the caller's responsibility (see the plan for
-  the rationale behind this choice over the shell-hook approach)
+- Implicit, always-on shell hooks — explicit wrapping remains the principle:
+  `shtrace` records what it is asked to wrap. Auto-wrap exists, but only as an
+  opt-in the user turns on with `shtrace enable` and can fully remove with
+  `shtrace disable` (see [Automatic wrapping](#automatic-wrapping-experimental))
 
 ## Contributing
 
