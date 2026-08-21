@@ -28,9 +28,15 @@ import (
 // PTYOptions configures one mode A invocation.
 type PTYOptions struct {
 	Argv   []string
-	Env    []string  // optional; nil means inherit os.Environ
-	Cwd    string    // optional; empty means inherit current cwd
+	Env    []string // optional; nil means inherit os.Environ
+	Cwd    string   // optional; empty means inherit current cwd
 	Writer ChunkWriter
+	// Stdin is relayed into the PTY master; nil means the child gets an empty
+	// stdin, never the parent's. RunPTY takes ownership for the duration of
+	// the call and may keep reading after it returns: the relay goroutine is
+	// detached, so a Read already in flight completes (and its bytes are lost)
+	// once the call is over. Do not reuse the reader across calls.
+	Stdin  io.Reader
 	Tty    *os.File  // terminal to forward PTY output to (typically os.Stdout)
 	Stderr io.Writer // for soft-error messages (e.g. MakeRaw failure); may be nil
 	Masker *secret.Masker
@@ -115,6 +121,27 @@ func RunPTY(ctx context.Context, opt PTYOptions) (Result, error) {
 		} else {
 			defer func() { _ = term.Restore(int(opt.Tty.Fd()), oldState) }()
 		}
+	}
+
+	// Relay the caller's stdin into the PTY master so interactive children
+	// (vim, password prompts) stay operable.
+	//
+	// This goroutine is deliberately not awaited. os.Stdin does not support
+	// read deadlines, so a read parked on a TTY cannot be interrupted; waiting
+	// for it would hang every interactive run at exit.
+	//
+	// Detaching is only memory-safe, not side-effect-free, and the guarantee
+	// covers the Write side alone: *os.File tracks its own closed state, so a
+	// Write pending when the deferred ptmx.Close runs fails with ErrClosed
+	// instead of reaching a recycled fd. A goroutine parked in opt.Stdin.Read
+	// is not released by closing ptmx — it stays blocked past our return and
+	// will consume whatever arrives next, discarding it. That is why Stdin
+	// ownership transfers to RunPTY for good; see PTYOptions.Stdin.
+	//
+	// The CLI hands over the process-wide os.Stdin exactly once per process,
+	// so the leftover reader has no second caller to steal bytes from.
+	if opt.Stdin != nil {
+		go func() { _, _ = io.Copy(ptmx, opt.Stdin) }()
 	}
 
 	// forwardStream runs synchronously and blocks until the PTY master returns

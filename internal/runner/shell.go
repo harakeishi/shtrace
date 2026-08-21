@@ -111,8 +111,17 @@ func RunShell(ctx context.Context, opt ShellOptions) error {
 	}
 
 	// Forward user's stdin to the shell (required for interactive use).
-	// This goroutine exits naturally once ptmx is closed (the next write
-	// attempt fails), which happens via the deferred ptmx.Close above.
+	//
+	// Unlike PTYOptions/PipeOptions this is not an injectable field: RunShell
+	// drives an interactive shell that only makes sense attached to the real
+	// terminal, and MakeRaw below already binds the call to os.Stdout's fd. A
+	// Stdin field would only ever be handed os.Stdin, so it would buy testability
+	// it cannot deliver — the shell needs a TTY on the other end regardless.
+	//
+	// As in RunPTY the goroutine is detached: a pending Write fails with
+	// ErrClosed once the deferred ptmx.Close runs, while a Read parked on the
+	// terminal outlives the call. That is safe here because RunShell owns
+	// os.Stdin until the process exits.
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
 
 	// Read PTY output: forward to terminal and record spans.

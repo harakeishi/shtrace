@@ -5,7 +5,7 @@
 # same SHTRACE_DATA_DIR. Asserts:
 #
 #   1. exactly one session was recorded
-#   2. at least 5 spans were recorded (outer bash + 4 nested commands)
+#   2. exactly 6 spans were recorded (outer bash + 5 nested commands)
 #   3. the AKIA secret literal does NOT appear in any JSONL log, and the
 #      redaction marker '***' DOES appear
 #   4. stderr is recorded under stream=stderr (and the on-stderr line is not
@@ -44,7 +44,7 @@ fi
 session_id=$(printf '%s' "$sessions_json" | jq -r '.[0].id')
 note "session=$session_id"
 
-# --- assertion 2: exactly 5 span log files (1 outer bash + 4 nested) ---
+# --- assertion 2: exactly 6 span log files (1 outer bash + 5 nested) ---
 # The workload is fully deterministic, so an exact-equals check catches both
 # under-counting (missed nested span) and over-counting (a stray child process
 # or accidental duplicate insert) regressions.
@@ -53,7 +53,7 @@ if [ ! -d "$log_dir" ]; then
     err "log dir $log_dir missing"
     exit 1
 fi
-expected_spans=5
+expected_spans=6
 span_count=$(find "$log_dir" -maxdepth 1 -name '*.log' | wc -l | tr -d ' ')
 if [ "$span_count" -ne "$expected_spans" ]; then
     err "expected exactly $expected_spans spans, got $span_count under $log_dir"

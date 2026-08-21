@@ -16,6 +16,7 @@
 #   2. stderr stays tagged stream=stderr (not folded into stdout)
 #   3. the built-in masker redacts a fake AWS access key in the recorded log
 #   4. the streaming masker's tail buffer survives output > 256 B (safetyTail)
+#   5. stdin reaches the wrapped command through the CLI wiring (issue #44)
 
 set -euo pipefail
 
@@ -43,5 +44,16 @@ shtrace -- sh -c 'echo "leaked AKIAIOSFODNN7EXAMPLE token"'
 #    exercises its tail-buffer flush path (safetyTail = 256 B in
 #    internal/runner/pipe.go). 30 lines * ~12 chars/line is ~360 B.
 shtrace -- sh -c 'i=1; while [ $i -le 30 ]; do echo "long-line-$i"; i=$((i + 1)); done'
+
+# 5. nested span: stdin must reach the wrapped command. This is the CLI-level
+#    regression guard for issue #44 — internal/runner has unit coverage, but
+#    the fix itself is the `Stdin: os.Stdin` wiring in internal/cli, which only
+#    this path exercises. Mirrors the reproduction from the issue.
+stdin_lines=$(printf 'a\nb\nc\n' | shtrace -- wc -l | tr -d ' ')
+if [ "$stdin_lines" != "3" ]; then
+    echo "integration-test: stdin not forwarded to wrapped command: wc -l said '$stdin_lines', want 3" >&2
+    exit 1
+fi
+echo "integration-test: stdin forwarded (wc -l = $stdin_lines)"
 
 echo "integration-test: done"
