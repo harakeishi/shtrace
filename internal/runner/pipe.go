@@ -148,26 +148,12 @@ func forward(wg *sync.WaitGroup, src io.Reader, stream storage.Stream, tee io.Wr
 	forwardStream(src, stream, tee, rec, m)
 }
 
-// safetyTail is the number of trailing bytes we hold back per stream before
-// masking, so a secret straddling two Reads still matches its regex. It must
-// exceed the longest expected secret literal we want to catch.
-const safetyTail = 256
-
 // forwardStream reads from src and routes each chunk to (a) the user tee
 // (raw bytes — the user already sees them on their terminal) and (b) the
-// recorder, after secret masking. It buffers a trailing window between Reads
-// so a secret that straddles a pipe-buffer boundary is still caught.
-//
-// Masking is always applied to the full pending buffer (not just the flushable
-// prefix) so that a secret whose start falls inside the safety tail of the
-// previous flush is still caught. After masking the full buffer we emit all
-// but the last safetyTail characters of the masked output and store those
-// safetyTail characters — already masked — as the new pending buffer. Storing
-// masked bytes (rather than original bytes) is safe: replacement markers
-// cannot match any secret pattern, so re-scanning them on the next iteration
-// is a no-op.
+// recorder, after secret masking. secret.StreamMasker owns the buffering that
+// keeps a secret straddling a pipe-buffer boundary detectable.
 func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec ChunkWriter, m *secret.Masker) {
-	var pending []byte
+	sm := secret.NewStreamMasker(m)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
@@ -175,22 +161,13 @@ func forwardStream(src io.Reader, stream storage.Stream, tee io.Writer, rec Chun
 			if tee != nil {
 				_, _ = tee.Write(buf[:n])
 			}
-			pending = append(pending, buf[:n]...)
-			if len(pending) > safetyTail {
-				masked, _ := m.MaskString(string(pending))
-				if len(masked) > safetyTail {
-					cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
-					_ = rec.WriteChunk(stream, []byte(masked[:cutoff]))
-					pending = []byte(masked[cutoff:])
-				} else {
-					pending = []byte(masked)
-				}
+			if out := sm.Write(buf[:n]); len(out) > 0 {
+				_ = rec.WriteChunk(stream, out)
 			}
 		}
 		if err != nil {
-			if len(pending) > 0 {
-				masked, _ := m.MaskString(string(pending))
-				_ = rec.WriteChunk(stream, []byte(masked))
+			if out := sm.Close(); len(out) > 0 {
+				_ = rec.WriteChunk(stream, out)
 			}
 			return
 		}

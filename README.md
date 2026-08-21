@@ -347,10 +347,46 @@ disambiguates `stdout` / `stderr` / `pty`).
 ### Secret masking (fail-secure)
 
 The recorded log is scrubbed; the user's own terminal stream is left
-untouched. Built-in patterns cover AWS access keys, GitHub PATs
-(`ghp_…`/`gho_…`/…), OpenAI API keys, `Bearer …` tokens, and JWTs. The
-masker buffers a small trailing window between reads so a secret that
-straddles a pipe-buffer boundary still gets caught.
+untouched. Built-in patterns cover:
+
+- AWS access key ids (`AKIA…`/`ASIA…`) and secret access keys anchored to a
+  nearby key name (`AWS_SECRET_ACCESS_KEY=…`, `--secret-access-key …`)
+- GitHub PATs — classic (`ghp_…`/`gho_…`/`ghu_…`/`ghs_…`/`ghr_…`) and
+  fine-grained (`github_pat_…`)
+- OpenAI keys, including `sk-proj-…` project keys
+- Slack tokens (`xoxb-`/`xoxp-`/`xoxa-`/`xoxs-`/`xapp-`)
+- Google API keys (`AIza…`)
+- `Bearer …` header values and JWTs (`eyJ….….…`)
+- Passwords in connection URLs (`postgres://user:pw@host`)
+- PEM private-key blocks, body included
+- A generic `NAME=VALUE` fallback for names containing `token`, `secret`,
+  `password`, `passwd`, or `api_key`
+
+Masking is line-oriented and streaming: the masker buffers a trailing window
+between reads so a secret straddling a pipe-buffer boundary still gets
+caught, and holds an incomplete line until its newline arrives so output is
+identical regardless of how reads happen to split it.
+
+Behaviour worth knowing when judging coverage:
+
+- **Prefixes are preserved** so masked output stays diagnosable: the scheme,
+  user and host of a URL, the key name in an assignment, and the `Bearer`
+  keyword survive; only the credential becomes `***`.
+- **Unexpanded variable references are left alone** — `$NAME`, `${NAME}`,
+  `$(cmd)` and `%NAME%` are what a script echoes before expansion, so
+  redacting them would hide context without hiding a secret. A default
+  *value* is not exempt: `${DB_PASS:-hunter2}` is masked.
+- **The generic fallback needs a value of 6+ characters**, so prose like
+  `password: ` or `token: n/a` is not redacted.
+- **PEM blocks** are masked in full — every line between `BEGIN` and `END`,
+  including the short final line — when they pass through the streaming
+  masker, which is every recorded stream. A PEM body line masked in
+  isolation (no `BEGIN` marker in the same buffer) still needs 60+ base64
+  characters to be recognised on its own. A `BEGIN` marker with no matching
+  `END` masks the remainder of that command's output.
+
+Masking is a safety net, not a guarantee: a credential in a format no
+pattern describes will be recorded as-is.
 
 > **Interactive input can land in the recording (mode A / PTY).**
 > shtrace never records your stdin directly, but in PTY mode the kernel's
