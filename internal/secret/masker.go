@@ -160,12 +160,18 @@ func (m *Masker) MaskString(s string) (string, int) {
 			// (scheme, key name, "Bearer") and any trailing delimiter survive,
 			// with only the secret span replaced.
 			out = r.re.ReplaceAllStringFunc(out, func(match string) string {
-				count++
 				g := r.re.FindStringSubmatch(match)
 				suffix := ""
 				if len(g) > 2 {
 					suffix = g[2]
 				}
+				// A value that is only a shell variable reference is what a script
+				// echoes before expansion — redacting it hides context without
+				// hiding a secret.
+				if isVarRef(match[len(g[1]) : len(match)-len(suffix)]) {
+					return match
+				}
+				count++
 				return g[1] + replacement + suffix
 			})
 			continue
@@ -176,6 +182,14 @@ func (m *Masker) MaskString(s string) (string, int) {
 		})
 	}
 	return out, count
+}
+
+// varRef matches a value that is nothing but an unexpanded variable reference:
+// $NAME, ${...}, $(...) or the Windows %NAME% form, optionally quoted.
+var varRef = regexp.MustCompile(`^["']?(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|\$\([^)]*\)|%[A-Za-z_][A-Za-z0-9_]*%)["']?$`)
+
+func isVarRef(value string) bool {
+	return varRef.MatchString(value)
 }
 
 // MaskArgv applies MaskString to each argv entry.

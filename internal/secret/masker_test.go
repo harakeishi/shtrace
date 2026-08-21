@@ -256,6 +256,11 @@ func TestMasker_MasksCredentialFormats(t *testing.T) {
 			in:     "registry_token: abcdef123456",
 			secret: "abcdef123456",
 		},
+		{
+			name:   "literal value containing a dollar sign",
+			in:     "PASSWORD=hunter2$xyz",
+			secret: "hunter2$xyz",
+		},
 	}
 
 	m := DefaultMasker()
@@ -328,6 +333,11 @@ func TestMasker_DoesNotMaskOrdinaryOutput(t *testing.T) {
 		{"certificate marker", "-----BEGIN CERTIFICATE-----"},
 		{"content length header", "Content-Length: 1048576"},
 		{"docker tag with sha", "pull registry.example.invalid/app:sha-da39a3ee5e6b4b0d3255bfef95601890afd80709"},
+		{"unexpanded var", "GITHUB_TOKEN=$GITHUB_TOKEN"},
+		{"unexpanded braced var", "api_key: ${API_KEY}"},
+		{"unexpanded command substitution", "SECRET=$(get-secret)"},
+		{"unexpanded windows var", "API_TOKEN=%API_TOKEN%"},
+		{"unexpanded quoted var", `PASSWORD="${DB_PASSWORD}"`},
 	}
 
 	m := DefaultMasker()
