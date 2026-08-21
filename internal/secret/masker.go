@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -32,9 +33,19 @@ func NewMaskerWithLiterals(extraPatterns []string, literals []string) (*Masker, 
 // pattern is a built-in secret rule. When keepPrefix is true the regex's first
 // capture group is a readable prefix (a scheme, a key name, a "Bearer" word)
 // that is preserved so masked output stays diagnosable.
+//
+// literals is a lowercase pre-filter: every group must contribute at least one
+// present substring for the regex to have any chance of matching. MaskString
+// skips the scan otherwise, which matters because the rules with a
+// variable-length prefix have no literal for RE2 to anchor on and cost ~100x
+// the prefixed rules per byte.
 type pattern struct {
 	expr       string
 	keepPrefix bool
+	literals   [][]string
+	// lineAnchored marks a rule whose (?m)^…$ anchors require the input to be
+	// cut on real line boundaries. Streaming skips these on a mid-line flush.
+	lineAnchored bool
 }
 
 // defaultPatterns are the built-in secret rules, applied in order. They are
@@ -66,30 +77,34 @@ var defaultPatterns = []pattern{
 	{expr: `xox[baprs]-[A-Za-z0-9\-]{10,}`},
 	{expr: `xapp-[0-9]-[A-Za-z0-9\-]{10,}`},
 	{expr: `AIza[0-9A-Za-z_\-]{35}`},
-	{expr: `(?i)(bearer\s+)[A-Za-z0-9._\-]{20,}`, keepPrefix: true},
+	// Braces are in the value class so ${VAR:-default} is inspected rather than
+	// skipped; isVarRef still exempts a bare ${VAR}.
+	{expr: `(?i)(bearer\s+)[A-Za-z0-9._${}:\-]{20,}`, keepPrefix: true, literals: [][]string{{"bearer"}}},
 	{expr: `eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`},
 	// An AWS secret access key has no prefix — a bare 40-char base64-ish match
 	// would redact every git SHA-1 and build hash — so it is anchored to a
 	// nearby key name instead.
-	{expr: `(?i)(aws_?secret_?access_?key\s*[=:]\s*)["']?[A-Za-z0-9/+=]{40}["']?`, keepPrefix: true},
-	{expr: `(?i)(--secret-access-key[\s=]+)["']?[A-Za-z0-9/+=]{40}["']?`, keepPrefix: true},
+	{expr: `(?i)(aws_?secret_?access_?key\s*[=:]\s*)["']?[A-Za-z0-9/+=]{40}["']?`, keepPrefix: true, literals: [][]string{{"access"}}},
+	{expr: `(?i)(--secret-access-key[\s=]+)["']?[A-Za-z0-9/+=]{40}["']?`, keepPrefix: true, literals: [][]string{{"secret-access-key"}}},
 	// Connection URLs: mask only the password so scheme, user and host stay
 	// readable.
-	{expr: `([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]*:)[^\s/@]+(@)`, keepPrefix: true},
-	// The streaming maskers only hold a 256-byte tail across writes, so a
-	// multi-line PEM block cannot be matched reliably as one span. Markers and
-	// body lines are therefore matched independently. The body rule is not
-	// anchored to a preceding BEGIN marker (that anchor would not survive a
-	// write boundary either); a 60+ char unbroken base64 line is treated as key
-	// material regardless of context.
-	{expr: `-----BEGIN [A-Z ]*PRIVATE KEY-----`},
-	{expr: `-----END [A-Z ]*PRIVATE KEY-----`},
-	{expr: `(?m)^[A-Za-z0-9/+]{60,}={0,2}$`},
+	{expr: `([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]*:)[^\s/@]+(@)`, keepPrefix: true, literals: [][]string{{"://"}}},
+	// Markers and body lines are matched independently so a PEM block is still
+	// caught in the non-streaming path, where there is no block state. A 60+
+	// char unbroken base64 line is treated as key material regardless of
+	// context. StreamMasker additionally tracks BEGIN/END state, which is what
+	// catches the short final body line.
+	{expr: `-----BEGIN [A-Z ]*PRIVATE KEY-----`, literals: [][]string{{"-----begin"}}},
+	{expr: `-----END [A-Z ]*PRIVATE KEY-----`, literals: [][]string{{"-----end"}}},
+	// RE2's multiline $ matches only before \n, so \r must be consumed
+	// explicitly or CRLF output (every PTY write, via ONLCR) leaves the body
+	// unmasked.
+	{expr: `(?m)^[A-Za-z0-9/+]{60,}={0,2}\r?$`, lineAnchored: true},
 	// Generic fallback for name=value assignments echoed by scripts. The value
 	// needs 6+ chars so prose like "password: " or "token: n/a" is left alone.
 	// Runs last: replaced text cannot re-match, so it must not pre-empt the
 	// vendor rules above.
-	{expr: `(?i)([A-Za-z0-9_\-]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_\-]*\s*[=:]\s*)["']?[^\s"']{6,}["']?`, keepPrefix: true},
+	{expr: `(?i)([A-Za-z0-9_\-]*(?:token|secret|password|passwd|api[_-]?key)[A-Za-z0-9_\-]*\s*[=:]\s*)["']?[^\s"']{6,}["']?`, keepPrefix: true, literals: [][]string{{"token", "secret", "password", "passwd", "api"}, {"=", ":"}}},
 }
 
 // Replacement is the string substituted in place of detected secrets.
@@ -101,12 +116,17 @@ const replacement = Replacement
 // Masker rewrites known-secret substrings to a fixed redaction marker.
 type Masker struct {
 	rules []rule
+	// anyLiterals records whether at least one rule declares literals, so
+	// MaskString can skip building the lowercase copy the pre-filter needs.
+	anyLiterals bool
 }
 
 // rule is a compiled pattern plus its prefix-preserving behaviour.
 type rule struct {
-	re         *regexp.Regexp
-	keepPrefix bool
+	re           *regexp.Regexp
+	keepPrefix   bool
+	literals     [][]string
+	lineAnchored bool
 }
 
 // DefaultMasker returns a Masker initialised with the built-in patterns.
@@ -130,6 +150,7 @@ func NewMasker(extra []string) (*Masker, error) {
 	}
 
 	rules := make([]rule, 0, len(all))
+	anyLiterals := false
 	for _, p := range all {
 		re, err := regexp.Compile(p.expr)
 		if err != nil {
@@ -138,9 +159,31 @@ func NewMasker(extra []string) (*Masker, error) {
 		if p.keepPrefix && re.NumSubexp() < 1 {
 			return nil, fmt.Errorf("pattern %q declares keepPrefix but has no capture group", p.expr)
 		}
-		rules = append(rules, rule{re: re, keepPrefix: p.keepPrefix})
+		if len(p.literals) > 0 {
+			anyLiterals = true
+		}
+		rules = append(rules, rule{re: re, keepPrefix: p.keepPrefix, literals: p.literals, lineAnchored: p.lineAnchored})
 	}
-	return &Masker{rules: rules}, nil
+	return &Masker{rules: rules, anyLiterals: anyLiterals}, nil
+}
+
+// mayMatch reports whether the rule can possibly match input whose lowercase
+// form is lower: every literal group must contribute a hit. A rule without
+// literals is always scanned.
+func (r rule) mayMatch(lower string) bool {
+	for _, group := range r.literals {
+		found := false
+		for _, lit := range group {
+			if strings.Contains(lower, lit) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // MaskString returns s with every match replaced by Replacement, plus the
@@ -152,9 +195,28 @@ func NewMasker(extra []string) (*Masker, error) {
 // means the count is accurate for non-overlapping matches; the rare case where
 // a single span would match multiple patterns is counted only once.
 func (m *Masker) MaskString(s string) (string, int) {
+	return m.maskString(s, true)
+}
+
+// maskString masks s, optionally skipping rules whose line anchors are only
+// meaningful when s is cut on real line boundaries.
+func (m *Masker) maskString(s string, lineAligned bool) (string, int) {
 	count := 0
 	out := s
+	// One lowercase copy feeds every rule's literal pre-filter; recomputed only
+	// after a rule actually rewrote the text.
+	lower := ""
+	if m.anyLiterals {
+		lower = strings.ToLower(out)
+	}
 	for _, r := range m.rules {
+		if r.lineAnchored && !lineAligned {
+			continue
+		}
+		if !r.mayMatch(lower) {
+			continue
+		}
+		before := out
 		if r.keepPrefix {
 			// Rebuild the match from its captures so the readable prefix
 			// (scheme, key name, "Bearer") and any trailing delimiter survive,
@@ -174,19 +236,24 @@ func (m *Masker) MaskString(s string) (string, int) {
 				count++
 				return g[1] + replacement + suffix
 			})
-			continue
+		} else {
+			out = r.re.ReplaceAllStringFunc(out, func(string) string {
+				count++
+				return replacement
+			})
 		}
-		out = r.re.ReplaceAllStringFunc(out, func(string) string {
-			count++
-			return replacement
-		})
+		if m.anyLiterals && out != before {
+			lower = strings.ToLower(out)
+		}
 	}
 	return out, count
 }
 
 // varRef matches a value that is nothing but an unexpanded variable reference:
-// $NAME, ${...}, $(...) or the Windows %NAME% form, optionally quoted.
-var varRef = regexp.MustCompile(`^["']?(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|\$\([^)]*\)|%[A-Za-z_][A-Za-z0-9_]*%)["']?$`)
+// $NAME, ${NAME}, $(...) or the Windows %NAME% form, optionally quoted. The
+// braced form is restricted to a bare name because ${VAR:-default} can carry a
+// real credential in its default and must stay maskable.
+var varRef = regexp.MustCompile(`^["']?(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$\([^)]*\)|%[A-Za-z_][A-Za-z0-9_]*%)["']?$`)
 
 func isVarRef(value string) bool {
 	return varRef.MatchString(value)
@@ -215,54 +282,32 @@ func UTF8Boundary(s string, pos int) int {
 	return pos
 }
 
-// maskingWriter is a streaming masker that buffers a small tail across writes
-// so a secret split across two Write calls still gets caught.
+// maskingWriter adapts StreamMasker to io.WriteCloser.
 type maskingWriter struct {
-	w      io.Writer
-	masker *Masker
-	buf    []byte
+	w  io.Writer
+	sm *StreamMasker
 }
 
-// safetyTail is the number of bytes we hold back so a secret straddling the
-// boundary between two writes is still detected. It must exceed the longest
-// expected secret literal we want to catch.
-const safetyTail = 256
-
 // NewMaskingWriter wraps w so that every write is masked before reaching w.
-// Callers must Close() the writer to flush the tail buffer.
+// Callers must Close() the writer to flush the buffered tail.
 func NewMaskingWriter(w io.Writer, m *Masker) io.WriteCloser {
-	return &maskingWriter{w: w, masker: m}
+	return &maskingWriter{w: w, sm: NewStreamMasker(m)}
 }
 
 func (mw *maskingWriter) Write(p []byte) (int, error) {
-	mw.buf = append(mw.buf, p...)
-	if len(mw.buf) <= safetyTail {
-		return len(p), nil
+	if out := mw.sm.Write(p); len(out) > 0 {
+		if _, err := mw.w.Write(out); err != nil {
+			return 0, err
+		}
 	}
-	// Mask the full buffer (not just the flushable prefix) so that a secret
-	// whose start falls inside the safety tail of the previous flush is still
-	// caught. Emit all but the last safetyTail characters of the masked output
-	// and store those characters — already masked — as the new buffer. Storing
-	// masked bytes is safe: replacement markers cannot match any pattern.
-	masked, _ := mw.masker.MaskString(string(mw.buf))
-	if len(masked) <= safetyTail {
-		mw.buf = []byte(masked)
-		return len(p), nil
-	}
-	cutoff := UTF8Boundary(masked, len(masked)-safetyTail)
-	if _, err := mw.w.Write([]byte(masked[:cutoff])); err != nil {
-		return 0, err
-	}
-	mw.buf = []byte(masked[cutoff:])
 	return len(p), nil
 }
 
 func (mw *maskingWriter) Close() error {
-	if len(mw.buf) == 0 {
+	out := mw.sm.Close()
+	if len(out) == 0 {
 		return nil
 	}
-	masked, _ := mw.masker.MaskString(string(mw.buf))
-	mw.buf = nil
-	_, err := mw.w.Write([]byte(masked))
+	_, err := mw.w.Write(out)
 	return err
 }

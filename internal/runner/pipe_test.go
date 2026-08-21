@@ -211,7 +211,7 @@ func TestForwardStream_FlushesAfterLargeOutput(t *testing.T) {
 }
 
 // TestForwardStream_LiteralSecretAtFlushBoundary is the regression test for
-// the flush-boundary split: when a single Read delivers more than safetyTail
+// the flush-boundary split: when a single Read delivers more than secret.SafetyTail
 // bytes and a literal secret straddles the cutoff position, the old
 // "mask flushable only" approach leaked it. This test verifies the fix.
 func TestForwardStream_LiteralSecretAtFlushBoundary(t *testing.T) {
@@ -221,10 +221,10 @@ func TestForwardStream_LiteralSecretAtFlushBoundary(t *testing.T) {
 		t.Fatalf("NewMaskerWithLiterals: %v", err)
 	}
 
-	// Place the secret near the safetyTail boundary so it straddles the
+	// Place the secret near the secret.SafetyTail boundary so it straddles the
 	// flush cutoff when delivered in a single large pipe write.
-	prefix := strings.Repeat("A", safetyTail-4)
-	suffix := strings.Repeat("B", safetyTail)
+	prefix := strings.Repeat("A", secret.SafetyTail-4)
+	suffix := strings.Repeat("B", secret.SafetyTail)
 	payload := prefix + litSecret + suffix
 
 	r, w := io.Pipe()

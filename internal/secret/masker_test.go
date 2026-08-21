@@ -227,6 +227,16 @@ func TestMasker_MasksCredentialFormats(t *testing.T) {
 			secret: "xoxp-EXAMPLE-FAKE-NOTAREALSLACKTOKEN-000000",
 		},
 		{
+			name:   "slack app-level token",
+			in:     "SLACK_TOKEN=xoxa-EXAMPLE-FAKE-NOTAREALSLACKTOKEN-000000",
+			secret: "xoxa-EXAMPLE-FAKE-NOTAREALSLACKTOKEN-000000",
+		},
+		{
+			name:   "slack legacy session token",
+			in:     "posting with xoxs-EXAMPLE-FAKE-NOTAREALSLACKTOKEN-000000",
+			secret: "xoxs-EXAMPLE-FAKE-NOTAREALSLACKTOKEN-000000",
+		},
+		{
 			name:   "slack app token",
 			in:     "xapp-1-A0000000000-1111111111111-aaaabbbbccccdddd",
 			secret: "xapp-1-A0000000000-1111111111111-aaaabbbbccccdddd",
@@ -382,5 +392,192 @@ func TestStreamMasker_MasksPEMBodyLineByLine(t *testing.T) {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("PEM material leaked: %q", out)
 		}
+	}
+}
+
+func TestMasker_MasksVarRefDefaults(t *testing.T) {
+	// ${VAR:-default} can carry a real credential in its default, so only a
+	// bare reference stays exempt.
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "generic assignment default",
+			in:   "PASSWORD=${DB_PASS:-hunter2default}",
+			want: "PASSWORD=" + Replacement,
+		},
+		{
+			name: "url password default",
+			in:   "postgres://u:${PW:-realpassword}@h/db",
+			want: "postgres://u:" + Replacement + "@h/db",
+		},
+		{
+			name: "bearer default",
+			in:   "Bearer ${TOK:-abcdefghijklmnopqrstuvwxyz}",
+			want: "Bearer " + Replacement,
+		},
+	}
+
+	m := DefaultMasker()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, count := m.MaskString(tt.in)
+			if got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+			if count != 1 {
+				t.Fatalf("count = %d, want 1", count)
+			}
+		})
+	}
+}
+
+func TestStreamMasker_MasksPEMWithCRLF(t *testing.T) {
+	// PTY output arrives CRLF-terminated (ONLCR), and RE2's multiline $ only
+	// matches before \n, so CRLF once left the whole key body in the clear.
+	m := DefaultMasker()
+	body := strings.Repeat("MIIEowIBAAKCAQEAx", 4)
+	shortTail := "SHORTFINALLINE16" // PEM's last line is shorter than the body rule's minimum
+
+	var buf bytes.Buffer
+	w := NewMaskingWriter(&buf, m)
+	for _, line := range []string{
+		"-----BEGIN RSA PRIVATE KEY-----",
+		body,
+		shortTail,
+		"-----END RSA PRIVATE KEY-----",
+	} {
+		if _, err := io.WriteString(w, line+"\r\n"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	out := buf.String()
+	for _, leaked := range []string{body, shortTail, "PRIVATE KEY"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("PEM material leaked with CRLF: %q", out)
+		}
+	}
+	if !strings.Contains(out, "\r\n") {
+		t.Fatalf("line endings not preserved: %q", out)
+	}
+}
+
+func TestStreamMasker_KeepPrefixRuleAcrossChunkBoundary(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		secret string
+		keep   string
+	}{
+		{
+			name:   "url password",
+			in:     "connecting to postgres://appuser:hunter2pw@db.example.invalid:5432/app\n",
+			secret: "hunter2pw",
+			keep:   "appuser",
+		},
+		{
+			name:   "aws assignment",
+			in:     "AWS_SECRET_ACCESS_KEY=EXAMPLEFAKEEXAMPLEFAKEEXAMPLEFAKEEXAMPLE\n",
+			secret: "EXAMPLEFAKEEXAMPLEFAKEEXAMPLEFAKEEXAMPLE",
+			keep:   "AWS_SECRET_ACCESS_KEY",
+		},
+	}
+
+	m := DefaultMasker()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, chunk := range []int{1, 3, 7, 64} {
+				var buf bytes.Buffer
+				w := NewMaskingWriter(&buf, m)
+				for i := 0; i < len(tt.in); i += chunk {
+					end := i + chunk
+					if end > len(tt.in) {
+						end = len(tt.in)
+					}
+					if _, err := io.WriteString(w, tt.in[i:end]); err != nil {
+						t.Fatalf("write: %v", err)
+					}
+				}
+				if err := w.Close(); err != nil {
+					t.Fatalf("close: %v", err)
+				}
+				out := buf.String()
+				if strings.Contains(out, tt.secret) {
+					t.Fatalf("chunk=%d: secret leaked: %q", chunk, out)
+				}
+				if !strings.Contains(out, tt.keep) {
+					t.Fatalf("chunk=%d: readable prefix lost: %q", chunk, out)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamMasker_OutputIsChunkSizeIndependent(t *testing.T) {
+	// A partial line held in the tail buffer must not be masked as if it were
+	// a whole line: the (?m)^…$ anchors would otherwise treat a write boundary
+	// as a line boundary and redact ordinary output.
+	inputs := map[string]string{
+		"long path":            "/usr/local/lib/" + strings.Repeat("abcdefghij", 30) + "/file.py\n",
+		"long path crlf":       "/usr/local/lib/" + strings.Repeat("abcdefghij", 30) + "/file.py\r\n",
+		"base64 prose":         "data: " + strings.Repeat("QUJDREVGR0hJSg", 25) + "\n",
+		"no trailing newline":  strings.Repeat("A", 300),
+		"secret in the middle": "prefix\nAWS_SECRET_ACCESS_KEY=EXAMPLEFAKEEXAMPLEFAKEEXAMPLEFAKEEXAMPLE\nsuffix\n",
+	}
+
+	write := func(in string, chunk int) string {
+		var buf bytes.Buffer
+		w := NewMaskingWriter(&buf, DefaultMasker())
+		if chunk <= 0 {
+			if _, err := io.WriteString(w, in); err != nil {
+				panic(err)
+			}
+		} else {
+			for i := 0; i < len(in); i += chunk {
+				end := i + chunk
+				if end > len(in) {
+					end = len(in)
+				}
+				if _, err := io.WriteString(w, in[i:end]); err != nil {
+					panic(err)
+				}
+			}
+		}
+		if err := w.Close(); err != nil {
+			panic(err)
+		}
+		return buf.String()
+	}
+
+	for name, in := range inputs {
+		t.Run(name, func(t *testing.T) {
+			want := write(in, 0)
+			for _, chunk := range []int{1, 7, 13, 64, 200, 1000} {
+				if got := write(in, chunk); got != want {
+					t.Fatalf("chunk=%d changed output\n got %q\nwant %q", chunk, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestMasker_MasksPEMBodyLineWithCRLF(t *testing.T) {
+	// The non-streaming path has no PEM block state, so the body rule itself
+	// must tolerate the \r that PTY output (ONLCR) puts before every \n.
+	m := DefaultMasker()
+	body := strings.Repeat("MIIEowIBAAKCAQEAx", 4)
+
+	got, count := m.MaskString(body + "\r\n")
+	if strings.Contains(got, body) {
+		t.Fatalf("CRLF-terminated PEM body left in the clear: %q", got)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
 	}
 }

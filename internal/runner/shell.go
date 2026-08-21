@@ -151,18 +151,17 @@ func shellEventLoop(r io.Reader, opt ShellOptions) {
 		parser  oscParser
 		writer  ChunkWriter
 		spanEnd func(int) error
-		pending []byte // masking safety-tail buffer for the current span
+		sm      *secret.StreamMasker // per-span; PEM block state must not cross spans
 	)
 
-	// flushPending emits all buffered bytes through the masker to writer,
-	// then resets the buffer.
+	// flushPending emits whatever the stream masker still holds for this span.
 	flushPending := func() {
-		if writer == nil || len(pending) == 0 {
+		if writer == nil || sm == nil {
 			return
 		}
-		masked, _ := opt.Masker.MaskString(string(pending))
-		_ = writer.WriteChunk(storage.StreamPTY, []byte(masked))
-		pending = pending[:0]
+		if out := sm.Close(); len(out) > 0 {
+			_ = writer.WriteChunk(storage.StreamPTY, out)
+		}
 	}
 
 	// endSpan flushes any remaining buffered output, calls spanEnd(code),
@@ -170,7 +169,7 @@ func shellEventLoop(r io.Reader, opt ShellOptions) {
 	// ended without a D marker (abnormal path).
 	endSpan := func(code int, implicit bool) {
 		flushPending()
-		pending = nil // release backing array so it is not held for the session lifetime
+		sm = nil // release the buffer so it is not held for the session lifetime
 		if spanEnd != nil {
 			label := "shtrace: span end"
 			if implicit {
@@ -184,22 +183,17 @@ func shellEventLoop(r io.Reader, opt ShellOptions) {
 		spanEnd = nil
 	}
 
-	// writeCleaned applies the safety-tail masking pattern (same as
-	// forwardStream in pipe.go) so secrets straddling read boundaries are caught.
+	// writeCleaned streams span output through the shared masker so secrets
+	// straddling read boundaries are caught.
 	writeCleaned := func(b []byte) {
 		if writer == nil || len(b) == 0 {
 			return
 		}
-		pending = append(pending, b...)
-		if len(pending) > safetyTail {
-			masked, _ := opt.Masker.MaskString(string(pending))
-			if len(masked) > safetyTail {
-				cutoff := secret.UTF8Boundary(masked, len(masked)-safetyTail)
-				_ = writer.WriteChunk(storage.StreamPTY, []byte(masked[:cutoff]))
-				pending = []byte(masked[cutoff:])
-			} else {
-				pending = []byte(masked)
-			}
+		if sm == nil {
+			sm = secret.NewStreamMasker(opt.Masker)
+		}
+		if out := sm.Write(b); len(out) > 0 {
+			_ = writer.WriteChunk(storage.StreamPTY, out)
 		}
 	}
 
